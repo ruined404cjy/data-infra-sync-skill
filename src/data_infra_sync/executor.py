@@ -305,7 +305,8 @@ def _domain_fingerprint(git, adapter, facts):
 
 def _repository_fingerprint(git, repository):
     """返回单仓 refs、index、status 和 tracked/untracked 文件内容指纹。"""
-    if not repository.exists():
+    repository = Path(os.path.abspath(str(repository)))
+    if not _safe_repository_path(repository):
         return ("missing",)
     head = git.run(repository, ("rev-parse", "HEAD")).stdout.strip()
     branch = git.run(
@@ -337,6 +338,25 @@ def _repository_fingerprint(git, repository):
         status,
         files,
     )
+
+
+def _safe_repository_path(repository):
+    """通过 lstat 验证仓库入口及其路径组件，拒绝任何 symlink。"""
+    current = Path(repository.anchor)
+    metadata = current.lstat()
+    for part in repository.parts[1:]:
+        current = current / part
+        try:
+            metadata = current.lstat()
+        except FileNotFoundError:
+            return False
+        if stat.S_ISLNK(metadata.st_mode):
+            raise ValueError("repository path contains symlink")
+        if current != repository and not stat.S_ISDIR(metadata.st_mode):
+            raise ValueError("repository path component is not a directory")
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise ValueError("repository path is not a directory")
+    return True
 
 
 def _path_fingerprint(repository, relative):

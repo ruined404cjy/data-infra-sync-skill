@@ -6,11 +6,13 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from data_infra_sync.adapters.datainfra import DataInfraAdapter, ManagedPatch
+from data_infra_sync.git import Git
 
 
 class ManagedPatchDeclarationTest(unittest.TestCase):
@@ -89,6 +91,76 @@ class ManagedPatchDeclarationTest(unittest.TestCase):
                     GitMustNotRun(), facts, (patch,), (patch,)
                 )
             )
+
+    def test_current_copy_preserves_unrelated_symlink_and_patch_semantics(self):
+        """防止 current 副本遍历与 apply path 无关的外部 symlink。"""
+
+        class PersistentDirectory:
+            def __init__(self, path):
+                self.path = path
+
+            def __enter__(self):
+                return str(self.path)
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                return False
+
+        with tempfile.TemporaryDirectory(prefix="managed patch copy ") as directory:
+            root = Path(directory)
+            repository = root / "modules/component"
+            external = root / "external"
+            inspection = root / "inspection"
+            repository.mkdir(parents=True)
+            external.mkdir()
+            (external / "outside.txt").write_text("outside\n", encoding="utf-8")
+
+            def run(*args):
+                return subprocess.run(
+                    ["git", *args],
+                    cwd=str(repository),
+                    check=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+
+            run("init", "--initial-branch=main")
+            run("config", "user.name", "Fixture User")
+            run("config", "user.email", "fixture@example.invalid")
+            (repository / "value.txt").write_text("A\n", encoding="utf-8")
+            os.symlink(str(external), repository / "unrelated-link")
+            run("add", "value.txt", "unrelated-link")
+            run("commit", "-m", "base")
+            (repository / "value.txt").write_text("B\n", encoding="utf-8")
+            patch = ManagedPatch(
+                "build",
+                "modules/component",
+                ".",
+                (
+                    "diff --git a/value.txt b/value.txt\n"
+                    "--- a/value.txt\n"
+                    "+++ b/value.txt\n"
+                    "@@ -1 +1 @@\n"
+                    "-A\n"
+                    "+B\n"
+                ).encode("utf-8"),
+            )
+            adapter = DataInfraAdapter(
+                root, lambda git, fresh: None, lambda commit: (patch,)
+            )
+
+            with mock.patch(
+                "data_infra_sync.adapters.datainfra.tempfile.TemporaryDirectory",
+                return_value=PersistentDirectory(inspection),
+            ):
+                exact = adapter._current_worktree_is_exact(
+                    Git(), "modules/component", (patch,)
+                )
+
+            copied_link = inspection / "worktree/unrelated-link"
+            self.assertTrue(exact)
+            self.assertTrue(copied_link.is_symlink())
+            self.assertEqual(os.readlink(copied_link), str(external))
 
 
 if __name__ == "__main__":

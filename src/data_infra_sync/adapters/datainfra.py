@@ -115,6 +115,7 @@ class DataInfraAdapter:
             shutil.copytree(
                 repository,
                 worktree,
+                symlinks=True,
                 ignore=shutil.ignore_patterns(".git"),
             )
             git_options = (

@@ -6,12 +6,13 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from data_infra_sync.adapters.datainfra import DataInfraAdapter, ManagedPatch
-from data_infra_sync.executor import execute_sync
+from data_infra_sync.executor import _domain_fingerprint, execute_sync
 from data_infra_sync.git import Git, GitError, RepoFacts
 from data_infra_sync.planner import PlanFacts, RepositoryPlanFacts, SubmoduleSpec, snapshot_for
 from tests.git_fixture import CompositeFixture
@@ -655,6 +656,101 @@ class ExecutorPreflightTest(unittest.TestCase):
 
 
 class ExecutorWriteTest(unittest.TestCase):
+    def test_domain_fingerprint_rejects_repository_symlink_before_git_access(self):
+        with tempfile.TemporaryDirectory(prefix="executor fingerprint symlink ") as directory:
+            root = Path(directory)
+            parent = root / "parent"
+            external = root / "external repository"
+            (parent / "modules").mkdir(parents=True)
+            external.mkdir()
+            CompositeFixture._run(
+                root, ("init", "--initial-branch=main", str(external))
+            )
+            (external / "outside.txt").write_text("outside\n", encoding="utf-8")
+            os.symlink(str(external), parent / "modules/component")
+
+            class GuardGit:
+                def __init__(self):
+                    self.unsafe_calls = []
+
+                def run(self, repo, args, *, check=True):
+                    if Path(repo).is_symlink():
+                        self.unsafe_calls.append((Path(repo), tuple(args)))
+                    stdout = PARENT + "\n" if args[:2] == ("rev-parse", "HEAD") else ""
+                    return subprocess.CompletedProcess(
+                        ("git",) + tuple(args), 0, stdout, ""
+                    )
+
+            git = GuardGit()
+            adapter = SimpleNamespace(root=parent)
+            facts = SimpleNamespace(
+                parent=SimpleNamespace(path=parent),
+                repositories=(SimpleNamespace(path="modules/component"),),
+            )
+
+            fingerprint = _domain_fingerprint(git, adapter, facts)
+
+            self.assertIsNone(fingerprint)
+            self.assertEqual(git.unsafe_calls, [])
+
+    def test_unreadable_symlink_fingerprint_makes_write_failure_partial(self):
+        with tempfile.TemporaryDirectory(prefix="executor partial symlink ") as directory:
+            root = Path(directory)
+            parent = root / "parent"
+            external = root / "external repository"
+            (parent / "modules").mkdir(parents=True)
+            external.mkdir()
+            CompositeFixture._run(
+                root, ("init", "--initial-branch=main", str(external))
+            )
+            (external / "outside.txt").write_text("outside\n", encoding="utf-8")
+            os.symlink(str(external), parent / "modules/component")
+
+            class NoInjectedFingerprintGit(RecordingGit):
+                domain_fingerprint = None
+
+                def __init__(self):
+                    super().__init__()
+                    self.unsafe_calls = []
+
+                def run(self, repo, args, *, check=True):
+                    if Path(repo).is_symlink():
+                        self.unsafe_calls.append((Path(repo), tuple(args)))
+                    return super().run(repo, args, check=check)
+
+            class FilesystemScriptedAdapter(ScriptedAdapter):
+                def __init__(self, git):
+                    super().__init__(git, (), ())
+                    self.root = parent
+
+                def collect_plan_facts(self, git, *, fresh):
+                    facts = super().collect_plan_facts(git, fresh=fresh)
+                    repository = facts.repositories[0]
+                    return replace(
+                        facts,
+                        parent=replace(facts.parent, path=parent),
+                        repositories=(
+                            replace(
+                                repository,
+                                facts=replace(
+                                    repository.facts,
+                                    path=parent / "modules/component",
+                                ),
+                            ),
+                        ),
+                    )
+
+            git = NoInjectedFingerprintGit()
+            git.patch_applied = False
+            git.fail_parent_once = True
+            adapter = FilesystemScriptedAdapter(git)
+
+            result = execute_sync(git, adapter, None, True)
+
+            self.assertEqual(result.state, "partial")
+            self.assertEqual(result.reason_codes, ("parent_update_failed",))
+            self.assertEqual(git.unsafe_calls, [])
+
     def test_new_submodule_is_initialized_at_the_exact_target_pin(self):
         git = RecordingGit()
         git.child_head = None
