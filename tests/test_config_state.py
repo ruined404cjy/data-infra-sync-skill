@@ -226,7 +226,15 @@ class StateStoreTest(unittest.TestCase):
             store = StateStore(Path(temp_dir))
             short_secret = "a9!"
             result = Result(
-                "inspect", "blocked", (short_secret,), None, (), False, (), None, False
+                "inspect",
+                "blocked",
+                (),
+                {"diagnostic": short_secret},
+                (),
+                False,
+                (),
+                None,
+                False,
             )
 
             with patch.dict(os.environ, {"SERVICE_TOKEN": short_secret}, clear=False):
@@ -326,6 +334,29 @@ class StateStoreTest(unittest.TestCase):
 
             latest = json.loads((Path(temp_dir) / "latest.json").read_text())
             self.assertEqual(latest["state"], "blocked")
+            self.assertEqual(latest["target"]["diagnostic"], "[REDACTED]")
+
+    def test_top_level_reason_codes_skip_environment_value_replacement(self):
+        """防止敏感环境变量值改写顶层结构化原因码。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = StateStore(Path(temp_dir))
+            result = Result(
+                "inspect",
+                "blocked",
+                ("blocked",),
+                {"diagnostic": "blocked"},
+                (),
+                False,
+                (),
+                None,
+                False,
+            )
+
+            with patch.dict(os.environ, {"SERVICE_TOKEN": "blocked"}, clear=False):
+                store.write_latest(result)
+
+            latest = json.loads((Path(temp_dir) / "latest.json").read_text())
+            self.assertEqual(latest["reason_codes"], ["blocked"])
             self.assertEqual(latest["target"]["diagnostic"], "[REDACTED]")
 
 

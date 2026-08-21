@@ -29,6 +29,7 @@ _TOP_LEVEL_PROTOCOL_FIELDS = frozenset(
         "changed",
         "snapshot",
         "stale_target",
+        "reason_codes",
     }
 )
 _ACTION_PROTOCOL_FIELDS = frozenset(
