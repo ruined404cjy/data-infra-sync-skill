@@ -220,6 +220,68 @@ class StateStoreTest(unittest.TestCase):
             self.assertNotIn(inline_token, persisted)
             self.assertEqual(json.loads((Path(temp_dir) / "latest.json").read_text())["schema_version"], "1")
 
+    def test_short_sensitive_environment_value_is_redacted(self):
+        """防止短 token 值绕过按长度筛选的脱敏。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = StateStore(Path(temp_dir))
+            short_secret = "a9!"
+            result = Result(
+                "inspect", "blocked", (short_secret,), None, (), False, (), None, False
+            )
+
+            with patch.dict(os.environ, {"SERVICE_TOKEN": short_secret}, clear=False):
+                store.write_latest(result)
+
+            latest = json.loads((Path(temp_dir) / "latest.json").read_text())
+            self.assertNotIn(short_secret, json.dumps(latest))
+            self.assertEqual(latest["schema_version"], "1")
+
+    def test_private_token_query_is_redacted(self):
+        """防止 private_token 查询参数绕过 URL 脱敏。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = StateStore(Path(temp_dir))
+            query_secret = "query-secret-19d4"
+            result = Result(
+                "inspect",
+                "blocked",
+                (),
+                {"remote_url": "https://example.invalid/repository?private_token=" + query_secret},
+                (),
+                False,
+                (),
+                None,
+                False,
+            )
+
+            store.write_latest(result)
+
+            latest = json.loads((Path(temp_dir) / "latest.json").read_text())
+            self.assertNotIn(query_secret, json.dumps(latest))
+            self.assertEqual(latest["schema_version"], "1")
+
+    def test_password_assignment_text_is_redacted(self):
+        """防止非 URL 文本中的 password 赋值进入持久化状态。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = StateStore(Path(temp_dir))
+            helper_secret = "helper-secret-72b1"
+            result = Result(
+                "inspect",
+                "blocked",
+                ("password=" + helper_secret,),
+                {"diagnostic": "password:" + helper_secret},
+                (),
+                False,
+                (),
+                None,
+                False,
+            )
+
+            store.write_latest(result)
+
+            latest = json.loads((Path(temp_dir) / "latest.json").read_text())
+            self.assertNotIn(helper_secret, json.dumps(latest))
+            self.assertEqual(latest["schema_version"], "1")
+
 
 if __name__ == "__main__":
     unittest.main()

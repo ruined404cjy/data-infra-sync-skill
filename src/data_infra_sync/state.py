@@ -11,8 +11,15 @@ from typing import Any, Iterator, Mapping
 
 
 _URL_USERINFO = re.compile(r"((?:[a-z][a-z0-9+.-]*://))[^/@\s]+@", re.IGNORECASE)
-_URL_TOKEN = re.compile(r"([?&](?:token|access_token|password|secret)=)[^&#\s]*", re.IGNORECASE)
-_SENSITIVE_KEY = re.compile(r"(?:token|password|secret|credential|authorization)", re.IGNORECASE)
+_SENSITIVE_WORDS = (
+    r"access_token|private_token|api_key|token|password|passwd|secret|credential|authorization|auth|key"
+)
+_URL_TOKEN = re.compile(r"([?&](?:" + _SENSITIVE_WORDS + r")=)[^&#\s]*", re.IGNORECASE)
+_SENSITIVE_ASSIGNMENT = re.compile(
+    r"(\b(?:" + _SENSITIVE_WORDS + r")\s*[:=]\s*)[^,\s&#]*", re.IGNORECASE
+)
+_SENSITIVE_KEY = re.compile(_SENSITIVE_WORDS, re.IGNORECASE)
+_SENSITIVE_ENV_NAME = re.compile(_SENSITIVE_WORDS, re.IGNORECASE)
 _REDACTED = "[REDACTED]"
 
 
@@ -93,10 +100,22 @@ def _redact(value: Any) -> Any:
     if isinstance(value, str):
         redacted = _URL_USERINFO.sub(r"\1", value)
         redacted = _URL_TOKEN.sub(r"\1" + _REDACTED, redacted)
-        environment_values = sorted(
-            {item for item in os.environ.values() if len(item) > 3}, key=len, reverse=True
-        )
+        redacted = _SENSITIVE_ASSIGNMENT.sub(r"\1" + _REDACTED, redacted)
+        environment_values = sorted(_sensitive_environment_values(), key=len, reverse=True)
         for secret in environment_values:
             redacted = redacted.replace(secret, _REDACTED)
         return redacted
     return value
+
+
+def _sensitive_environment_values() -> set[str]:
+    """返回按名称规则判定为敏感的非空环境变量值。"""
+    return {
+        value
+        for name, value in os.environ.items()
+        if value
+        and (
+            name.upper().startswith("DATA_INFRA_SYNC_")
+            or _SENSITIVE_ENV_NAME.search(name) is not None
+        )
+    }
