@@ -282,6 +282,52 @@ class StateStoreTest(unittest.TestCase):
             self.assertNotIn(helper_secret, json.dumps(latest))
             self.assertEqual(latest["schema_version"], "1")
 
+    def test_schema_version_skips_short_environment_value_replacement(self):
+        """防止敏感环境变量值与 schema 常量相同导致协议失效。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = StateStore(Path(temp_dir))
+            result = Result(
+                "inspect",
+                "blocked",
+                (),
+                {"diagnostic": "1"},
+                (),
+                False,
+                (),
+                None,
+                False,
+            )
+
+            with patch.dict(os.environ, {"SERVICE_TOKEN": "1"}, clear=False):
+                store.write_latest(result)
+
+            latest = json.loads((Path(temp_dir) / "latest.json").read_text())
+            self.assertEqual(latest["schema_version"], "1")
+            self.assertEqual(latest["target"]["diagnostic"], "[REDACTED]")
+
+    def test_state_skips_environment_value_replacement_while_free_text_is_redacted(self):
+        """防止敏感环境变量值与 state 枚举相同导致状态协议失效。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = StateStore(Path(temp_dir))
+            result = Result(
+                "inspect",
+                "blocked",
+                (),
+                {"diagnostic": "blocked"},
+                (),
+                False,
+                (),
+                None,
+                False,
+            )
+
+            with patch.dict(os.environ, {"SERVICE_TOKEN": "blocked"}, clear=False):
+                store.write_latest(result)
+
+            latest = json.loads((Path(temp_dir) / "latest.json").read_text())
+            self.assertEqual(latest["state"], "blocked")
+            self.assertEqual(latest["target"]["diagnostic"], "[REDACTED]")
+
 
 if __name__ == "__main__":
     unittest.main()

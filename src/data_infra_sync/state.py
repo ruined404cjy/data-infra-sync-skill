@@ -7,7 +7,7 @@ import re
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator, Mapping
+from typing import Any, Iterator, Mapping, Tuple
 
 
 _URL_USERINFO = re.compile(r"((?:[a-z][a-z0-9+.-]*://))[^/@\s]+@", re.IGNORECASE)
@@ -21,6 +21,23 @@ _SENSITIVE_ASSIGNMENT = re.compile(
 _SENSITIVE_KEY = re.compile(_SENSITIVE_WORDS, re.IGNORECASE)
 _SENSITIVE_ENV_NAME = re.compile(_SENSITIVE_WORDS, re.IGNORECASE)
 _REDACTED = "[REDACTED]"
+_TOP_LEVEL_PROTOCOL_FIELDS = frozenset(
+    {
+        "schema_version",
+        "command",
+        "state",
+        "changed",
+        "snapshot",
+        "stale_target",
+    }
+)
+_ACTION_PROTOCOL_FIELDS = frozenset(
+    {"kind", "mutates_worktree", "requires_confirmation", "preconditions"}
+)
+_REPOSITORY_PROTOCOL_FIELDS = frozenset(
+    {"role", "head", "target_pin", "ahead", "behind", "worktree", "relation", "reason_codes"}
+)
+_TARGET_PROTOCOL_FIELDS = frozenset({"parent_commit", "gitlinks"})
 
 
 class StateStore:
@@ -86,26 +103,44 @@ class StateStore:
         self.state_dir.mkdir(parents=True, exist_ok=True)
 
 
-def _redact(value: Any) -> Any:
-    """递归删除 URL userinfo 和当前环境变量值。"""
+def _redact(value: Any, path: Tuple[object, ...] = ()) -> Any:
+    """按 JSON 路径递归删除凭据并保留协议控制字段。"""
     if isinstance(value, Mapping):
         return {
-            key: _REDACTED if _SENSITIVE_KEY.search(str(key)) else _redact(item)
+            key: _REDACTED
+            if _SENSITIVE_KEY.search(str(key))
+            else _redact(item, path + (str(key),))
             for key, item in value.items()
         }
     if isinstance(value, list):
-        return [_redact(item) for item in value]
+        return [_redact(item, path + (index,)) for index, item in enumerate(value)]
     if isinstance(value, tuple):
-        return [_redact(item) for item in value]
+        return [_redact(item, path + (index,)) for index, item in enumerate(value)]
     if isinstance(value, str):
         redacted = _URL_USERINFO.sub(r"\1", value)
         redacted = _URL_TOKEN.sub(r"\1" + _REDACTED, redacted)
         redacted = _SENSITIVE_ASSIGNMENT.sub(r"\1" + _REDACTED, redacted)
-        environment_values = sorted(_sensitive_environment_values(), key=len, reverse=True)
-        for secret in environment_values:
-            redacted = redacted.replace(secret, _REDACTED)
+        if not _is_protocol_path(path):
+            environment_values = sorted(_sensitive_environment_values(), key=len, reverse=True)
+            for secret in environment_values:
+                redacted = redacted.replace(secret, _REDACTED)
         return redacted
     return value
+
+
+def _is_protocol_path(path: Tuple[object, ...]) -> bool:
+    """判断路径是否指向 schema 控制且不接受环境值替换的字段。"""
+    if not path:
+        return False
+    if path[0] in _TOP_LEVEL_PROTOCOL_FIELDS:
+        return True
+    if len(path) >= 3 and path[0] == "next_actions":
+        return path[2] in _ACTION_PROTOCOL_FIELDS
+    if len(path) >= 3 and path[0] == "repositories":
+        return path[2] in _REPOSITORY_PROTOCOL_FIELDS
+    if len(path) >= 2 and path[0] == "target":
+        return path[1] in _TARGET_PROTOCOL_FIELDS
+    return False
 
 
 def _sensitive_environment_values() -> set[str]:
