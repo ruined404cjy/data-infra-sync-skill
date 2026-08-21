@@ -1,0 +1,225 @@
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from data_infra_sync.config import load_config
+from data_infra_sync.model import Result
+from data_infra_sync.state import StateStore
+
+
+class WorkspaceConfigTest(unittest.TestCase):
+    def test_adapter_defaults_supply_current_root_origin_and_main(self):
+        """防止缺少全部配置时偏离适配器的最小默认值。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            previous_cwd = Path.cwd()
+            try:
+                os.chdir(temp_path)
+                config = load_config({}, {}, temp_path / "missing.conf")
+            finally:
+                os.chdir(previous_cwd)
+
+            self.assertEqual(config.root, temp_path.resolve())
+            self.assertEqual(config.target_remote, "origin")
+            self.assertEqual(config.target_branch, "main")
+
+    def test_cli_values_override_environment_file_and_defaults(self):
+        """防止较低优先级配置覆盖显式命令行参数。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            config_path = temp_path / "workspace.conf"
+            self._write_config(
+                config_path,
+                {
+                    "root": str(temp_path / "file-root"),
+                    "targetRemote": "file-remote",
+                    "targetBranch": "file-branch",
+                    "stateDir": str(temp_path / "file-state"),
+                },
+            )
+
+            config = load_config(
+                {
+                    "root": str(temp_path / "cli-root"),
+                    "target_remote": "cli-remote",
+                    "target_branch": "cli-branch",
+                    "state_dir": str(temp_path / "cli-state"),
+                },
+                {
+                    "DATA_INFRA_SYNC_ROOT": str(temp_path / "env-root"),
+                    "DATA_INFRA_SYNC_TARGET_REMOTE": "env-remote",
+                    "DATA_INFRA_SYNC_TARGET_BRANCH": "env-branch",
+                    "DATA_INFRA_SYNC_STATE_DIR": str(temp_path / "env-state"),
+                },
+                config_path,
+            )
+
+            self.assertEqual(config.root, (temp_path / "cli-root").resolve())
+            self.assertEqual(config.target_remote, "cli-remote")
+            self.assertEqual(config.target_branch, "cli-branch")
+            self.assertEqual(config.state_dir, (temp_path / "cli-state").resolve())
+            self.assertEqual(config.config_path, config_path.resolve())
+
+    def test_environment_values_override_file_and_defaults(self):
+        """防止工作区配置覆盖调用环境。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            config_path = temp_path / "workspace.conf"
+            self._write_config(
+                config_path,
+                {"targetRemote": "file-remote", "targetBranch": "file-branch"},
+            )
+
+            config = load_config(
+                {},
+                {
+                    "DATA_INFRA_SYNC_TARGET_REMOTE": "env-remote",
+                    "DATA_INFRA_SYNC_TARGET_BRANCH": "env-branch",
+                },
+                config_path,
+            )
+
+            self.assertEqual(config.target_remote, "env-remote")
+            self.assertEqual(config.target_branch, "env-branch")
+
+    def test_workspace_file_values_override_adapter_defaults(self):
+        """防止适配器默认值覆盖已保存的工作区选择。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            config_path = temp_path / "workspace.conf"
+            self._write_config(
+                config_path,
+                {"targetRemote": "file-remote", "targetBranch": "file-branch"},
+            )
+
+            config = load_config({}, {}, config_path)
+
+            self.assertEqual(config.target_remote, "file-remote")
+            self.assertEqual(config.target_branch, "file-branch")
+
+    def test_default_config_and_state_paths_use_distinct_canonical_workspace_keys(self):
+        """防止不同绝对工作区共享配置或状态目录。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            environ = {
+                "XDG_CONFIG_HOME": str(temp_path / "config"),
+                "XDG_STATE_HOME": str(temp_path / "state"),
+            }
+
+            first = load_config({"root": str(temp_path / "first")}, environ, None)
+            second = load_config({"root": str(temp_path / "second")}, environ, None)
+
+            first_key = hashlib.sha256(str((temp_path / "first").resolve()).encode()).hexdigest()[:16]
+            second_key = hashlib.sha256(str((temp_path / "second").resolve()).encode()).hexdigest()[:16]
+            self.assertNotEqual(first_key, second_key)
+            self.assertEqual(first.config_path, temp_path / "config/data-infra-sync-skill" / (first_key + ".conf"))
+            self.assertEqual(second.config_path, temp_path / "config/data-infra-sync-skill" / (second_key + ".conf"))
+            self.assertEqual(first.state_dir, temp_path / "state/data-infra-sync-skill" / first_key)
+            self.assertEqual(second.state_dir, temp_path / "state/data-infra-sync-skill" / second_key)
+
+    def test_workspace_root_from_default_file_changes_state_key_not_config_path(self):
+        """防止文件中的 root 仍使用查找配置时的旧状态目录。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            initial_root = temp_path / "initial-root"
+            final_root = temp_path / "final-root"
+            environ = {
+                "XDG_CONFIG_HOME": str(temp_path / "config"),
+                "XDG_STATE_HOME": str(temp_path / "state"),
+            }
+            initial_key = hashlib.sha256(str(initial_root.resolve()).encode()).hexdigest()[:16]
+            final_key = hashlib.sha256(str(final_root.resolve()).encode()).hexdigest()[:16]
+            config_path = temp_path / "config/data-infra-sync-skill" / (initial_key + ".conf")
+            self._write_config(config_path, {"root": str(final_root)})
+
+            initial_root.mkdir()
+            previous_cwd = Path.cwd()
+            try:
+                os.chdir(initial_root)
+                config = load_config({}, environ, None)
+            finally:
+                os.chdir(previous_cwd)
+
+            self.assertEqual(config.config_path, config_path)
+            self.assertEqual(config.root, final_root.resolve())
+            self.assertEqual(config.state_dir, temp_path / "state/data-infra-sync-skill" / final_key)
+
+    @staticmethod
+    def _write_config(path, values):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        for key, value in values.items():
+            subprocess.run(
+                ["git", "config", "--file", str(path), "data-infra-sync." + key, value],
+                check=True,
+            )
+
+
+class StateStoreTest(unittest.TestCase):
+    def test_latest_replaces_atomically_without_temporary_files(self):
+        """防止状态写入留下可被后续读取器误判的临时 JSON。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = StateStore(Path(temp_dir))
+            result = Result("inspect", "up_to_date", (), None, (), False, (), None, False)
+
+            store.write_latest(result)
+
+            self.assertEqual(json.loads((Path(temp_dir) / "latest.json").read_text())["state"], "up_to_date")
+            self.assertEqual(list(Path(temp_dir).glob("*.tmp")), [])
+
+    def test_second_lock_attempt_fails_without_waiting(self):
+        """防止两个同步进程同时修改同一状态目录。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = StateStore(Path(temp_dir))
+
+            with store.lock():
+                with self.assertRaises(BlockingIOError):
+                    with StateStore(Path(temp_dir)).lock():
+                        pass
+
+    def test_persisted_json_redacts_url_userinfo_tokens_and_environment_values(self):
+        """防止凭据通过结果、manifest 或环境变量进入磁盘。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = StateStore(Path(temp_dir))
+            secret = "environment-secret-value"
+            inline_token = "inline-token-value"
+            result = Result(
+                "inspect",
+                "blocked",
+                ("token=" + secret,),
+                {
+                    "remote_url": "https://user:token@example.invalid/repository?token=" + inline_token,
+                    "token": inline_token,
+                },
+                (),
+                False,
+                (),
+                None,
+                False,
+            )
+
+            with patch.dict(os.environ, {"DATA_INFRA_SYNC_TOKEN": secret}, clear=False):
+                store.write_latest(result)
+                store.append_event(result)
+                store.write_manifest({"source": secret, "url": "ssh://user:token@example.invalid/repository"})
+
+            persisted = "\n".join(
+                path.read_text() for path in Path(temp_dir).glob("*.json*")
+            )
+            self.assertNotIn("user:token", persisted)
+            self.assertNotIn("token@example.invalid", persisted)
+            self.assertNotIn(secret, persisted)
+            self.assertNotIn(inline_token, persisted)
+            self.assertEqual(json.loads((Path(temp_dir) / "latest.json").read_text())["schema_version"], "1")
+
+
+if __name__ == "__main__":
+    unittest.main()
