@@ -57,6 +57,8 @@ def resume_branch(git: Git, repo: Path, target_pin: str, name: str) -> Result:
         )
     if not _local_branch_exists(git, repo, name):
         return _result("branch resume", "blocked", ("branch_missing",), facts, target_pin, relation)
+    if facts.branch == name:
+        return _result("branch resume", "branch_resumed", (), facts, target_pin, relation)
 
     git.run(repo, ("switch", name))
     updated = git.inspect_repo(repo)
@@ -69,19 +71,14 @@ def resume_branch(git: Git, repo: Path, target_pin: str, name: str) -> Result:
 def publish_check(git: Git, repo: Path, target_pin: str) -> Result:
     """fresh fetch 后检查 upstream 发布与目标 pin 覆盖状态。"""
     facts = git.inspect_repo(repo)
-    if not _target_exists(git, repo, target_pin):
+    if facts.worktree != "clean":
         return _result(
             "branch publish-check",
-            "waiting_for_pin",
-            ("target_pin_missing",),
+            "blocked",
+            ("dirty_worktree",),
             facts,
             target_pin,
             "not_applicable",
-        )
-    relation = _relation(git, repo, facts, target_pin, True)
-    if facts.worktree != "clean":
-        return _result(
-            "branch publish-check", "blocked", ("dirty_worktree",), facts, target_pin, relation
         )
     if facts.operation is not None:
         return _result(
@@ -90,15 +87,29 @@ def publish_check(git: Git, repo: Path, target_pin: str) -> Result:
             ("active_git_operation",),
             facts,
             target_pin,
-            relation,
+            "not_applicable",
         )
     if facts.upstream is None:
         return _result(
-            "branch publish-check", "blocked", ("upstream_missing",), facts, target_pin, relation
+            "branch publish-check",
+            "blocked",
+            ("upstream_missing",),
+            facts,
+            target_pin,
+            "not_applicable",
         )
 
     git.run(repo, ("fetch",))
     fresh = git.inspect_repo(repo)
+    if not _target_exists(git, repo, target_pin):
+        return _result(
+            "branch publish-check",
+            "waiting_for_pin",
+            ("target_pin_missing",),
+            fresh,
+            target_pin,
+            "not_applicable",
+        )
     fresh_relation = _relation(git, repo, fresh, target_pin, True)
     upstream_relation = git.relation(repo, fresh.head, fresh.upstream)
     if upstream_relation not in _CONTAINED_RELATIONS:

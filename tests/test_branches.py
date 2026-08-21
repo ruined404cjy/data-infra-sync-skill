@@ -64,6 +64,21 @@ class DevelopmentBranchTest(unittest.TestCase):
         self.assertTrue(result.changed)
         self.assertEqual(self.git.inspect_repo(self.fixture.submodule).branch, "feature/work")
 
+    def test_resume_is_idempotent_when_already_on_the_requested_branch(self):
+        self.fixture.create_branch(
+            self.fixture.submodule, "feature/work", self.fixture.target_pin
+        )
+        self.fixture.switch(self.fixture.submodule, "feature/work")
+        before = self._repository_snapshot()
+
+        result = resume_branch(
+            self.git, self.fixture.submodule, self.fixture.target_pin, "feature/work"
+        )
+
+        self.assertEqual(result.state, "branch_resumed")
+        self.assertFalse(result.changed)
+        self.assertEqual(self._repository_snapshot(), before)
+
     def test_branch_status_reports_ahead_behind_and_target_coverage(self):
         self.fixture.commit_file(
             self.fixture.submodule, "local.txt", "local\n", "local commit"
@@ -88,6 +103,24 @@ class DevelopmentBranchTest(unittest.TestCase):
         self.assertEqual(result.state, "publish_verified")
         self.assertFalse(result.changed)
         self.assertEqual(repository["behind"], 1)
+
+    def test_publish_check_fetches_a_target_pin_missing_from_the_local_object_store(self):
+        remote = self._clone_submodule("submodule target update")
+        target_pin = self.fixture.commit_file(
+            remote, "target.txt", "target\n", "advance target"
+        )
+        self.fixture._run(remote, ("push", "origin", "main"))
+        before_fetch = self.git.run(
+            self.fixture.submodule,
+            ("rev-parse", "--verify", "--quiet", "{}^{{commit}}".format(target_pin)),
+            check=False,
+        )
+
+        result = publish_check(self.git, self.fixture.submodule, target_pin)
+
+        self.assertNotEqual(before_fetch.returncode, 0)
+        self.assertEqual(result.state, "publish_verified")
+        self.assertEqual(result.repositories[0]["target_pin"], target_pin)
 
     def test_publish_check_requires_publish_when_upstream_does_not_cover_head(self):
         self.fixture.commit_file(
