@@ -1,5 +1,9 @@
 """组合仓同步计划的复检、受控写入与部分状态报告。"""
 
+import hashlib
+import os
+import stat
+from pathlib import Path
 from typing import Optional
 
 from data_infra_sync.git import GitError
@@ -65,10 +69,11 @@ def execute_sync(
     writes_started = False
     write_attempted = False
     failure_reason = "sync_write_failed"
+    before_fingerprint = _domain_fingerprint(git, adapter, facts)
     try:
         # partial 重入时父仓已到目标；此时补丁已暂停，无需再次 reverse。
         if facts.current_parent != facts.target_parent:
-            for patch in sorted(current_patches, key=_patch_key):
+            for patch in reversed(current_patches):
                 failure_reason = "managed_patch_reverse_failed"
                 state = adapter.patch_state(git, patch)
                 if state == "applied":
@@ -105,7 +110,7 @@ def execute_sync(
                 )
             writes_started = True
 
-        for patch in sorted(target_patches, key=_patch_key):
+        for patch in target_patches:
             failure_reason = "managed_patch_apply_failed"
             state = adapter.patch_state(git, patch)
             if state == "absent":
@@ -123,7 +128,13 @@ def execute_sync(
         return _from_plan(post_plan, "updated", (), changed=True)
     except GitError:
         actual = _read_actual_state(git, adapter, facts, plan)
-        if not writes_started and (not write_attempted or actual["changed"] is False):
+        after_fingerprint = _domain_fingerprint(git, adapter, facts)
+        proven_unchanged = (
+            before_fingerprint is not None
+            and after_fingerprint is not None
+            and before_fingerprint == after_fingerprint
+        )
+        if not writes_started and (not write_attempted or proven_unchanged):
             return _failed(plan, failure_reason)
         return _partial(actual, failure_reason)
     except _PatchTransitionError:
@@ -143,8 +154,8 @@ class _PatchTransitionError(RuntimeError):
 
 def _continuous_declarations(current, target) -> bool:
     """确认补丁数量、名称、字节哈希、目标子仓和适用路径完全相同。"""
-    current_keys = tuple(sorted((_patch_key(item) for item in current)))
-    target_keys = tuple(sorted((_patch_key(item) for item in target)))
+    current_keys = tuple(_patch_key(item) for item in current)
+    target_keys = tuple(_patch_key(item) for item in target)
     current_names = tuple(item[0] for item in current_keys)
     target_names = tuple(item[0] for item in target_keys)
     return (
@@ -170,7 +181,6 @@ def _read_actual_state(git, adapter, facts, before_plan):
         actual_facts = adapter.collect_plan_facts(git, fresh=False)
         actual_plan = plan_sync(actual_facts)
         actual = _actual_from_plan(actual_plan)
-        actual["changed"] = _facts_signature(actual_facts) != _facts_signature(facts)
         return actual
     except GitError:
         return _read_repositories_individually(git, adapter, facts, before_plan)
@@ -185,34 +195,33 @@ def _read_repositories_individually(git, adapter, facts, before_plan):
         logical_path = previous["path"]
         path = facts.parent.path if logical_path == "." else adapter.root / logical_path
         try:
+            head = git.run(path, ("rev-parse", "HEAD")).stdout.strip() or None
+        except (GitError, OSError):
+            head = None
+        try:
             observed = git.inspect_repo(path)
-            item, item_read_failed = _observed_repository(
-                git, path, logical_path, previous, observed
-            )
-            read_failed = read_failed or item_read_failed
-            changed = changed or any(
-                item[key] != previous[key]
-                for key in ("head", "branch", "worktree")
-            )
-            repositories.append(
-                item if item_read_failed else _progress_repository(item)
-            )
-        except GitError:
+        except (GitError, OSError):
             read_failed = True
-            item = dict(previous)
-            item.update(
-                {
-                    "head": None,
-                    "branch": None,
-                    "upstream": None,
-                    "ahead": None,
-                    "behind": None,
-                    "worktree": "missing",
-                    "relation": "not_applicable",
-                    "reason_codes": ["actual_state_read_failed"],
-                }
+            item = _repository_with_unread_auxiliary(
+                git, path, previous, head
             )
             repositories.append(item)
+            changed = changed or head != previous["head"]
+            continue
+
+        if head is None:
+            head = observed.head
+        item, item_read_failed = _observed_repository(
+            git, path, logical_path, previous, observed, head
+        )
+        read_failed = read_failed or item_read_failed
+        changed = changed or any(
+            item[key] != previous[key]
+            for key in ("head", "branch", "worktree")
+        )
+        repositories.append(
+            item if item_read_failed else _progress_repository(item)
+        )
     return {
         "target": before_plan.target,
         "repositories": tuple(repositories),
@@ -223,21 +232,45 @@ def _read_repositories_individually(git, adapter, facts, before_plan):
     }
 
 
-def _observed_repository(git, path, logical_path, previous, observed):
+def _repository_with_unread_auxiliary(git, path, previous, head):
+    """保留独立读取的 HEAD，并显式降级不可读辅助字段。"""
+    relation = "not_applicable"
+    if head is not None and previous["target_pin"] is not None:
+        try:
+            relation = git.relation(path, head, previous["target_pin"])
+        except GitError:
+            pass
+    item = dict(previous)
+    item.update(
+        {
+            "head": head,
+            "branch": None,
+            "upstream": None,
+            "ahead": None,
+            "behind": None,
+            "worktree": "missing",
+            "relation": relation,
+            "reason_codes": ["actual_state_read_failed"],
+        }
+    )
+    return item
+
+
+def _observed_repository(git, path, logical_path, previous, observed, head):
     """将逐仓读取结果转换为协议 repository 对象。"""
     target_pin = previous["target_pin"]
     relation = "not_applicable"
     reason_codes = []
-    if observed.head is not None and target_pin is not None:
+    if head is not None and target_pin is not None:
         try:
-            relation = git.relation(path, observed.head, target_pin)
+            relation = git.relation(path, head, target_pin)
         except GitError:
             reason_codes.append("actual_state_read_failed")
     return (
         {
             "path": logical_path,
             "role": previous["role"],
-            "head": observed.head,
+            "head": head,
             "target_pin": target_pin,
             "branch": observed.branch,
             "upstream": observed.upstream,
@@ -251,27 +284,84 @@ def _observed_repository(git, path, logical_path, previous, observed):
     )
 
 
-def _facts_signature(facts):
-    """返回仅含本地 ref、index 与工作树领域状态的比较值。"""
-    parent = (
-        facts.parent.head,
-        facts.parent.branch,
-        facts.parent.worktree,
-        facts.parent.index_dirty,
-        facts.parent.worktree_dirty,
-    )
-    repositories = tuple(
-        (
-            item.path,
-            item.facts.head,
-            item.facts.branch,
-            item.facts.worktree,
-            item.facts.index_dirty,
-            item.facts.worktree_dirty,
-        )
+def _domain_fingerprint(git, adapter, facts):
+    """精确读取本地 refs、index 和相关工作树内容；任一失败返回 None。"""
+    injected = getattr(git, "domain_fingerprint", None)
+    if injected is not None:
+        return injected(adapter, facts)
+    repositories = [(".", facts.parent.path)]
+    repositories.extend(
+        (item.path, adapter.root / item.path)
         for item in sorted(facts.repositories, key=lambda item: item.path)
     )
-    return parent, repositories
+    try:
+        return tuple(
+            (logical_path, _repository_fingerprint(git, Path(path)))
+            for logical_path, path in repositories
+        )
+    except (GitError, OSError, RuntimeError, ValueError):
+        return None
+
+
+def _repository_fingerprint(git, repository):
+    """返回单仓 refs、index、status 和 tracked/untracked 文件内容指纹。"""
+    if not repository.exists():
+        return ("missing",)
+    head = git.run(repository, ("rev-parse", "HEAD")).stdout.strip()
+    branch = git.run(
+        repository, ("symbolic-ref", "--quiet", "HEAD"), check=False
+    )
+    refs = git.run(
+        repository,
+        ("for-each-ref", "--format=%(refname)%00%(objectname)", "refs/heads"),
+    ).stdout
+    index = git.run(repository, ("ls-files", "--stage", "-z")).stdout
+    status = git.run(
+        repository,
+        ("status", "--porcelain=v1", "-z", "--untracked-files=all"),
+    ).stdout
+    paths = git.run(
+        repository,
+        ("ls-files", "-z", "--cached", "--others", "--exclude-standard"),
+    ).stdout
+    files = tuple(
+        (relative, _path_fingerprint(repository, relative))
+        for relative in sorted(item for item in paths.split("\0") if item)
+    )
+    return (
+        head,
+        branch.returncode,
+        branch.stdout,
+        refs,
+        index,
+        status,
+        files,
+    )
+
+
+def _path_fingerprint(repository, relative):
+    """不跟随 symlink 地计算单个工作树路径的稳定内容指纹。"""
+    path = repository
+    parts = Path(relative).parts
+    for position, part in enumerate(parts):
+        path = path / part
+        metadata = path.lstat()
+        if stat.S_ISLNK(metadata.st_mode):
+            return (
+                "symlink",
+                position,
+                stat.S_IMODE(metadata.st_mode),
+                os.readlink(path),
+            )
+    if stat.S_ISREG(metadata.st_mode):
+        return (
+            "file",
+            stat.S_IMODE(metadata.st_mode),
+            hashlib.sha256(path.read_bytes()).hexdigest(),
+        )
+    if stat.S_ISDIR(metadata.st_mode):
+        return ("directory", stat.S_IMODE(metadata.st_mode))
+    return ("other", metadata.st_mode, metadata.st_size)
 
 
 def _actual_from_plan(plan):

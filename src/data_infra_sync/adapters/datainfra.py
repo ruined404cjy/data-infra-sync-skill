@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Tuple
 
+from data_infra_sync.git import GitError
+
 
 @dataclass(frozen=True)
 class ManagedPatch:
@@ -54,7 +56,9 @@ class DataInfraAdapter:
 
     def patch_state(self, git, patch: ManagedPatch) -> str:
         """返回实际工作树中补丁的 applied、absent 或 invalid 状态。"""
-        repository = self.root / patch.target_submodule
+        repository = _safe_directory(self.root, patch.target_submodule)
+        if repository is None:
+            return "invalid"
         return self._patch_state_at(git, repository, patch)
 
     def preflight_managed_patches(
@@ -63,16 +67,17 @@ class DataInfraAdapter:
         """无领域写入地验证当前 dirty 可清除且目标 pin 可接纳整组补丁。"""
         target_pins = {item.path: item.pin for item in facts.target_submodules}
         patches_by_repository = {}
-        for patch in sorted(target_patches, key=_patch_sort_key):
+        for patch in target_patches:
             if (
                 patch.target_submodule not in target_pins
+                or not _safe_relative_path(patch.target_submodule)
                 or not _safe_relative_path(patch.apply_path)
             ):
                 return False
             patches_by_repository.setdefault(patch.target_submodule, []).append(patch)
 
         current_by_repository = {}
-        for patch in sorted(current_patches, key=_patch_sort_key):
+        for patch in current_patches:
             current_by_repository.setdefault(patch.target_submodule, []).append(patch)
 
         for path, patches in patches_by_repository.items():
@@ -87,12 +92,21 @@ class DataInfraAdapter:
 
     def _apply_patch(self, git, patch: ManagedPatch, *, reverse: bool) -> None:
         """通过临时补丁文件调用 Git argv 边界。"""
-        repository = self.root / patch.target_submodule
+        repository = _safe_directory(self.root, patch.target_submodule)
+        if repository is None:
+            raise GitError(("git", "apply"), "unsafe managed patch target", 2)
         self._apply_patch_at(git, repository, patch, reverse=reverse)
 
     def _current_worktree_is_exact(self, git, path, patches) -> bool:
         """在工作树副本中移除已应用补丁，确认没有其他 Git 改动。"""
-        repository = self.root / path
+        repository = _safe_directory(self.root, path)
+        if repository is None:
+            return False
+        if any(
+            _safe_directory(repository, patch.apply_path) is None
+            for patch in patches
+        ):
+            return False
         git_dir = git.run(
             repository, ("rev-parse", "--absolute-git-dir")
         ).stdout.strip()
@@ -107,7 +121,9 @@ class DataInfraAdapter:
                 "--git-dir={}".format(git_dir),
                 "--work-tree={}".format(worktree),
             )
-            for patch in patches:
+            for patch in reversed(patches):
+                if _safe_directory(worktree, patch.apply_path) is None:
+                    return False
                 state = self._patch_state_at(
                     git, worktree, patch, git_options=git_options
                 )
@@ -130,7 +146,9 @@ class DataInfraAdapter:
 
     def _target_accepts_patches(self, git, path, target_pin, patches) -> bool:
         """在隔离临时 worktree 中验证目标 pin 可应用或已等价。"""
-        repository = self.root / path
+        repository = _safe_directory(self.root, path)
+        if repository is None:
+            return False
         with tempfile.TemporaryDirectory(prefix="data-infra-sync-target-") as directory:
             worktree = Path(directory) / "target"
             git.run(
@@ -139,6 +157,8 @@ class DataInfraAdapter:
             )
             try:
                 for patch in patches:
+                    if _safe_directory(worktree, patch.apply_path) is None:
+                        return False
                     state = self._patch_state_at(git, worktree, patch)
                     if state == "absent":
                         self._apply_patch_at(git, worktree, patch, reverse=False)
@@ -155,10 +175,12 @@ class DataInfraAdapter:
         self, git, repository, patch, *, git_options=()
     ) -> str:
         """在指定工作树执行双向 check，区分 applied、absent 与 invalid。"""
+        apply_path = _safe_directory(repository, patch.apply_path)
+        if apply_path is None:
+            return "invalid"
         with tempfile.NamedTemporaryFile(prefix="data-infra-sync-", suffix=".patch") as handle:
             handle.write(patch.content)
             handle.flush()
-            apply_path = Path(repository) / patch.apply_path
             reverse = git.run(
                 apply_path,
                 tuple(git_options)
@@ -180,6 +202,9 @@ class DataInfraAdapter:
         self, git, repository, patch, *, reverse, git_options=()
     ) -> None:
         """在指定工作树通过临时文件应用或反向应用补丁。"""
+        apply_path = _safe_directory(repository, patch.apply_path)
+        if apply_path is None:
+            raise GitError(("git", "apply"), "unsafe managed patch path", 2)
         with tempfile.NamedTemporaryFile(prefix="data-infra-sync-", suffix=".patch") as handle:
             handle.write(patch.content)
             handle.flush()
@@ -187,20 +212,36 @@ class DataInfraAdapter:
             if reverse:
                 args += ("--reverse",)
             args += (handle.name,)
-            git.run(Path(repository) / patch.apply_path, args)
-
-
-def _patch_sort_key(patch):
-    """返回补丁执行和预检的确定顺序。"""
-    return (
-        patch.target_submodule,
-        patch.apply_path,
-        patch.name,
-        patch.content_hash,
-    )
+            git.run(apply_path, args)
 
 
 def _safe_relative_path(value):
     """确认 apply path 保持在声明的 submodule 内。"""
     path = Path(value)
     return not path.is_absolute() and ".." not in path.parts
+
+
+def _safe_directory(root, relative):
+    """解析并验证 root 内不经过 symlink 的现有目录。"""
+    if not _safe_relative_path(relative):
+        return None
+    try:
+        root = Path(root).resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+    candidate = root
+    for part in Path(relative).parts:
+        candidate = candidate / part
+        try:
+            if candidate.is_symlink() or not candidate.exists():
+                return None
+        except OSError:
+            return None
+    try:
+        resolved = candidate.resolve(strict=True)
+        resolved.relative_to(root)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if resolved != candidate or not resolved.is_dir():
+        return None
+    return resolved

@@ -1,3 +1,5 @@
+import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -47,8 +49,17 @@ class RecordingGit:
         self.fail_init_after_write = False
         self.fail_inspect_paths = set()
         self.fail_relation_paths = set()
+        self.fail_head_paths = set()
 
     def run(self, repo, args, *, check=True):
+        if args[:2] == ("rev-parse", "HEAD"):
+            logical = "." if Path(repo).name == "parent" else "modules/component"
+            if logical in self.fail_head_paths:
+                raise GitError(("git",) + tuple(args), "injected HEAD failure", 128)
+            head = self.parent_head if logical == "." else self.child_head
+            return subprocess.CompletedProcess(
+                ("git",) + tuple(args), 0, (head or "") + "\n", ""
+            )
         if args[:2] == ("merge", "--ff-only"):
             if self.fail_parent_once:
                 self.fail_parent_once = False
@@ -88,6 +99,15 @@ class RecordingGit:
         if logical in self.fail_relation_paths:
             raise GitError(("git", "merge-base"), "injected relation failure", 128)
         return "equal" if head == target else "contained"
+
+    def domain_fingerprint(self, adapter, facts):
+        states = getattr(adapter, "states", None)
+        return (
+            self.parent_head,
+            self.child_head,
+            self.patch_applied,
+            tuple(sorted(states.items())) if states is not None else None,
+        )
 
 
 class ScriptedAdapter:
@@ -192,7 +212,7 @@ class MultiPatchAdapter(ScriptedAdapter):
     def reverse_patch(self, git, patch):
         if self.states[patch.name] != "applied":
             raise GitError(("git", "apply", "--reverse"), "already reversed", 1)
-        if patch.name == "two" and self.fail_second_reverse_once:
+        if patch.name == "one" and self.fail_second_reverse_once:
             self.fail_second_reverse_once = False
             raise GitError(("git", "apply", "--reverse"), "injected second failure", 1)
         self.operations.append("reverse:" + patch.name)
@@ -235,6 +255,34 @@ class FailingPatchGit:
         ):
             self.failed = True
             raise GitError(("git",) + tuple(args), "injected real patch failure", 1)
+        return self.delegate.run(repo, args, check=check)
+
+
+class FailingNthPatchGit:
+    """在真实目标工作树的第 N 个指定补丁动作注入一次失败。"""
+
+    def __init__(self, delegate, repository, phase, nth=2, *, mutate_then_raise=False):
+        self.delegate = delegate
+        self.repository = repository.resolve()
+        self.phase = phase
+        self.nth = nth
+        self.mutate_then_raise = mutate_then_raise
+        self.calls = 0
+        self.failed = False
+
+    def __getattr__(self, name):
+        return getattr(self.delegate, name)
+
+    def run(self, repo, args, *, check=True):
+        is_apply = args and args[0] == "apply" and "--check" not in args
+        phase = "reverse" if "--reverse" in args else "apply"
+        if is_apply and phase == self.phase and Path(repo).resolve() == self.repository:
+            self.calls += 1
+            if self.calls == self.nth and not self.failed:
+                self.failed = True
+                if self.mutate_then_raise:
+                    self.delegate.run(repo, args, check=check)
+                raise GitError(("git",) + tuple(args), "injected nth patch failure", 1)
         return self.delegate.run(repo, args, check=check)
 
 
@@ -312,6 +360,9 @@ class RealCompositeHarness:
         self.fixture._run(sub_updater, ("push", "origin", "main"))
         target_pin = self.fixture.rev_parse(sub_updater, "HEAD")
 
+        return self._push_parent_target(target_pin), target_pin
+
+    def _push_parent_target(self, target_pin):
         parent_updater = self.fixture.clone_parent("parent updater")
         self.fixture._run(
             parent_updater,
@@ -330,7 +381,7 @@ class RealCompositeHarness:
         self.fixture._run(parent_updater, ("add", "modules/component"))
         self.fixture._run(parent_updater, ("commit", "-m", "advance target pin"))
         self.fixture._run(parent_updater, ("push", "origin", "main"))
-        return self.fixture.rev_parse(parent_updater, "HEAD"), target_pin
+        return self.fixture.rev_parse(parent_updater, "HEAD")
 
     def collect_plan_facts(self, git, *, fresh):
         if fresh:
@@ -382,6 +433,110 @@ class RealCompositeHarness:
                 ("status", "--porcelain=v1", "-z", "--untracked-files=all"),
             ).stdout,
         )
+
+
+class StackedPatchHarness(RealCompositeHarness):
+    """构造同一文件 A→B、B→C 的有序补丁栈。"""
+
+    def _add_base_files(self):
+        self.fixture.commit_file(self.fixture.submodule, "stack.txt", "A\n", "add stack")
+        self.fixture._run(self.fixture.submodule, ("push", "origin", "main"))
+        self.fixture._run(self.fixture.parent, ("add", "modules/component"))
+        self.fixture._run(self.fixture.parent, ("commit", "-m", "advance stack base"))
+        self.fixture._run(self.fixture.parent, ("push", "origin", "main"))
+
+    def _create_patches(self):
+        return (
+            ManagedPatch(
+                "a-to-b",
+                "modules/component",
+                ".",
+                _single_line_patch("stack.txt", "A", "B"),
+            ),
+            ManagedPatch(
+                "b-to-c",
+                "modules/component",
+                ".",
+                _single_line_patch("stack.txt", "B", "C"),
+            ),
+        )
+
+
+class SymlinkEscapeHarness(RealCompositeHarness):
+    """构造目标 apply path 指向外部仓库的 symlink 场景。"""
+
+    def __init__(self, root):
+        self.external = root / "external repository"
+        CompositeFixture._run(root, ("init", "--initial-branch=main", str(self.external)))
+        CompositeFixture._configure_user(self.external)
+        (self.external / "apply-link").mkdir()
+        (self.external / "apply-link/victim.txt").write_text(
+            "outside base\n", encoding="utf-8"
+        )
+        CompositeFixture._run(self.external, ("add", "apply-link/victim.txt"))
+        CompositeFixture._run(self.external, ("commit", "-m", "external base"))
+        super().__init__(root)
+
+    def _add_base_files(self):
+        self.fixture.commit_file(
+            self.fixture.submodule,
+            "apply-link/victim.txt",
+            "outside base\n",
+            "add internal apply path",
+        )
+        self.fixture._run(self.fixture.submodule, ("push", "origin", "main"))
+        self.fixture._run(self.fixture.parent, ("add", "modules/component"))
+        self.fixture._run(self.fixture.parent, ("commit", "-m", "advance symlink base"))
+        self.fixture._run(self.fixture.parent, ("push", "origin", "main"))
+
+    def _create_patches(self):
+        return (
+            ManagedPatch(
+                "external-write",
+                "modules/component",
+                "apply-link",
+                _single_line_patch(
+                    "apply-link/victim.txt", "outside base", "patched"
+                ),
+            ),
+        )
+
+    def _push_target(self, conflicting_target, target_contains_patches):
+        sub_updater = self.fixture.root / "sub updater"
+        self.fixture._run(
+            self.fixture.root,
+            ("clone", str(self.fixture.submodule_remote), str(sub_updater)),
+        )
+        self.fixture._configure_user(sub_updater)
+        shutil.rmtree(sub_updater / "apply-link")
+        os.symlink(str(self.external), sub_updater / "apply-link")
+        self.fixture._run(sub_updater, ("add", "-A"))
+        self.fixture._run(sub_updater, ("commit", "-m", "replace apply path with symlink"))
+        self.fixture._run(sub_updater, ("push", "origin", "main"))
+        target_pin = self.fixture.rev_parse(sub_updater, "HEAD")
+        return self._push_parent_target(target_pin), target_pin
+
+    def external_snapshot(self):
+        return (
+            self.fixture.rev_parse(self.external, "HEAD"),
+            self.fixture._run(self.external, ("write-tree",)).stdout.strip(),
+            self.git.run(
+                self.external,
+                ("status", "--porcelain=v1", "-z", "--untracked-files=all"),
+            ).stdout,
+            (self.external / "apply-link/victim.txt").read_bytes(),
+        )
+
+
+def _single_line_patch(path, before, after):
+    return (
+        "diff --git a/{0} b/{0}\n"
+        "--- a/{0}\n"
+        "+++ b/{0}\n"
+        "@@ -1 +1 @@\n"
+        "-{1}\n"
+        "+{2}\n".format(path, before, after)
+    ).encode("utf-8")
 
 
 class ExecutorPreflightTest(unittest.TestCase):
@@ -463,6 +618,23 @@ class ExecutorPreflightTest(unittest.TestCase):
                 self.assertFalse(result.changed)
                 self.assertEqual(git.writes, [])
                 self.assertEqual(adapter.operations, [])
+
+    def test_patch_declaration_order_change_is_a_transition(self):
+        git = RecordingGit()
+        patches = (
+            ManagedPatch("first", "modules/component", ".", b"first\n"),
+            ManagedPatch("second", "modules/component", ".", b"second\n"),
+        )
+        adapter = ScriptedAdapter(git, patches, tuple(reversed(patches)))
+
+        result = execute_sync(git, adapter, None, True)
+
+        self.assertEqual(result.state, "blocked")
+        self.assertEqual(
+            result.reason_codes, ("managed_patch_transition_required",)
+        )
+        self.assertEqual(git.writes, [])
+        self.assertEqual(adapter.operations, [])
 
     def test_patch_content_preflight_failure_blocks_without_domain_writes(self):
         git = RecordingGit()
@@ -578,7 +750,7 @@ class ExecutorWriteTest(unittest.TestCase):
         self.assertEqual(recovered.state, "updated")
         self.assertEqual(
             adapter.operations,
-            ["reverse:one", "reverse:two", "apply:one", "apply:two"],
+            ["reverse:two", "reverse:one", "apply:one", "apply:two"],
         )
         self.assertEqual(adapter.states, {"one": "applied", "two": "applied"})
 
@@ -596,6 +768,25 @@ class ExecutorWriteTest(unittest.TestCase):
         self.assertEqual(result.state, "partial")
         self.assertIn("actual_state_read_failed", result.reason_codes)
         self.assertEqual(repositories["."]["head"], TARGET_PARENT)
+        self.assertEqual(repositories["modules/component"]["head"], PIN)
+        self.assertEqual(
+            repositories["modules/component"]["reason_codes"],
+            ["actual_state_read_failed"],
+        )
+
+    def test_partial_uses_null_only_when_head_itself_cannot_be_read(self):
+        git = RecordingGit()
+        git.fail_checkout_once = True
+        git.fail_inspect_paths.add("modules/component")
+        git.fail_head_paths.add("modules/component")
+        patch = managed_patch()
+        adapter = ScriptedAdapter(git, (patch,), (patch,))
+        adapter.actual_collect_error = True
+
+        result = execute_sync(git, adapter, None, True)
+
+        repositories = {item["path"]: item for item in result.repositories}
+        self.assertEqual(result.state, "partial")
         self.assertIsNone(repositories["modules/component"]["head"])
         self.assertEqual(
             repositories["modules/component"]["reason_codes"],
@@ -623,6 +814,21 @@ class ExecutorWriteTest(unittest.TestCase):
 
 
 class RealGitExecutorTest(unittest.TestCase):
+    def test_target_apply_path_symlink_cannot_escape_to_external_repository(self):
+        with tempfile.TemporaryDirectory(prefix="executor real symlink ") as directory:
+            harness = SymlinkEscapeHarness(Path(directory))
+            external_before = harness.external_snapshot()
+            domain_before = harness.snapshot()
+
+            result = execute_sync(harness.git, harness.adapter, None, True)
+
+            self.assertEqual(result.state, "blocked")
+            self.assertEqual(
+                result.reason_codes, ("managed_patch_transition_required",)
+            )
+            self.assertEqual(harness.external_snapshot(), external_before)
+            self.assertEqual(harness.snapshot(), domain_before)
+
     def test_target_patch_conflict_blocks_before_real_domain_writes(self):
         with tempfile.TemporaryDirectory(prefix="executor real conflict ") as directory:
             harness = RealCompositeHarness(Path(directory), conflicting_target=True)
@@ -708,7 +914,7 @@ class RealGitExecutorTest(unittest.TestCase):
                     failing_git = FailingPatchGit(
                         harness.git,
                         harness.fixture.submodule,
-                        "two.txt",
+                        "one.txt" if phase == "reverse" else "two.txt",
                         phase,
                     )
 
@@ -733,6 +939,49 @@ class RealGitExecutorTest(unittest.TestCase):
                         (harness.fixture.submodule / "two.txt").read_text(encoding="utf-8"),
                         "base two patched\n",
                     )
+
+    def test_stacked_patches_use_forward_replay_and_reverse_unwind_order(self):
+        for phase in ("reverse", "apply"):
+            with self.subTest(phase=phase):
+                with tempfile.TemporaryDirectory(
+                    prefix="executor real stacked "
+                ) as directory:
+                    harness = StackedPatchHarness(Path(directory))
+                    failing_git = FailingNthPatchGit(
+                        harness.git,
+                        harness.fixture.submodule,
+                        phase,
+                        2,
+                    )
+
+                    partial = execute_sync(failing_git, harness.adapter, None, True)
+                    recovered = execute_sync(failing_git, harness.adapter, None, True)
+
+                    self.assertEqual(partial.state, "partial")
+                    self.assertEqual(recovered.state, "updated")
+                    self.assertEqual(
+                        (harness.fixture.submodule / "stack.txt").read_text(
+                            encoding="utf-8"
+                        ),
+                        "C\n",
+                    )
+
+    def test_first_reverse_content_change_then_error_is_partial(self):
+        with tempfile.TemporaryDirectory(prefix="executor real fingerprint ") as directory:
+            harness = RealCompositeHarness(Path(directory))
+            failing_git = FailingNthPatchGit(
+                harness.git,
+                harness.fixture.submodule,
+                "reverse",
+                1,
+                mutate_then_raise=True,
+            )
+
+            result = execute_sync(failing_git, harness.adapter, None, True)
+
+            self.assertEqual(result.state, "partial")
+            self.assertTrue(result.changed)
+            self.assertEqual(result.next_actions[0].kind, "resume_sync")
 
 
 if __name__ == "__main__":

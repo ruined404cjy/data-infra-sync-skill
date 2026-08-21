@@ -1,8 +1,11 @@
 import hashlib
+import os
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -34,20 +37,58 @@ class ManagedPatchDeclarationTest(unittest.TestCase):
                 calls.append((repo, args[:-1], Path(args[-1]).read_bytes()))
                 return subprocess.CompletedProcess(("git",) + tuple(args), 0, "", "")
 
-        root = Path("/checkout")
-        patch = ManagedPatch("build", "modules/component", "src", b"patch bytes\n")
-        adapter = DataInfraAdapter(root, lambda git, fresh: None, lambda commit: (patch,))
+        with tempfile.TemporaryDirectory(prefix="managed patch ") as directory:
+            root = Path(directory)
+            (root / "modules/component/src").mkdir(parents=True)
+            patch = ManagedPatch("build", "modules/component", "src", b"patch bytes\n")
+            adapter = DataInfraAdapter(
+                root, lambda git, fresh: None, lambda commit: (patch,)
+            )
 
-        adapter.reverse_patch(InspectingGit(), patch)
-        adapter.apply_patch(InspectingGit(), patch)
+            adapter.reverse_patch(InspectingGit(), patch)
+            adapter.apply_patch(InspectingGit(), patch)
 
-        self.assertEqual(
-            calls,
-            [
-                (root / "modules/component/src", ("apply", "--reverse"), patch.content),
-                (root / "modules/component/src", ("apply",), patch.content),
-            ],
-        )
+            self.assertEqual(
+                calls,
+                [
+                    (
+                        root / "modules/component/src",
+                        ("apply", "--reverse"),
+                        patch.content,
+                    ),
+                    (root / "modules/component/src", ("apply",), patch.content),
+                ],
+            )
+
+    def test_preflight_rejects_current_apply_path_symlink_before_git_access(self):
+        """防止 current 副本预检解引用 apply path symlink 后访问外部目录。"""
+
+        class GitMustNotRun:
+            def run(self, repo, args, *, check=True):
+                raise AssertionError("unsafe current path reached Git")
+
+        with tempfile.TemporaryDirectory(prefix="managed patch symlink ") as directory:
+            root = Path(directory)
+            repository = root / "modules/component"
+            external = root / "external"
+            repository.mkdir(parents=True)
+            external.mkdir()
+            os.symlink(str(external), repository / "apply-link")
+            patch = ManagedPatch("build", "modules/component", "apply-link", b"patch\n")
+            adapter = DataInfraAdapter(
+                root, lambda git, fresh: None, lambda commit: (patch,)
+            )
+            facts = SimpleNamespace(
+                target_submodules=(
+                    SimpleNamespace(path="modules/component", pin="a" * 40),
+                )
+            )
+
+            self.assertFalse(
+                adapter.preflight_managed_patches(
+                    GitMustNotRun(), facts, (patch,), (patch,)
+                )
+            )
 
 
 if __name__ == "__main__":
