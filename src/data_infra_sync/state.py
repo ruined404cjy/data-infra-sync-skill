@@ -7,7 +7,7 @@ import re
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator, Mapping, Set, Tuple
+from typing import Any, Iterator, Mapping, Tuple
 
 
 _URL_USERINFO = re.compile(r"((?:[a-z][a-z0-9+.-]*://))[^/@\s]+@", re.IGNORECASE)
@@ -144,7 +144,7 @@ def _is_protocol_path(path: Tuple[object, ...]) -> bool:
     return False
 
 
-def _sensitive_environment_values() -> Set[str]:
+def _sensitive_environment_values() -> set[str]:
     """返回按名称规则判定为敏感的非空环境变量值。"""
     return {
         value
