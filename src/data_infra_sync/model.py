@@ -1,7 +1,7 @@
 """稳定的结构化命令结果模型。"""
 
 from dataclasses import fields, is_dataclass, dataclass
-from typing import Any
+from typing import Any, Optional
 
 
 REQUIRED_RESULT_FIELDS = frozenset(
@@ -38,12 +38,12 @@ class Result:
     command: str
     state: str
     reason_codes: tuple[str, ...]
-    target: dict[str, Any] | None
+    target: Optional[dict[str, Any]]
     repositories: tuple[dict[str, Any], ...]
     changed: bool
     next_actions: tuple[Action, ...]
-    snapshot: str | None
-    stale_target: bool | None
+    snapshot: Optional[str]
+    stale_target: Optional[bool]
 
     def to_dict(self) -> dict[str, object]:
         """返回符合 result-v1 schema 的原生 JSON 数据。"""
