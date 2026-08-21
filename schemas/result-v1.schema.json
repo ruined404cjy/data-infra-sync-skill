@@ -1,0 +1,133 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DataInfra Sync Result v1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "command",
+    "state",
+    "reason_codes",
+    "target",
+    "repositories",
+    "changed",
+    "next_actions",
+    "snapshot",
+    "stale_target"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": "1"
+    },
+    "command": {
+      "type": "string"
+    },
+    "state": {
+      "type": "string"
+    },
+    "reason_codes": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "target": {
+      "oneOf": [
+        { "type": "null" },
+        { "$ref": "#/$defs/target" }
+      ]
+    },
+    "repositories": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/repository" }
+    },
+    "changed": {
+      "type": "boolean"
+    },
+    "next_actions": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/action" }
+    },
+    "snapshot": {
+      "type": ["string", "null"]
+    },
+    "stale_target": {
+      "type": ["boolean", "null"]
+    }
+  },
+  "$defs": {
+    "object_id": {
+      "type": "string",
+      "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"
+    },
+    "target": {
+      "type": "object",
+      "required": ["parent_commit", "remote", "branch", "gitlinks"],
+      "additionalProperties": false,
+      "properties": {
+        "parent_commit": { "$ref": "#/$defs/object_id" },
+        "remote": { "type": "string" },
+        "branch": { "type": "string" },
+        "gitlinks": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/object_id" }
+        }
+      }
+    },
+    "repository": {
+      "type": "object",
+      "required": [
+        "path",
+        "role",
+        "head",
+        "target_pin",
+        "branch",
+        "upstream",
+        "ahead",
+        "behind",
+        "worktree",
+        "relation",
+        "reason_codes"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "path": { "type": "string" },
+        "role": { "enum": ["parent", "submodule"] },
+        "head": { "oneOf": [{ "$ref": "#/$defs/object_id" }, { "type": "null" }] },
+        "target_pin": { "oneOf": [{ "$ref": "#/$defs/object_id" }, { "type": "null" }] },
+        "branch": { "type": ["string", "null"] },
+        "upstream": { "type": ["string", "null"] },
+        "ahead": { "type": ["integer", "null"], "minimum": 0 },
+        "behind": { "type": ["integer", "null"], "minimum": 0 },
+        "worktree": { "enum": ["clean", "dirty", "missing"] },
+        "relation": { "enum": ["equal", "contained", "tree_equal", "diverged", "not_applicable"] },
+        "reason_codes": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "action": {
+      "type": "object",
+      "required": [
+        "kind",
+        "argv",
+        "mutates_worktree",
+        "requires_confirmation",
+        "preconditions"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "type": "string" },
+        "argv": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "mutates_worktree": { "type": "boolean" },
+        "requires_confirmation": { "type": "boolean" },
+        "preconditions": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    }
+  }
+}
