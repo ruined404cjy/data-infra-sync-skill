@@ -88,6 +88,39 @@ class CompositeFixture:
         """在仓库工作树写入未跟踪文件。"""
         (repo / relative_path).write_text("dirty\n", encoding="utf-8")
 
+    def write_file(self, repo: Path, relative_path: str, contents: str) -> None:
+        """写入工作树文件，不修改 index。"""
+        path = repo / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(contents, encoding="utf-8")
+
+    def stage(self, repo: Path, relative_path: str) -> None:
+        """将指定文件写入 index。"""
+        self._run(repo, ("add", relative_path))
+
+    def unset_upstream(self, repo: Path) -> None:
+        """移除当前分支的 upstream 配置。"""
+        self._run(repo, ("branch", "--unset-upstream"))
+
+    def detach(self, repo: Path) -> None:
+        """将 HEAD 切换到当前提交的 detached 状态。"""
+        self._run(repo, ("switch", "--detach", "HEAD"))
+
+    def clone_parent(self, name: str) -> Path:
+        """克隆父仓 remote，供测试创建独立远程提交。"""
+        clone = self.root / name
+        self._run(self.root, ("clone", str(self.parent_remote), str(clone)))
+        self._configure_user(clone)
+        return clone
+
+    def fetch(self, repo: Path) -> None:
+        """更新仓库的远程跟踪引用。"""
+        self._run(repo, ("fetch", "origin"))
+
+    def push(self, repo: Path) -> None:
+        """将当前 main 分支推送到 origin。"""
+        self._run(repo, ("push", "origin", "main"))
+
     def activate_operation(self, repo: Path, marker: str = "MERGE_HEAD") -> None:
         """写入 Git 操作标记，模拟待完成的 Git 操作。"""
         marker_path = Path(self._run(repo, ("rev-parse", "--git-path", marker)).stdout.strip())

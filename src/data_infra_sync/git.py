@@ -112,10 +112,7 @@ class Git:
         branch = self._optional_output(
             resolved_path, ("symbolic-ref", "--quiet", "--short", "HEAD")
         )
-        upstream = self._optional_output(
-            resolved_path,
-            ("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"),
-        )
+        upstream = self._upstream(resolved_path)
         ahead, behind = self._ahead_behind(resolved_path, upstream)
         index_dirty, worktree_dirty = self._status(resolved_path)
         return RepoFacts(
@@ -175,6 +172,20 @@ class Git:
         if completed.returncode == 0:
             return completed.stdout.strip() or None
         if completed.returncode == 1:
+            return None
+        raise GitError(tuple(str(item) for item in completed.args), completed.stderr, completed.returncode)
+
+    def _upstream(self, repo: Path) -> Optional[str]:
+        """返回当前 HEAD 的 upstream，未配置或 detached 时返回 None。"""
+        completed = self.run(
+            repo,
+            ("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"),
+            check=False,
+        )
+        if completed.returncode == 0:
+            return completed.stdout.strip() or None
+        # 此专用 rev-parse 查询以 128 表示无 upstream 或 detached HEAD。
+        if completed.returncode in (1, 128):
             return None
         raise GitError(tuple(str(item) for item in completed.args), completed.stderr, completed.returncode)
 

@@ -61,6 +61,64 @@ class GitFactsTest(unittest.TestCase):
 
         self.assertEqual(active.operation, "merge")
 
+    def test_inspect_repo_distinguishes_staged_only_changes(self):
+        self.fixture.write_file(self.fixture.parent, "staged.txt", "staged\n")
+        self.fixture.stage(self.fixture.parent, "staged.txt")
+
+        facts = self.git.inspect_repo(self.fixture.parent)
+
+        self.assertEqual(facts.worktree, "dirty")
+        self.assertTrue(facts.index_dirty)
+        self.assertFalse(facts.worktree_dirty)
+
+    def test_inspect_repo_reports_mixed_index_and_worktree_changes(self):
+        self.fixture.write_file(self.fixture.parent, "mixed.txt", "staged\n")
+        self.fixture.stage(self.fixture.parent, "mixed.txt")
+        self.fixture.write_file(self.fixture.parent, "mixed.txt", "unstaged\n")
+
+        facts = self.git.inspect_repo(self.fixture.parent)
+
+        self.assertTrue(facts.index_dirty)
+        self.assertTrue(facts.worktree_dirty)
+
+    def test_inspect_repo_returns_none_for_a_branch_without_upstream(self):
+        self.fixture.unset_upstream(self.fixture.parent)
+
+        facts = self.git.inspect_repo(self.fixture.parent)
+
+        self.assertIsNone(facts.upstream)
+        self.assertIsNone(facts.ahead)
+        self.assertIsNone(facts.behind)
+
+    def test_inspect_repo_returns_none_for_detached_head_upstream_facts(self):
+        self.fixture.detach(self.fixture.parent)
+
+        facts = self.git.inspect_repo(self.fixture.parent)
+
+        self.assertIsNone(facts.branch)
+        self.assertIsNone(facts.upstream)
+        self.assertIsNone(facts.ahead)
+        self.assertIsNone(facts.behind)
+
+    def test_inspect_repo_reports_ahead_and_behind_against_upstream(self):
+        self.fixture.commit_file(
+            self.fixture.parent, "local.txt", "local\n", "local commit"
+        )
+
+        ahead = self.git.inspect_repo(self.fixture.parent)
+
+        self.assertEqual(ahead.upstream, "origin/main")
+        self.assertEqual((ahead.ahead, ahead.behind), (1, 0))
+
+        remote = self.fixture.clone_parent("parent remote update")
+        self.fixture.commit_file(remote, "remote.txt", "remote\n", "remote commit")
+        self.fixture.push(remote)
+        self.fixture.fetch(self.fixture.parent)
+
+        diverged = self.git.inspect_repo(self.fixture.parent)
+
+        self.assertEqual((diverged.ahead, diverged.behind), (1, 1))
+
     def test_gitlinks_reads_only_first_level_gitlinks_at_a_parent_commit(self):
         initial = gitlinks(self.fixture.parent, self.fixture.target_parent)
 
