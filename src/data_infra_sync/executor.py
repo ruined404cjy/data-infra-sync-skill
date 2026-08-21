@@ -29,9 +29,7 @@ def execute_sync(
         return _from_plan(
             plan, "blocked", ("managed_patch_transition_required",)
         )
-    if plan.state == "up_to_date":
-        return _from_plan(plan, "updated", (), changed=False)
-    if plan.state != "update_ready":
+    if plan.state not in ("up_to_date", "update_ready"):
         return _from_plan(plan, plan.state, plan.reason_codes)
 
     try:
@@ -43,18 +41,45 @@ def execute_sync(
         return _from_plan(
             plan, "blocked", ("managed_patch_transition_required",)
         )
+    try:
+        preflight_ok = adapter.preflight_managed_patches(
+            git, facts, current_patches, target_patches
+        )
+    except GitError:
+        return _failed(plan, "git_precondition_failed")
+    if not preflight_ok:
+        return _from_plan(
+            plan, "blocked", ("managed_patch_transition_required",)
+        )
+    if plan.state == "up_to_date":
+        try:
+            all_applied = all(
+                adapter.patch_state(git, patch) == "applied"
+                for patch in target_patches
+            )
+        except GitError:
+            return _failed(plan, "git_precondition_failed")
+        if all_applied:
+            return _from_plan(plan, "updated", (), changed=False)
 
     writes_started = False
+    write_attempted = False
     failure_reason = "sync_write_failed"
     try:
         # partial 重入时父仓已到目标；此时补丁已暂停，无需再次 reverse。
         if facts.current_parent != facts.target_parent:
-            for patch in current_patches:
+            for patch in sorted(current_patches, key=_patch_key):
                 failure_reason = "managed_patch_reverse_failed"
-                adapter.reverse_patch(git, patch)
-                writes_started = True
+                state = adapter.patch_state(git, patch)
+                if state == "applied":
+                    write_attempted = True
+                    adapter.reverse_patch(git, patch)
+                    writes_started = True
+                elif state != "absent":
+                    raise _PatchTransitionError()
 
             failure_reason = "parent_update_failed"
+            write_attempted = True
             git.run(
                 facts.parent.path,
                 ("merge", "--ff-only", facts.target_parent),
@@ -67,6 +92,7 @@ def execute_sync(
             if repository.facts.head == target.pin:
                 continue
             failure_reason = "submodule_update_failed"
+            write_attempted = True
             if repository.facts.worktree == "missing":
                 git.run(
                     facts.parent.path,
@@ -79,21 +105,40 @@ def execute_sync(
                 )
             writes_started = True
 
-        for patch in target_patches:
+        for patch in sorted(target_patches, key=_patch_key):
             failure_reason = "managed_patch_apply_failed"
-            adapter.apply_patch(git, patch)
-            writes_started = True
+            state = adapter.patch_state(git, patch)
+            if state == "absent":
+                write_attempted = True
+                adapter.apply_patch(git, patch)
+                writes_started = True
+            elif state != "applied":
+                raise _PatchTransitionError()
 
         failure_reason = "postcondition_failed"
         post_facts = adapter.collect_plan_facts(git, fresh=False)
         post_plan = plan_sync(post_facts)
         if post_plan.state != "up_to_date":
-            return _partial(post_plan, failure_reason)
+            return _partial(_actual_from_plan(post_plan), failure_reason)
         return _from_plan(post_plan, "updated", (), changed=True)
     except GitError:
-        if not writes_started:
+        actual = _read_actual_state(git, adapter, facts, plan)
+        if not writes_started and (not write_attempted or actual["changed"] is False):
             return _failed(plan, failure_reason)
-        return _partial(_actual_plan(git, adapter, plan), failure_reason)
+        return _partial(actual, failure_reason)
+    except _PatchTransitionError:
+        if not writes_started:
+            return _from_plan(
+                plan, "blocked", ("managed_patch_transition_required",)
+            )
+        return _partial(
+            _read_actual_state(git, adapter, facts, plan),
+            "managed_patch_transition_required",
+        )
+
+
+class _PatchTransitionError(RuntimeError):
+    """表示执行期间补丁状态偏离已完成的写前预检。"""
 
 
 def _continuous_declarations(current, target) -> bool:
@@ -119,17 +164,135 @@ def _patch_key(patch):
     )
 
 
-def _actual_plan(git, adapter, fallback):
-    """失败后尽力重新读取实际 HEAD；读取失败时保留最后可信事实。"""
+def _read_actual_state(git, adapter, facts, before_plan):
+    """失败后读取实际状态；完整收集失败时逐仓读取且不复用旧 HEAD。"""
     try:
-        return plan_sync(adapter.collect_plan_facts(git, fresh=False))
+        actual_facts = adapter.collect_plan_facts(git, fresh=False)
+        actual_plan = plan_sync(actual_facts)
+        actual = _actual_from_plan(actual_plan)
+        actual["changed"] = _facts_signature(actual_facts) != _facts_signature(facts)
+        return actual
     except GitError:
-        return fallback
+        return _read_repositories_individually(git, adapter, facts, before_plan)
 
 
-def _partial(plan, reason):
+def _read_repositories_individually(git, adapter, facts, before_plan):
+    """逐仓尽力读取实际 Git 事实，并显式标记不可读取项。"""
+    repositories = []
+    changed = False
+    read_failed = False
+    for previous in before_plan.repositories:
+        logical_path = previous["path"]
+        path = facts.parent.path if logical_path == "." else adapter.root / logical_path
+        try:
+            observed = git.inspect_repo(path)
+            item, item_read_failed = _observed_repository(
+                git, path, logical_path, previous, observed
+            )
+            read_failed = read_failed or item_read_failed
+            changed = changed or any(
+                item[key] != previous[key]
+                for key in ("head", "branch", "worktree")
+            )
+            repositories.append(
+                item if item_read_failed else _progress_repository(item)
+            )
+        except GitError:
+            read_failed = True
+            item = dict(previous)
+            item.update(
+                {
+                    "head": None,
+                    "branch": None,
+                    "upstream": None,
+                    "ahead": None,
+                    "behind": None,
+                    "worktree": "missing",
+                    "relation": "not_applicable",
+                    "reason_codes": ["actual_state_read_failed"],
+                }
+            )
+            repositories.append(item)
+    return {
+        "target": before_plan.target,
+        "repositories": tuple(repositories),
+        "snapshot": None,
+        "stale_target": False,
+        "read_failed": read_failed,
+        "changed": None if read_failed else changed,
+    }
+
+
+def _observed_repository(git, path, logical_path, previous, observed):
+    """将逐仓读取结果转换为协议 repository 对象。"""
+    target_pin = previous["target_pin"]
+    relation = "not_applicable"
+    reason_codes = []
+    if observed.head is not None and target_pin is not None:
+        try:
+            relation = git.relation(path, observed.head, target_pin)
+        except GitError:
+            reason_codes.append("actual_state_read_failed")
+    return (
+        {
+            "path": logical_path,
+            "role": previous["role"],
+            "head": observed.head,
+            "target_pin": target_pin,
+            "branch": observed.branch,
+            "upstream": observed.upstream,
+            "ahead": observed.ahead,
+            "behind": observed.behind,
+            "worktree": observed.worktree,
+            "relation": relation,
+            "reason_codes": reason_codes,
+        },
+        bool(reason_codes),
+    )
+
+
+def _facts_signature(facts):
+    """返回仅含本地 ref、index 与工作树领域状态的比较值。"""
+    parent = (
+        facts.parent.head,
+        facts.parent.branch,
+        facts.parent.worktree,
+        facts.parent.index_dirty,
+        facts.parent.worktree_dirty,
+    )
+    repositories = tuple(
+        (
+            item.path,
+            item.facts.head,
+            item.facts.branch,
+            item.facts.worktree,
+            item.facts.index_dirty,
+            item.facts.worktree_dirty,
+        )
+        for item in sorted(facts.repositories, key=lambda item: item.path)
+    )
+    return parent, repositories
+
+
+def _actual_from_plan(plan):
+    """将已成功收集的实际计划转换为 partial 输入。"""
+    return {
+        "target": plan.target,
+        "repositories": tuple(
+            _progress_repository(item) for item in plan.repositories
+        ),
+        "snapshot": plan.snapshot,
+        "stale_target": plan.stale_target,
+        "read_failed": False,
+        "changed": True,
+    }
+
+
+def _partial(actual, reason):
     """返回包含实际完成项、未完成项和直接恢复 argv 的 partial 结果。"""
-    repositories = tuple(_progress_repository(item) for item in plan.repositories)
+    reasons = (reason,)
+    if actual["read_failed"]:
+        reasons += ("actual_state_read_failed",)
     action = Action(
         "resume_sync",
         ("data-infra-sync", "sync", "apply", "--non-interactive"),
@@ -140,13 +303,13 @@ def _partial(plan, reason):
     return Result(
         "sync apply",
         "partial",
-        (reason,),
-        plan.target,
-        repositories,
+        reasons,
+        actual["target"],
+        actual["repositories"],
         True,
         (action,),
-        plan.snapshot,
-        False,
+        actual["snapshot"],
+        actual["stale_target"],
     )
 
 
