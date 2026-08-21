@@ -71,6 +71,19 @@ class PlanFacts:
 
 def plan_sync(facts: PlanFacts) -> Result:
     """根据给定事实返回稳定状态、原因、后续操作和 snapshot。"""
+    if not _valid_repository_paths(facts):
+        return Result(
+            "sync plan",
+            "failed",
+            ("invalid_plan_facts",),
+            _target(facts),
+            (),
+            False,
+            (),
+            None,
+            facts.stale_target,
+        )
+
     repository_reasons = {
         repository.path: _repository_reasons(repository)
         for repository in facts.repositories
@@ -166,7 +179,10 @@ def _parent_reasons(facts: PlanFacts) -> tuple[str, ...]:
         reasons.add("target_parent_missing")
     if facts.parent.branch != facts.required_parent_branch:
         reasons.add("parent_branch_mismatch")
-    if facts.target_parent is not None and facts.parent_relation == "diverged":
+    if (
+        facts.target_parent is not None
+        and facts.parent_relation not in ("equal", "contained")
+    ):
         reasons.add("parent_not_fast_forward")
     if facts.parent_non_submodule_dirty:
         reasons.add("dirty_worktree")
@@ -230,6 +246,16 @@ def _layout_changed(facts: PlanFacts) -> bool:
         target.path not in current_paths and target.name in current_names
         for target in facts.target_submodules
     )
+
+
+def _valid_repository_paths(facts: PlanFacts) -> bool:
+    """确认 repository 路径唯一且与 submodule 路径并集完全一致。"""
+    repository_paths = [item.path for item in facts.repositories]
+    if len(repository_paths) != len(set(repository_paths)):
+        return False
+    expected_paths = {item.path for item in facts.current_submodules}
+    expected_paths.update(item.path for item in facts.target_submodules)
+    return set(repository_paths) == expected_paths
 
 
 def _all_heads_equal(facts: PlanFacts) -> bool:

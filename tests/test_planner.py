@@ -115,6 +115,18 @@ class PlannerStateTest(unittest.TestCase):
                 ("parent_not_fast_forward",),
             ),
             (
+                "parent tree equality is not fast forward",
+                {"target_parent": TARGET_PARENT, "parent_relation": "tree_equal"},
+                "blocked",
+                ("parent_not_fast_forward",),
+            ),
+            (
+                "parent relation is unavailable",
+                {"target_parent": TARGET_PARENT, "parent_relation": "not_applicable"},
+                "blocked",
+                ("parent_not_fast_forward",),
+            ),
+            (
                 "running instance",
                 {"running_instances": True},
                 "blocked",
@@ -226,6 +238,30 @@ class PlannerStateTest(unittest.TestCase):
         self.assertEqual(result.state, "update_ready")
 
 
+class PlannerFactsValidationTest(unittest.TestCase):
+    def assert_invalid(self, facts):
+        result = plan_sync(facts)
+
+        self.assertEqual(result.state, "failed")
+        self.assertEqual(result.reason_codes, ("invalid_plan_facts",))
+        self.assertEqual(result.next_actions, ())
+
+    def test_missing_repository_facts_fail_before_planning(self):
+        self.assert_invalid(plan_facts(repositories=()))
+
+    def test_duplicate_repository_paths_fail_before_dict_coalescing(self):
+        repository = plan_facts().repositories[0]
+
+        self.assert_invalid(plan_facts(repositories=(repository, repository)))
+
+    def test_extra_repository_facts_fail_before_planning(self):
+        extra = replace(plan_facts().repositories[0], path="modules/extra")
+
+        self.assert_invalid(
+            plan_facts(repositories=plan_facts().repositories + (extra,))
+        )
+
+
 class PlannerLayoutTest(unittest.TestCase):
     def test_a_new_submodule_is_a_safe_update(self):
         added = SubmoduleSpec("new", "modules/new", "../new.git", "5" * 40)
@@ -252,20 +288,30 @@ class PlannerLayoutTest(unittest.TestCase):
 
     def test_layout_removal_rename_path_and_url_changes_are_blocked(self):
         current = plan_facts().current_submodules[0]
+        moved = replace(current, path="modules/moved")
+        moved_repository = RepositoryPlanFacts(
+            moved.path,
+            repo_facts(moved.path, head=None, worktree="missing"),
+            None,
+            moved.pin,
+            "not_applicable",
+            "none",
+        )
         cases = (
-            ("removed", ()),
-            ("renamed", (replace(current, name="renamed"),)),
-            ("path changed", (replace(current, path="modules/moved"),)),
-            ("url changed", (replace(current, url="../fork.git"),)),
+            ("removed", (), plan_facts().repositories),
+            ("renamed", (replace(current, name="renamed"),), plan_facts().repositories),
+            ("path changed", (moved,), plan_facts().repositories + (moved_repository,)),
+            ("url changed", (replace(current, url="../fork.git"),), plan_facts().repositories),
         )
 
-        for label, target_submodules in cases:
+        for label, target_submodules, repositories in cases:
             with self.subTest(label):
                 result = plan_sync(
                     plan_facts(
                         target_parent=TARGET_PARENT,
                         parent_relation="contained",
                         target_submodules=target_submodules,
+                        repositories=repositories,
                     )
                 )
 
