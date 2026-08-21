@@ -2,7 +2,7 @@
 
 日期：2026-08-21
 
-状态：待书面审阅
+状态：待书面复审
 
 ## 1. 目标
 
@@ -47,34 +47,37 @@
 | Executor | 重新预检、受控写入、后置校验与部分状态报告 |
 | State store | `latest.json`、`events.jsonl`、安装 manifest 和进程锁 |
 | DataInfra 适配器 | 运行实例、受控补丁、产物路径和动态库映射规则 |
+| JSON Schema | 版本化定义结果对象、嵌套对象和下一步操作契约 |
 | `SKILL.md` | 触发范围、安全边界、状态机执行步骤和完成判据 |
 
 ## 5. 命令契约
 
-| 命令 | 工作树写入 | 说明 |
-|---|---:|---|
-| `init` | 无 | 检查现有 checkout，写入独立配置和状态目录 |
-| `inspect` | 无 | 仅使用本地仓库与已获取 refs |
-| `branch status` | 无 | 输出分支、upstream、ahead/behind 和目标 pin 关系 |
-| `branch start` | 有 | 从目标 pin 创建并切换到全新开发分支 |
-| `branch resume` | 有 | 切回明确存在的本地开发分支 |
-| `branch publish-check` | 无 | 检查远程保存状态和目标组合覆盖状态 |
-| `sync plan` | 无 | 默认 fresh fetch，不修改本地分支和工作树 |
-| `sync apply` | 有 | fresh fetch、全量重新预检后执行精确同步 |
-| `verify install` | 无 | 比较当前源码、产物、manifest 和进程映射 |
-| `verify install --record` | 无 | 检查全部通过后写入状态目录中的安装 manifest |
+| 命令 | 工作树/本地 ref | 远程 ref/对象库 | 配置/状态 | 网络 | 说明 |
+|---|---:|---:|---:|---:|---|
+| `init` | 无 | 无 | 有 | 无 | 检查现有 checkout，写入独立配置和状态目录 |
+| `inspect` | 无 | 无 | 有 | 无 | 仅使用本地仓库与已获取 refs |
+| `branch status` | 无 | 无 | 有 | 无 | 输出分支、upstream、ahead/behind 和目标 pin 关系 |
+| `branch start` | 有 | 无 | 有 | 无 | 从目标 pin 创建并切换到全新开发分支 |
+| `branch resume` | 有 | 无 | 有 | 无 | 切回明确存在的本地开发分支 |
+| `branch publish-check` | 无 | 有 | 有 | 有 | fresh fetch 后检查远程保存状态和目标组合覆盖状态 |
+| `sync plan` | 无 | 有 | 有 | 有 | 默认 fresh fetch，不修改本地分支和工作树 |
+| `sync apply --snapshot <hash>` | 有 | 有 | 有 | 有 | 复检指定计划后执行精确同步 |
+| `sync apply --non-interactive` | 有 | 有 | 有 | 有 | 在同一进程锁内完成计划、复检和精确同步 |
+| `verify install` | 无 | 无 | 有 | 无 | 比较当前状态与已记录安装身份 |
+| `verify install --record` | 无 | 无 | 有 | 无 | 验证当前安装内部一致性并记录新安装身份 |
 
-`sync plan --offline` 使用缓存目标并设置 `stale_target=true`。`sync apply` 必须 fresh fetch 成功。Git 认证使用已配置的 credential helper，`gh` 是可选实现。
+所有命令均可写入锁和审计状态；表中“配置/状态”包含该行为。`inspect` 和 `sync plan --offline` 不访问网络、不更新远程 ref 和对象库，并设置 `stale_target=true`。`sync apply` 必须且只能指定 `--snapshot` 或 `--non-interactive`，并要求 fresh fetch 成功。Git 认证使用已配置的 credential helper，`gh` 是可选实现。
 
 ## 6. 状态与输出
 
-主流程为：
+同步和部署是两个相关的状态轴。`state` 表示当前命令的结果状态，不表示单一的跨命令全局状态。同步流程为：
 
 ```text
 unconfigured -> inspected -> up_to_date | update_ready | waiting_for_pin | blocked | failed
 update_ready -> updated | blocked | partial | failed
-updated -> build_required -> deployment_consistent | deployment_mismatch
 ```
+
+部署状态为 `unknown | build_required | deployment_consistent | deployment_mismatch | failed`。同步完成后源码身份变化，将部署状态标记为 `build_required`；`verify install` 可在任意同步状态下重新计算部署状态。
 
 JSON 固定字段为：
 
@@ -84,29 +87,33 @@ JSON 固定字段为：
 | `command` | 字符串 |
 | `state` | 字符串枚举 |
 | `reason_codes` | 字符串数组 |
-| `target` | 目标父仓与 gitlink 对象 |
+| `target` | 目标父仓与 gitlink 对象，或 `null` |
 | `repositories` | 仓库状态对象数组 |
 | `changed` | 布尔值 |
 | `next_actions` | 结构化操作对象数组 |
-| `snapshot` | 字符串哈希 |
-| `stale_target` | 布尔值 |
+| `snapshot` | 字符串哈希，或 `null` |
+| `stale_target` | 布尔值，或 `null` |
+
+`target`、`repositories` 和 `next_actions` 的完整结构由 `schemas/result-v1.schema.json` 定义。每个 `next_actions` 对象固定包含 `kind`、`argv`、`mutates_worktree`、`requires_confirmation` 和 `preconditions`；`argv` 是不经过 shell 解析的字符串数组。
 
 退出码：
 
 | 码 | 语义 |
 |---:|---|
 | 0 | 检查通过、已是目标状态或操作完成 |
-| 2 | 安全延期或条件阻塞，工作树未修改 |
-| 3 | 配置、认证、网络或 Git 操作失败 |
-| 4 | 写操作部分完成，需要恢复 |
+| 2 | `waiting_for_pin`、`blocked`、snapshot 不一致、`build_required` 或 `deployment_mismatch`；工作树和本地分支未修改 |
+| 3 | 配置、认证、网络或 Git 操作失败；失败发生在工作树或本地分支首次写入前 |
+| 4 | 工作树或本地分支首次写入后发生失败，状态为 `partial` |
+
+`inspect` 和 `sync plan` 在成功产生 `up_to_date` 或 `update_ready` 计划时返回 0。`sync apply` 在 `updated` 或已经达到目标组合时返回 0。分支写命令完成时返回 0，安全前置条件不满足时返回 2。所有命令遵循“首次领域写入前失败为 2/3，首次领域写入后失败为 4”的边界；审计状态写入不构成领域写入。
 
 ## 7. 同步与分支规则
 
-`sync plan` 依次获取进程锁、fresh fetch、校验父仓 fast-forward、从目标父仓树解析一级 gitlink、预取目标对象、检查 Git 操作和运行实例，然后为每个子仓计算分支、工作树、目标 pin 与受控补丁状态。发现嵌套 submodule 时返回 `unsupported_nested_submodule`。
+`sync plan` 依次获取进程锁、fresh fetch、校验父仓 fast-forward、解析当前与目标父仓的一级 gitlink 并取并集、预取目标对象、检查 Git 操作和运行实例，然后为每个子仓计算分支、工作树、目标 pin 与受控补丁状态。新增 submodule 可以初始化；删除、改名、路径变化或 URL 变化返回 `submodule_layout_transition_required`，保留现有目录。发现嵌套 submodule 时返回 `unsupported_nested_submodule`。
 
-开发分支仅在工作树干净、没有活动 Git 操作，且目标 pin 包含当前 HEAD 或两者 tree 等价时允许自动离开。upstream 状态只用于报告和恢复指导。多个未合入任务使用独立 Git worktree。
+开发分支仅在工作树干净、没有活动 Git 操作，且达到可自动离开开发状态时允许自动离开。upstream 状态只用于报告和恢复指导。多个未合入任务使用独立 Git worktree。
 
-`sync apply` 重新计算完整计划并比对 snapshot。通过后暂停连续受控补丁、fast-forward 父仓、checkout 精确 gitlink、重放补丁并执行后置校验。中途失败不自动回滚，返回 `partial` 和实际 HEAD、已完成项、未完成项及恢复命令。同一命令可重入执行并继续收敛。
+snapshot 是影响计划操作的规范化 JSON 的 SHA-256，输入包含目标父仓和 gitlink、当前 HEAD、index 与工作树状态、分支关系和受控补丁状态，不包含时间戳与输出格式。`sync apply --snapshot <hash>` fresh fetch 后重新计算完整计划，并与调用方提供的 snapshot 比对；不一致时返回 2，不修改工作树和本地分支。`sync apply --non-interactive` 在同一进程锁内生成计划、复检并应用，不接收外部 snapshot。通过后暂停连续受控补丁、fast-forward 父仓、checkout 精确 gitlink、重放补丁并执行后置校验。中途失败不自动回滚，返回 `partial` 和实际 HEAD、已完成项、未完成项及结构化恢复操作。同一命令可重入执行并继续收敛。
 
 ## 8. 受控构建补丁
 
@@ -123,7 +130,9 @@ DataInfra 适配器声明父仓补丁文件、目标 submodule、适用路径和
 
 Skill 引导用户或 agent 阅读当前 DataInfra 仓库文档并调用其原生构建入口。CLI 不提供 `build` 子命令。
 
-DataInfra 适配器核对父仓与关键 submodule HEAD、Bridge 构建/Catalog 依赖/安装副本、Catalog/FDW/Delta `.so`、extension control/SQL、manifest SHA-256 和运行中 `gaussdb` 映射。已删除 `.so` 映射是不一致，SysV 共享内存 `(deleted)` 保持正常分类。`verify install --record` 仅在所有检查通过时写入新 manifest。
+DataInfra 适配器核对父仓与关键 submodule HEAD、Bridge 构建/Catalog 依赖/安装副本、Catalog/FDW/Delta `.so`、extension control/SQL、manifest SHA-256 和运行中 `gaussdb` 映射。已删除 `.so` 映射是不一致，SysV 共享内存 `(deleted)` 保持正常分类。
+
+`verify install` 要求当前源码和产物匹配已有 manifest。`verify install --record` 跳过旧 manifest 比对，要求当前源码、构建副本、安装副本、扩展文件和进程映射内部一致，然后原子覆盖 manifest。任一当前状态检查失败时保留旧 manifest。
 
 ## 10. 配置、持久化与安全
 
@@ -146,18 +155,20 @@ $XDG_STATE_HOME/data-infra-sync-skill/<workspace>/
 
 ## 12. 测试与 QCC 评估
 
-自动测试使用 Python 标准库和临时 bare Git 仓库，覆盖目标已达成、干净更新、dirty、未进入目标 pin、目标包含、tree 等价、不可 fast-forward、fetch 失败、受控补丁迁移、部分更新、安装身份过期、`.so` 不一致、并发锁、脱敏和 JSON schema。
+自动测试使用 Python 标准库和临时 bare Git 仓库，覆盖目标已达成、干净更新、dirty、未进入目标 pin、目标包含、tree 等价、不可 fast-forward、fetch 失败、submodule 布局变化、受控补丁迁移、部分更新、安装身份过期、`.so` 不一致、并发锁、脱敏和 JSON schema。
 
 QCC 验收指标：
 
-- 阻塞场景的 ref、index 和工作树写入次数为 0。
+- 阻塞场景的本地分支 ref、index 和工作树写入次数为 0；fresh fetch 可以更新远程跟踪 ref 和对象库。
 - fixture 预期状态、原因码和退出码匹配率为 100%。
 - 成功同步后父仓和全部一级 submodule 与目标 pin 一致率为 100%。
 - 两个不同绝对路径和用户配置通过相同测试。
 - 正常路径不需要手写 Git 命令，每次状态转换使用一个顶层 CLI 命令。
-- 无会话记忆的较弱 agent 仅依据 Skill 完成指定场景，危险操作次数为 0。
+- 无会话记忆的较弱 agent 仅依据 Skill 完成指定场景，危险操作次数和人工介入次数均为 0。
 - 结构化结果通过 schema 校验，凭据和不必要的个人环境值泄漏次数为 0。
 - 只有源码、manifest、磁盘产物和进程映射全部一致时报告部署一致。
+
+较弱 agent 评估使用固定场景集：干净同步、目标包含开发提交、tree 等价、upstream 已发布但目标未覆盖、dirty 阻塞、连续补丁重放、补丁迁移阻塞、注入式部分失败恢复和安装身份不一致。每个场景在全新会话中独立执行 3 次，只提供任务、仓库路径和 `SKILL.md`。记录终态与原因码正确率、顶层 CLI 命令数、危险操作数、人工介入数和是否完成恢复。全部 27 次执行必须得到预期终态和退出码，危险操作数与人工介入数为 0。首版采用绝对指标；获得人工或其他 agent 数据后再增加对照指标。
 
 ## 13. 迁移
 
