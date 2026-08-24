@@ -67,6 +67,7 @@ class PlanFacts:
     running_instances: bool
     nested_submodules: bool
     stale_target: bool = False
+    global_managed_patch_transition: bool = False
 
 
 def plan_sync(facts: PlanFacts) -> Result:
@@ -96,6 +97,8 @@ def plan_sync(facts: PlanFacts) -> Result:
         reasons.add("running_instances")
     if facts.nested_submodules:
         reasons.add("unsupported_nested_submodule")
+    if facts.global_managed_patch_transition:
+        reasons.add("managed_patch_transition_required")
     if facts.target_parent is not None and _layout_changed(facts):
         reasons.add("submodule_layout_transition_required")
 
@@ -165,6 +168,7 @@ def snapshot_for(facts: PlanFacts) -> str:
         "running_instances": facts.running_instances,
         "nested_submodules": facts.nested_submodules,
         "stale_target": facts.stale_target,
+        "global_managed_patch_transition": facts.global_managed_patch_transition,
     }
     encoded = json.dumps(
         document, ensure_ascii=False, sort_keys=True, separators=(",", ":")

@@ -9,9 +9,9 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Tuple
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
-from data_infra_sync.git import GitError
+from data_infra_sync.git import GitError, RepoFacts
 from data_infra_sync.planner import PlanFacts, RepositoryPlanFacts, SubmoduleSpec
 
 
@@ -393,24 +393,19 @@ def _collect_workspace_facts(adapter, config, git, process_reader, *, fresh):
     root = adapter.root
     target_ref = _target_ref(config.target_remote, config.target_branch)
     _validate_target_ref(git, root, target_ref, config.target_remote)
+    if fresh:
+        _fetch_parent_target(
+            git, root, config.target_remote, config.target_branch, target_ref
+        )
     current_parent = git.run(root, ("rev-parse", "HEAD")).stdout.strip()
     if not current_parent:
         raise GitError(("git", "rev-parse", "HEAD"), "parent HEAD is missing", 2)
-
-    if fresh:
-        git.run(
-            root,
-            ("fetch", "--prune", "--no-recurse-submodules", config.target_remote),
-        )
     current_submodules = _submodules_at(git, root, current_parent)
     if fresh:
         for spec in current_submodules:
-            repository = _existing_repository(root, spec.path)
+            repository = _existing_repository(git, root, spec.path)
             if repository is not None:
-                git.run(
-                    repository,
-                    ("fetch", "--prune", "--no-recurse-submodules"),
-                )
+                _fetch_submodule_upstream(git, repository)
 
     target_parent = _resolve_target(git, root, target_ref)
     target_submodules = (
@@ -435,8 +430,13 @@ def _collect_workspace_facts(adapter, config, git, process_reader, *, fresh):
     repositories = []
     nested_submodules = prefetched_nested
     for logical_path in sorted(set(current_by_path) | set(target_by_path)):
-        repository_path = _repository_path(root, logical_path)
-        observed = git.inspect_repo(repository_path)
+        existing = _existing_repository(git, root, logical_path)
+        repository_path = existing or (Path(root) / logical_path)
+        observed = (
+            git.inspect_repo(repository_path)
+            if existing is not None
+            else _missing_repo_facts(repository_path)
+        )
         current_pin = (
             current_by_path[logical_path].pin
             if logical_path in current_by_path
@@ -527,6 +527,87 @@ def _validate_target_ref(git, root, target_ref, remote):
         )
 
 
+def _fetch_parent_target(git, root, remote, branch, target_ref):
+    """仅将目标父仓分支更新到指定远程跟踪引用。"""
+    source = "refs/heads/{}".format(branch)
+    _require_valid_ref(git, root, source)
+    git.run(
+        root,
+        (
+            "fetch",
+            "--prune",
+            "--no-recurse-submodules",
+            "--",
+            remote,
+            "+{}:{}".format(source, target_ref),
+        ),
+    )
+
+
+def _fetch_submodule_upstream(git, repository):
+    """仅更新当前子仓分支的安全远程跟踪 upstream。"""
+    branch = git.run(
+        repository, ("symbolic-ref", "--quiet", "--short", "HEAD"), check=False
+    )
+    if branch.returncode == 1:
+        return
+    if branch.returncode != 0:
+        raise GitError(
+            tuple(str(item) for item in branch.args),
+            branch.stderr,
+            branch.returncode,
+        )
+    name = branch.stdout.strip()
+    remote = git.run(
+        repository, ("config", "--get", "branch.{}.remote".format(name)), check=False
+    )
+    merge = git.run(
+        repository, ("config", "--get", "branch.{}.merge".format(name)), check=False
+    )
+    if remote.returncode == 1 or merge.returncode == 1:
+        return
+    if remote.returncode != 0 or merge.returncode != 0:
+        failed = remote if remote.returncode != 0 else merge
+        raise GitError(
+            tuple(str(item) for item in failed.args),
+            failed.stderr,
+            failed.returncode,
+        )
+    remote_name = remote.stdout.strip()
+    source = merge.stdout.strip()
+    if remote_name == ".":
+        return
+    if not source.startswith("refs/heads/"):
+        raise GitError(("git", "fetch"), "unsafe submodule upstream", 2)
+    destination = "refs/remotes/{}/{}".format(
+        remote_name, source[len("refs/heads/"):]
+    )
+    _require_valid_ref(git, repository, source)
+    _require_valid_ref(git, repository, destination)
+    git.run(
+        repository,
+        (
+            "fetch",
+            "--prune",
+            "--no-recurse-submodules",
+            "--",
+            remote_name,
+            "+{}:{}".format(source, destination),
+        ),
+    )
+
+
+def _require_valid_ref(git, repository, ref):
+    """要求 ref 通过 Git 完整引用格式校验。"""
+    completed = git.run(repository, ("check-ref-format", ref), check=False)
+    if completed.returncode != 0:
+        raise GitError(
+            tuple(str(item) for item in completed.args),
+            completed.stderr or "invalid ref",
+            completed.returncode,
+        )
+
+
 def _resolve_target(git, root, target_ref):
     """读取完整远程跟踪引用；引用存在时要求其对象为 commit。"""
     exists = git.run(
@@ -585,7 +666,11 @@ def _submodules_at(git, parent, commit):
     specs = []
     seen_paths = set()
     for name, fields in declarations.items():
-        if set(fields) != {"path", "url"} or not _safe_submodule_path(fields["path"]):
+        if (
+            set(fields) != {"path", "url"}
+            or not fields["url"]
+            or not _safe_submodule_path(fields["path"])
+        ):
             raise GitError(("git", "config", "--blob"), "unsafe submodule declaration", 2)
         path = fields["path"]
         if path in seen_paths or path not in links:
@@ -609,7 +694,7 @@ def _safe_submodule_path(value):
     )
 
 
-def _existing_repository(root, logical_path):
+def _existing_repository(git, root, logical_path):
     """返回安全的现有 submodule 目录，缺失目录返回 None。"""
     path = Path(root) / logical_path
     try:
@@ -619,12 +704,39 @@ def _existing_repository(root, logical_path):
     repository = _safe_directory(root, logical_path)
     if repository is None:
         raise GitError(("git", "-C", logical_path), "unsafe submodule path", 2)
-    return repository
+    top = git.run(repository, ("rev-parse", "--show-toplevel"), check=False)
+    if top.returncode == 0:
+        try:
+            actual = Path(top.stdout.strip()).resolve(strict=True)
+        except (OSError, RuntimeError):
+            actual = None
+        if actual == repository:
+            return repository
+    try:
+        empty = not any(repository.iterdir())
+    except OSError:
+        empty = False
+    if empty:
+        return None
+    if top.returncode not in (0, 128):
+        raise GitError(tuple(str(item) for item in top.args), top.stderr, top.returncode)
+    raise GitError(("git", "rev-parse", "--show-toplevel"), "submodule root mismatch", 2)
 
 
-def _repository_path(root, logical_path):
-    """返回现有安全目录或缺失 submodule 的预期绝对路径。"""
-    return _existing_repository(root, logical_path) or (Path(root) / logical_path)
+def _missing_repo_facts(path):
+    """构造不会向上发现父仓的缺失 submodule 事实。"""
+    return RepoFacts(
+        Path(path).resolve(strict=False),
+        None,
+        None,
+        None,
+        None,
+        None,
+        "missing",
+        False,
+        False,
+        None,
+    )
 
 
 def _require_commit(git, repository, commit):
@@ -653,12 +765,19 @@ def _prefetch_target_objects(
     nested = False
     for target in target_submodules:
         url = _resolve_submodule_url(root, parent_url, target.url)
-        repository = _existing_repository(root, target.path)
+        repository = _existing_repository(git, root, target.path)
         if repository is not None and target.path in current_paths:
             if not _commit_exists(git, repository, target.pin):
                 git.run(
                     repository,
-                    ("fetch", "--no-tags", "--", url, target.pin),
+                    (
+                        "fetch",
+                        "--no-tags",
+                        "--no-recurse-submodules",
+                        "--",
+                        url,
+                        target.pin,
+                    ),
                 )
             _require_commit(git, repository, target.pin)
             nested = nested or bool(git.gitlinks(repository, target.pin))
@@ -668,7 +787,17 @@ def _prefetch_target_objects(
         ) as directory:
             bare = Path(directory) / "repository.git"
             git.run(root, ("init", "--bare", str(bare)))
-            git.run(bare, ("fetch", "--no-tags", "--", url, target.pin))
+            git.run(
+                bare,
+                (
+                    "fetch",
+                    "--no-tags",
+                    "--no-recurse-submodules",
+                    "--",
+                    url,
+                    target.pin,
+                ),
+            )
             _require_commit(git, bare, target.pin)
             nested = nested or bool(git.gitlinks(bare, target.pin))
     return nested
@@ -699,7 +828,16 @@ def _resolve_submodule_url(root, parent_url, submodule_url):
         return submodule_url
     parsed = urlsplit(parent_url)
     if parsed.scheme:
-        return urljoin(parent_url.rstrip("/") + "/", submodule_url)
+        base = urlunsplit(
+            (
+                parsed.scheme,
+                parsed.netloc,
+                parsed.path.rstrip("/") + "/",
+                "",
+                "",
+            )
+        )
+        return urljoin(base, submodule_url)
     if ":" in parent_url and not parent_url.startswith("/"):
         prefix, path = parent_url.split(":", 1)
         return "{}:{}".format(
@@ -799,9 +937,17 @@ def _load_managed_patches(git, root, parent_commit):
 def _with_managed_patch_states(adapter, git, facts):
     """按声明变化和隔离预检结果设置各子仓补丁状态。"""
     current = adapter.managed_patches(facts.current_parent)
+    target = (
+        ()
+        if facts.target_parent is None
+        else adapter.managed_patches(facts.target_parent)
+    )
+    repository_paths = {item.path for item in facts.repositories}
+    global_transition = any(
+        item.target_submodule not in repository_paths for item in current + target
+    )
     if facts.target_parent is None:
-        return facts
-    target = adapter.managed_patches(facts.target_parent)
+        return _replace_patch_facts(facts, facts.repositories, global_transition)
     current_keys = tuple(_managed_patch_key(item) for item in current)
     target_keys = tuple(_managed_patch_key(item) for item in target)
     states = {}
@@ -813,10 +959,10 @@ def _with_managed_patch_states(adapter, git, facts):
     elif current:
         paths = {item.target_submodule for item in current}
         repositories = {item.path: item for item in facts.repositories}
-        if not paths.issubset(repositories):
-            raise GitError(("git", "show", _DELTA_PATCH_PATH), "patch target is undeclared", 2)
-        dirty = all(repositories[path].facts.worktree == "dirty" for path in paths)
-        if dirty:
+        dirty = paths.issubset(repositories) and all(
+            repositories[path].facts.worktree == "dirty" for path in paths
+        )
+        if dirty and not global_transition:
             state = (
                 "continuous"
                 if adapter.preflight_managed_patches(git, facts, current, target)
@@ -834,6 +980,11 @@ def _with_managed_patch_states(adapter, git, facts):
         )
         for item in facts.repositories
     )
+    return _replace_patch_facts(facts, repositories, global_transition)
+
+
+def _replace_patch_facts(facts, repositories, global_transition):
+    """保留采集事实并替换补丁仓库状态和全局迁移标记。"""
     return PlanFacts(
         facts.parent,
         facts.current_parent,
@@ -849,6 +1000,7 @@ def _with_managed_patch_states(adapter, git, facts):
         facts.running_instances,
         facts.nested_submodules,
         facts.stale_target,
+        global_transition,
     )
 
 

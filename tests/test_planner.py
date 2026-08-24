@@ -81,6 +81,18 @@ def plan_facts(**overrides):
 
 
 class PlannerStateTest(unittest.TestCase):
+    def test_global_managed_patch_transition_blocks_without_action(self):
+        """防止补丁目标不在仓库 union 时迁移状态被丢弃。"""
+        baseline = plan_facts(target_parent=TARGET_PARENT, parent_relation="contained")
+        facts = replace(baseline, global_managed_patch_transition=True)
+
+        result = plan_sync(facts)
+
+        self.assertEqual(result.state, "blocked")
+        self.assertEqual(result.reason_codes, ("managed_patch_transition_required",))
+        self.assertEqual(result.next_actions, ())
+        self.assertNotEqual(snapshot_for(facts), snapshot_for(baseline))
+
     def test_state_matrix_uses_stable_reasons_in_safety_priority(self):
         cases = (
             ("up to date", {}, "up_to_date", ()),
