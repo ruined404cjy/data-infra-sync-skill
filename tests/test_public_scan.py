@@ -144,6 +144,8 @@ class PublicScanTests(unittest.TestCase):
             "https://user:pass@fixture.invalid.?query=yes",
             "https://user:pass@fixture.invalid#fragment",
             "<https://user:pass@fixture.invalid>",
+            "https://example.invalid?contact=person@example.com",
+            "https://example.invalid#person@example.com",
         )
         for url in cases:
             with self.subTest(url=url):

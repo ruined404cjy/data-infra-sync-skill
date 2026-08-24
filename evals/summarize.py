@@ -333,7 +333,10 @@ def _validate_scenario_semantics(scenario):
             patch["target"] == PATCH_TARGET
             and submodule["worktree"] == "dirty_managed"
             and _sync_difference(parent, submodule)
-            and patch["current_declaration"]
+            and len(patch["contents"]) == 1
+            and len(patch["current_declaration"]) == 1
+            and len(patch["target_declaration"]) == 1
+            and len(patch["worktree_applied"]) == 1
             and patch["current_declaration"] == patch["target_declaration"]
             and patch["current_declaration"] == patch["worktree_applied"]
             and fault is None and identity is None
@@ -343,8 +346,10 @@ def _validate_scenario_semantics(scenario):
             patch["target"] == PATCH_TARGET
             and submodule["worktree"] == "dirty_managed"
             and _sync_difference(parent, submodule)
-            and patch["current_declaration"]
-            and patch["target_declaration"]
+            and len(patch["contents"]) == 2
+            and len(patch["current_declaration"]) == 1
+            and len(patch["target_declaration"]) == 1
+            and len(patch["worktree_applied"]) == 1
             and patch["current_declaration"] != patch["target_declaration"]
             and patch["worktree_applied"] == patch["current_declaration"]
             and fault is None and identity is None
@@ -352,7 +357,12 @@ def _validate_scenario_semantics(scenario):
     elif scenario_id == "partial_failure_recovery":
         valid = (
             clean and _patch_empty(patch) and identity is None
-            and fault is not None and _sync_difference(parent, submodule)
+            and fault == {
+                "operation": "submodule_checkout",
+                "occurrence": 1,
+                "timing": "after_domain_write",
+            }
+            and _sync_difference(parent, submodule)
         )
     elif scenario_id == "install_identity_mismatch":
         valid = (

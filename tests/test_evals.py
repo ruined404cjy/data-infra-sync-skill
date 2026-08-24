@@ -391,10 +391,22 @@ class EvalScenarioTests(unittest.TestCase):
             "target_declaration": [], "worktree_applied": [],
         }
         semantic_cases.append(no_continuous_patch)
-        for invalid in semantic_cases:
-            completed = self.run_summarizer(valid_records(), invalid)
-            self.assertEqual(completed.returncode, 2)
-            self.assertEqual(completed.stderr, "invalid evaluation records\n")
+        multi_continuous_patch = json.loads(json.dumps(catalog))
+        continuous_patch = multi_continuous_patch["scenarios"][5]["fixture"]["managed_patch"]
+        continuous_patch["contents"]["patch_v2"] = json.loads(
+            json.dumps(continuous_patch["contents"]["patch_v1"])
+        )
+        for field in ("current_declaration", "target_declaration", "worktree_applied"):
+            continuous_patch[field] = ["patch_v1", "patch_v2"]
+        semantic_cases.append(multi_continuous_patch)
+        wrong_fault_occurrence = json.loads(json.dumps(catalog))
+        wrong_fault_occurrence["scenarios"][7]["fixture"]["fault_injection"]["occurrence"] = 2
+        semantic_cases.append(wrong_fault_occurrence)
+        for position, invalid in enumerate(semantic_cases):
+            with self.subTest(case=position):
+                completed = self.run_summarizer(valid_records(), invalid)
+                self.assertEqual(completed.returncode, 2)
+                self.assertEqual(completed.stderr, "invalid evaluation records\n")
 
 
 if __name__ == "__main__":
