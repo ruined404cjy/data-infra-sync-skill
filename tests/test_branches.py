@@ -17,6 +17,40 @@ from tests.git_fixture import CompositeFixture
 
 
 class DevelopmentBranchTest(unittest.TestCase):
+    def test_start_ref_created_before_switch_error_is_partial_with_resume_action(self):
+        target = self.fixture.target_pin
+        before = self.git.inspect_repo(self.fixture.submodule)
+        original = self.git.run
+
+        def run(repo, args, *, check=True):
+            if args[:2] == ("switch", "-c"):
+                original(repo, ("branch", args[2], args[3]))
+                raise OSError("ref created before switch failed")
+            return original(repo, args, check=check)
+
+        self.git.run = run
+
+        result = start_branch(self.git, self.fixture.submodule, target, "feature/ref-only")
+
+        after = self.git.inspect_repo(self.fixture.submodule)
+        created = self.git.run(
+            self.fixture.submodule,
+            ("rev-parse", "--verify", "refs/heads/feature/ref-only"),
+        ).stdout.strip()
+        self.assertEqual((result.state, result.changed), ("partial", True))
+        self.assertEqual((after.head, after.branch), (before.head, before.branch))
+        self.assertEqual(created, target)
+        self.assertEqual(result.repositories[0]["head"], before.head)
+        self.assertEqual(result.repositories[0]["branch"], before.branch)
+        self.assertEqual(
+            result.next_actions[0].argv,
+            (
+                "data-infra-sync", "branch", "resume", "--repo",
+                str(self.fixture.submodule), "--name", "feature/ref-only",
+            ),
+        )
+        self.assertTrue(result.next_actions[0].mutates_worktree)
+
     def test_start_postcondition_read_failure_returns_actual_partial(self):
         target = self.fixture.target_pin
         original = self.git.inspect_repo
@@ -36,7 +70,8 @@ class DevelopmentBranchTest(unittest.TestCase):
         self.assertEqual(result.reason_codes, ("branch_postcondition_failed",))
         self.assertEqual(result.repositories[0]["head"], target)
         self.assertEqual(result.repositories[0]["branch"], "feature/post")
-        self.assertEqual(result.next_actions[0].argv[:4], ("data-infra-sync", "branch", "status", "--repo"))
+        self.assertEqual(result.next_actions[0].argv[:4], ("data-infra-sync", "branch", "resume", "--repo"))
+        self.assertEqual(result.next_actions[0].argv[-2:], ("--name", "feature/post"))
 
     def test_start_switch_that_changes_branch_then_raises_is_partial(self):
         target = self.fixture.target_pin

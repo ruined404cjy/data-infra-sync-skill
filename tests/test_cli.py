@@ -251,8 +251,9 @@ class RoutingTests(unittest.TestCase):
     def test_branch_result_replaces_absolute_service_path_with_logical_repo(self):
         self.adapter.collect_plan_facts.return_value = self.facts
         service_result = result(
-            command="branch status",
-            state="branch_status",
+            command="branch start",
+            state="partial",
+            changed=True,
             snapshot=None,
             stale_target=None,
             repositories=(
@@ -263,15 +264,25 @@ class RoutingTests(unittest.TestCase):
                     "relation": "equal", "reason_codes": [],
                 },
             ),
-            next_actions=(Action("branch_status", ("data-infra-sync", "branch", "status", "--repo", str(self.config.root)), False, False, ()),),
+            next_actions=(Action("branch_resume", ("data-infra-sync", "branch", "resume", "--repo", str(self.config.root), "--name", "feature/ref-only"), False, False, ()),),
         )
-        with patch.object(cli, "branch_status", return_value=service_result):
-            _, output, _ = self.run_main(("branch", "status", "--repo", ".", "--format", "json"))
+        with patch.object(cli, "start_branch", return_value=service_result):
+            code, output, _ = self.run_main(("branch", "start", "--repo", ".", "--name", "feature/ref-only", "--format", "json"))
         document = json.loads(output)
+        self.assertEqual(code, 4)
         self.assertEqual(document["repositories"][0]["path"], ".")
         self.assertEqual(document["repositories"][0]["role"], "parent")
-        self.assertEqual(document["next_actions"][0]["argv"][-1], ".")
+        action_argv = document["next_actions"][0]["argv"]
+        self.assertEqual(action_argv, ["data-infra-sync", "branch", "resume", "--repo", ".", "--name", "feature/ref-only"])
+        parsed = cli._build_parser().parse_args(action_argv[1:])
+        self.assertEqual((parsed.branch_command, parsed.repo, parsed.name), ("resume", ".", "feature/ref-only"))
         self.assertNotIn(str(self.config.root), output)
+
+    def test_branch_start_zero_effect_service_failure_is_failed_exit_three(self):
+        self.adapter.collect_plan_facts.return_value = self.facts
+        with patch.object(cli, "start_branch", side_effect=GitError(("git", "switch"), "failed", 1)):
+            code, output, _ = self.run_main(("branch", "start", "--repo", ".", "--name", "feature/failed", "--format", "json"))
+        self.assertEqual((code, json.loads(output)["state"]), (3, "failed"))
 
     def test_audit_order_precedes_render(self):
         manager = Mock()

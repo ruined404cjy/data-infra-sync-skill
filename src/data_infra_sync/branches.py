@@ -46,17 +46,26 @@ def start_branch(git: Git, repo: Path, target_pin: str, name: str) -> Result:
         git.run(repo, ("switch", "-c", name, target_pin))
     except (GitError, OSError):
         identity = _read_branch_identity(git, repo)
+        requested_ref = _read_local_branch_oid(git, repo, name)
         partial = _branch_postcondition_failed(
-            git, repo, facts, target_pin, "branch start", identity
+            git, repo, facts, target_pin, "branch start", identity, name
         )
         actual = partial.repositories[0]
-        if identity[2] and actual["head"] == facts.head and actual["branch"] == facts.branch:
+        if (
+            identity[2]
+            and requested_ref[1]
+            and requested_ref[0] is None
+            and actual["head"] == facts.head
+            and actual["branch"] == facts.branch
+        ):
             raise
         return partial
     try:
         updated = git.inspect_repo(repo)
     except (GitError, OSError):
-        return _branch_postcondition_failed(git, repo, facts, target_pin, "branch start")
+        return _branch_postcondition_failed(
+            git, repo, facts, target_pin, "branch start", requested_name=name
+        )
     return _result("branch start", "branch_started", (), updated, target_pin, "equal", changed=True)
 
 
@@ -79,7 +88,7 @@ def resume_branch(git: Git, repo: Path, target_pin: str, name: str) -> Result:
     except (GitError, OSError):
         identity = _read_branch_identity(git, repo)
         partial = _branch_postcondition_failed(
-            git, repo, facts, target_pin, "branch resume", identity
+            git, repo, facts, target_pin, "branch resume", identity, name
         )
         actual = partial.repositories[0]
         if identity[2] and actual["head"] == facts.head and actual["branch"] == facts.branch:
@@ -89,7 +98,9 @@ def resume_branch(git: Git, repo: Path, target_pin: str, name: str) -> Result:
         updated = git.inspect_repo(repo)
         updated_relation = _relation(git, repo, updated, target_pin, True)
     except (GitError, OSError):
-        return _branch_postcondition_failed(git, repo, facts, target_pin, "branch resume")
+        return _branch_postcondition_failed(
+            git, repo, facts, target_pin, "branch resume", requested_name=name
+        )
     return _result(
         "branch resume", "branch_resumed", (), updated, target_pin, updated_relation, changed=True
     )
@@ -350,8 +361,25 @@ def _read_branch_identity(git, repo):
     return head, branch, readable
 
 
+def _read_local_branch_oid(git, repo, name):
+    """独立读取请求分支 ref；返回 OID 与是否能明确判定存在性。"""
+    try:
+        observed = git.run(
+            repo,
+            ("rev-parse", "--verify", "--quiet", "refs/heads/{}".format(name)),
+            check=False,
+        )
+    except (GitError, OSError):
+        return None, False
+    if observed.returncode == 0:
+        return observed.stdout.strip() or None, bool(observed.stdout.strip())
+    if observed.returncode == 1:
+        return None, True
+    return None, False
+
+
 def _branch_postcondition_failed(
-    git, repo, previous, target_pin, command, identity=None
+    git, repo, previous, target_pin, command, identity=None, requested_name=None
 ):
     """切换成功后尽力读取实际 HEAD/branch，并返回可恢复的 partial。"""
     head, branch, _ = identity or _read_branch_identity(git, repo)
@@ -365,10 +393,18 @@ def _branch_postcondition_failed(
         "not_applicable",
         changed=True,
     )
+    action_argv = ["data-infra-sync", "branch", "status", "--repo", str(repo)]
+    action_kind = "branch_status"
+    if requested_name is not None:
+        action_kind = "branch_resume"
+        action_argv = [
+            "data-infra-sync", "branch", "resume", "--repo", str(repo),
+            "--name", requested_name,
+        ]
     action = Action(
-        "branch_status",
-        ("data-infra-sync", "branch", "status", "--repo", str(repo)),
-        False,
+        action_kind,
+        tuple(action_argv),
+        requested_name is not None,
         False,
         ("full_recheck",),
     )
