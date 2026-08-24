@@ -1,14 +1,15 @@
 """组合仓同步计划的复检、受控写入与部分状态报告。"""
 
-import hashlib
-import os
-import stat
 from pathlib import Path
 from typing import Optional
 
+from data_infra_sync.fingerprint import repository_fingerprint
 from data_infra_sync.git import GitError
 from data_infra_sync.model import Action, Result
 from data_infra_sync.planner import plan_sync
+
+
+_EXPECTED_OPERATION_ERRORS = (GitError, OSError, RuntimeError, ValueError)
 
 
 def execute_sync(
@@ -23,7 +24,7 @@ def execute_sync(
 
     try:
         facts = adapter.collect_plan_facts(git, fresh=True)
-    except (GitError, OSError):
+    except _EXPECTED_OPERATION_ERRORS:
         return _failed(None, "git_precondition_failed")
 
     plan = plan_sync(facts)
@@ -39,7 +40,7 @@ def execute_sync(
     try:
         current_patches = adapter.managed_patches(facts.current_parent)
         target_patches = adapter.managed_patches(facts.target_parent)
-    except (GitError, OSError):
+    except _EXPECTED_OPERATION_ERRORS:
         return _failed(plan, "git_precondition_failed")
     if not _continuous_declarations(current_patches, target_patches):
         return _from_plan(
@@ -49,7 +50,7 @@ def execute_sync(
         preflight_ok = adapter.preflight_managed_patches(
             git, facts, current_patches, target_patches
         )
-    except (GitError, OSError):
+    except _EXPECTED_OPERATION_ERRORS:
         return _failed(plan, "git_precondition_failed")
     if not preflight_ok:
         return _from_plan(
@@ -61,7 +62,7 @@ def execute_sync(
                 adapter.patch_state(git, patch) == "applied"
                 for patch in target_patches
             )
-        except (GitError, OSError):
+        except _EXPECTED_OPERATION_ERRORS:
             return _failed(plan, "git_precondition_failed")
         if all_applied:
             return _from_plan(plan, "updated", (), changed=False)
@@ -126,7 +127,7 @@ def execute_sync(
         if post_plan.state != "up_to_date":
             return _partial(_actual_from_plan(post_plan), failure_reason)
         return _from_plan(post_plan, "updated", (), changed=True)
-    except (GitError, OSError):
+    except _EXPECTED_OPERATION_ERRORS:
         actual = _read_actual_state(git, adapter, facts, plan)
         after_fingerprint = _domain_fingerprint(git, adapter, facts)
         proven_unchanged = (
@@ -182,7 +183,7 @@ def _read_actual_state(git, adapter, facts, before_plan):
         actual_plan = plan_sync(actual_facts)
         actual = _actual_from_plan(actual_plan)
         return actual
-    except (GitError, OSError):
+    except _EXPECTED_OPERATION_ERRORS:
         return _read_repositories_individually(git, adapter, facts, before_plan)
 
 
@@ -196,11 +197,11 @@ def _read_repositories_individually(git, adapter, facts, before_plan):
         path = facts.parent.path if logical_path == "." else adapter.root / logical_path
         try:
             head = git.run(path, ("rev-parse", "HEAD")).stdout.strip() or None
-        except (GitError, OSError):
+        except _EXPECTED_OPERATION_ERRORS:
             head = None
         try:
             observed = git.inspect_repo(path)
-        except (GitError, OSError):
+        except _EXPECTED_OPERATION_ERRORS:
             read_failed = True
             item = _repository_with_unread_auxiliary(
                 git, path, previous, head
@@ -238,7 +239,7 @@ def _repository_with_unread_auxiliary(git, path, previous, head):
     if head is not None and previous["target_pin"] is not None:
         try:
             relation = git.relation(path, head, previous["target_pin"])
-        except (GitError, OSError):
+        except _EXPECTED_OPERATION_ERRORS:
             pass
     item = dict(previous)
     item.update(
@@ -264,7 +265,7 @@ def _observed_repository(git, path, logical_path, previous, observed, head):
     if head is not None and target_pin is not None:
         try:
             relation = git.relation(path, head, target_pin)
-        except (GitError, OSError):
+        except _EXPECTED_OPERATION_ERRORS:
             reason_codes.append("actual_state_read_failed")
     return (
         {
@@ -286,102 +287,21 @@ def _observed_repository(git, path, logical_path, previous, observed, head):
 
 def _domain_fingerprint(git, adapter, facts):
     """精确读取本地 refs、index 和相关工作树内容；任一失败返回 None。"""
-    injected = getattr(git, "domain_fingerprint", None)
-    if injected is not None:
-        return injected(adapter, facts)
-    repositories = [(".", facts.parent.path)]
-    repositories.extend(
-        (item.path, adapter.root / item.path)
-        for item in sorted(facts.repositories, key=lambda item: item.path)
-    )
     try:
+        injected = getattr(git, "domain_fingerprint", None)
+        if injected is not None:
+            return injected(adapter, facts)
+        repositories = [(".", facts.parent.path)]
+        repositories.extend(
+            (item.path, adapter.root / item.path)
+            for item in sorted(facts.repositories, key=lambda item: item.path)
+        )
         return tuple(
-            (logical_path, _repository_fingerprint(git, Path(path)))
+            (logical_path, repository_fingerprint(git, Path(path)))
             for logical_path, path in repositories
         )
-    except (GitError, OSError, RuntimeError, ValueError):
+    except _EXPECTED_OPERATION_ERRORS:
         return None
-
-
-def _repository_fingerprint(git, repository):
-    """返回单仓 refs、index、status 和 tracked/untracked 文件内容指纹。"""
-    repository = Path(os.path.abspath(str(repository)))
-    if not _safe_repository_path(repository):
-        return ("missing",)
-    head = git.run(repository, ("rev-parse", "HEAD")).stdout.strip()
-    branch = git.run(
-        repository, ("symbolic-ref", "--quiet", "HEAD"), check=False
-    )
-    refs = git.run(
-        repository,
-        ("for-each-ref", "--format=%(refname)%00%(objectname)", "refs/heads"),
-    ).stdout
-    index = git.run(repository, ("ls-files", "--stage", "-z")).stdout
-    status = git.run(
-        repository,
-        ("status", "--porcelain=v1", "-z", "--untracked-files=all"),
-    ).stdout
-    paths = git.run(
-        repository,
-        ("ls-files", "-z", "--cached", "--others", "--exclude-standard"),
-    ).stdout
-    files = tuple(
-        (relative, _path_fingerprint(repository, relative))
-        for relative in sorted(item for item in paths.split("\0") if item)
-    )
-    return (
-        head,
-        branch.returncode,
-        branch.stdout,
-        refs,
-        index,
-        status,
-        files,
-    )
-
-
-def _safe_repository_path(repository):
-    """通过 lstat 验证仓库入口及其路径组件，拒绝任何 symlink。"""
-    current = Path(repository.anchor)
-    metadata = current.lstat()
-    for part in repository.parts[1:]:
-        current = current / part
-        try:
-            metadata = current.lstat()
-        except FileNotFoundError:
-            return False
-        if stat.S_ISLNK(metadata.st_mode):
-            raise ValueError("repository path contains symlink")
-        if current != repository and not stat.S_ISDIR(metadata.st_mode):
-            raise ValueError("repository path component is not a directory")
-    if not stat.S_ISDIR(metadata.st_mode):
-        raise ValueError("repository path is not a directory")
-    return True
-
-
-def _path_fingerprint(repository, relative):
-    """不跟随 symlink 地计算单个工作树路径的稳定内容指纹。"""
-    path = repository
-    parts = Path(relative).parts
-    for position, part in enumerate(parts):
-        path = path / part
-        metadata = path.lstat()
-        if stat.S_ISLNK(metadata.st_mode):
-            return (
-                "symlink",
-                position,
-                stat.S_IMODE(metadata.st_mode),
-                os.readlink(path),
-            )
-    if stat.S_ISREG(metadata.st_mode):
-        return (
-            "file",
-            stat.S_IMODE(metadata.st_mode),
-            hashlib.sha256(path.read_bytes()).hexdigest(),
-        )
-    if stat.S_ISDIR(metadata.st_mode):
-        return ("directory", stat.S_IMODE(metadata.st_mode))
-    return ("other", metadata.st_mode, metadata.st_size)
 
 
 def _actual_from_plan(plan):

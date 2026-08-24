@@ -20,6 +20,7 @@ from data_infra_sync.config import WorkspaceConfig
 from data_infra_sync.git import GitError
 from data_infra_sync.model import Action, Result
 from data_infra_sync import cli
+from tests.test_executor import RecordingGit, ScriptedAdapter, TARGET_PARENT
 
 
 OID = "1" * 40
@@ -210,6 +211,32 @@ class RoutingTests(unittest.TestCase):
             code, _, mocks = self.run_main(("sync", "apply", "--snapshot", SNAPSHOT))
         self.assertEqual(code, 0)
         execute.assert_called_once_with(mocks[2].return_value, self.adapter, SNAPSHOT, False)
+
+    def test_write_then_decode_error_is_partial_exit_four(self):
+        """防止 CLI 把 Executor 写后读取异常降级为 failed/3。"""
+        git = RecordingGit()
+        git.patch_applied = False
+        adapter = ScriptedAdapter(git, (), ())
+        original = adapter.collect_plan_facts
+
+        def collect(runtime_git, *, fresh):
+            if not fresh and runtime_git.parent_head == TARGET_PARENT:
+                raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid byte")
+            return original(runtime_git, fresh=fresh)
+
+        adapter.collect_plan_facts = collect
+        output = io.StringIO()
+        with patch.object(cli, "load_config", return_value=self.config), patch.object(
+            cli, "StateStore", return_value=self.store
+        ), patch.object(cli, "Git", return_value=git), patch.object(
+            cli.DataInfraAdapter, "for_workspace", return_value=adapter
+        ), contextlib.redirect_stdout(output):
+            code = cli.main(("sync", "apply", "--non-interactive", "--format", "json"))
+
+        document = json.loads(output.getvalue())
+        self.assertEqual((code, document["state"], document["changed"]), (4, "partial", True))
+        self.assertEqual(document["reason_codes"][0], "postcondition_failed")
+        self.assertEqual(document["next_actions"][0]["kind"], "resume_sync")
 
     def test_verify_install_receives_config_store_and_record(self):
         with patch.object(cli, "verify_install", return_value=result(command="verify install")) as verify:

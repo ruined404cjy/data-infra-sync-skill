@@ -688,6 +688,32 @@ class ExecutorWriteTest(unittest.TestCase):
         self.assertEqual(result.repositories[0]["head"], TARGET_PARENT)
         self.assertEqual(result.next_actions[0].argv, ("data-infra-sync", "sync", "apply", "--non-interactive"))
 
+    def test_postcondition_decode_value_error_after_write_is_partial(self):
+        """防止写后事实解码失败越过 Executor 并被 CLI 误报为写前失败。"""
+        for error in (
+            UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid byte"),
+            ValueError("invalid collected value"),
+        ):
+            with self.subTest(error=type(error).__name__):
+                git = RecordingGit()
+                git.patch_applied = False
+                adapter = ScriptedAdapter(git, (), ())
+                original = adapter.collect_plan_facts
+
+                def collect(runtime_git, *, fresh, injected=error):
+                    if not fresh and runtime_git.parent_head == TARGET_PARENT:
+                        raise injected
+                    return original(runtime_git, fresh=fresh)
+
+                adapter.collect_plan_facts = collect
+
+                result = execute_sync(git, adapter, None, True)
+
+                self.assertEqual((result.state, result.changed), ("partial", True))
+                self.assertEqual(result.reason_codes[0], "postcondition_failed")
+                self.assertEqual(result.repositories[0]["head"], TARGET_PARENT)
+                self.assertEqual(result.next_actions[0].kind, "resume_sync")
+
     def test_patch_os_error_after_content_change_is_partial_and_retry_converges(self):
         git = RecordingGit()
         patch = managed_patch()

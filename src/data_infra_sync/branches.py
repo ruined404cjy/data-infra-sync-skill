@@ -4,12 +4,14 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Optional, Tuple
 
+from data_infra_sync.fingerprint import repository_fingerprint
 from data_infra_sync.git import Git, GitError, RepoFacts
 from data_infra_sync.model import Action, Result
 
 
 _COVERED_RELATIONS = frozenset(("equal", "contained", "tree_equal"))
 _CONTAINED_RELATIONS = frozenset(("equal", "contained"))
+_EXPECTED_BRANCH_ERRORS = (GitError, OSError, RuntimeError, ValueError)
 
 
 def branch_status(git: Git, repo: Path, target_pin: str) -> Result:
@@ -42,27 +44,25 @@ def start_branch(git: Git, repo: Path, target_pin: str, name: str) -> Result:
     if _local_branch_exists(git, repo, name):
         return _result("branch start", "blocked", ("branch_exists",), facts, target_pin, relation)
 
+    before_fingerprint = _switch_fingerprint(git, repo)
     try:
         git.run(repo, ("switch", "-c", name, target_pin))
-    except (GitError, OSError):
+    except _EXPECTED_BRANCH_ERRORS:
+        after_fingerprint = _switch_fingerprint(git, repo)
         identity = _read_branch_identity(git, repo)
-        requested_ref = _read_local_branch_oid(git, repo, name)
         partial = _branch_postcondition_failed(
             git, repo, facts, target_pin, "branch start", identity, name
         )
-        actual = partial.repositories[0]
         if (
-            identity[2]
-            and requested_ref[1]
-            and requested_ref[0] is None
-            and actual["head"] == facts.head
-            and actual["branch"] == facts.branch
+            before_fingerprint is not None
+            and after_fingerprint is not None
+            and before_fingerprint == after_fingerprint
         ):
             raise
         return partial
     try:
         updated = git.inspect_repo(repo)
-    except (GitError, OSError):
+    except _EXPECTED_BRANCH_ERRORS:
         return _branch_postcondition_failed(
             git, repo, facts, target_pin, "branch start", requested_name=name
         )
@@ -83,21 +83,26 @@ def resume_branch(git: Git, repo: Path, target_pin: str, name: str) -> Result:
     if facts.branch == name:
         return _result("branch resume", "branch_resumed", (), facts, target_pin, relation)
 
+    before_fingerprint = _switch_fingerprint(git, repo)
     try:
         git.run(repo, ("switch", name))
-    except (GitError, OSError):
+    except _EXPECTED_BRANCH_ERRORS:
+        after_fingerprint = _switch_fingerprint(git, repo)
         identity = _read_branch_identity(git, repo)
         partial = _branch_postcondition_failed(
             git, repo, facts, target_pin, "branch resume", identity, name
         )
-        actual = partial.repositories[0]
-        if identity[2] and actual["head"] == facts.head and actual["branch"] == facts.branch:
+        if (
+            before_fingerprint is not None
+            and after_fingerprint is not None
+            and before_fingerprint == after_fingerprint
+        ):
             raise
         return partial
     try:
         updated = git.inspect_repo(repo)
         updated_relation = _relation(git, repo, updated, target_pin, True)
-    except (GitError, OSError):
+    except _EXPECTED_BRANCH_ERRORS:
         return _branch_postcondition_failed(
             git, repo, facts, target_pin, "branch resume", requested_name=name
         )
@@ -346,7 +351,7 @@ def _read_branch_identity(git, repo):
     branch = None
     try:
         head = git.run(repo, ("rev-parse", "HEAD")).stdout.strip() or None
-    except (GitError, OSError):
+    except _EXPECTED_BRANCH_ERRORS:
         readable = False
     try:
         observed = git.run(
@@ -356,26 +361,17 @@ def _read_branch_identity(git, repo):
             branch = observed.stdout.strip() or None
         elif observed.returncode != 1:
             readable = False
-    except (GitError, OSError):
+    except _EXPECTED_BRANCH_ERRORS:
         readable = False
     return head, branch, readable
 
 
-def _read_local_branch_oid(git, repo, name):
-    """独立读取请求分支 ref；返回 OID 与是否能明确判定存在性。"""
+def _switch_fingerprint(git, repo):
+    """读取 switch 前后完整本地领域状态；失败时返回未知。"""
     try:
-        observed = git.run(
-            repo,
-            ("rev-parse", "--verify", "--quiet", "refs/heads/{}".format(name)),
-            check=False,
-        )
-    except (GitError, OSError):
-        return None, False
-    if observed.returncode == 0:
-        return observed.stdout.strip() or None, bool(observed.stdout.strip())
-    if observed.returncode == 1:
-        return None, True
-    return None, False
+        return repository_fingerprint(git, repo)
+    except _EXPECTED_BRANCH_ERRORS:
+        return None
 
 
 def _branch_postcondition_failed(

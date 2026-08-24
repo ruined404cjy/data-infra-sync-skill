@@ -1,6 +1,7 @@
 """跨 Agent Skill 安装脚本的行为测试。"""
 
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -19,10 +20,13 @@ HOST_DIRECTORIES = {
 
 
 class InstallSkillScriptTests(unittest.TestCase):
-    def run_installer(self, home: Path, *arguments: str) -> subprocess.CompletedProcess:
+    def run_installer(
+        self, home: Path, *arguments: str, environment_changes=None
+    ) -> subprocess.CompletedProcess:
         """在隔离 HOME 中运行安装器并返回完整进程结果。"""
         environment = os.environ.copy()
         environment["HOME"] = str(home)
+        environment.update(environment_changes or {})
         return subprocess.run(
             ["bash", str(INSTALLER), *arguments],
             cwd=ROOT,
@@ -156,6 +160,48 @@ class InstallSkillScriptTests(unittest.TestCase):
             self.assertTrue(binary_link.is_symlink())
             self.assertEqual(binary_link.resolve(), other.resolve())
             self.assertFalse((home / ".gemini").exists())
+
+    def test_second_link_race_rolls_back_only_the_first_owned_link(self):
+        """防止第二目标竞争失败留下半安装或删除竞争方文件。"""
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            home = base / "home"
+            home.mkdir()
+            shim_dir = base / "shim"
+            shim_dir.mkdir()
+            counter = base / "ln-count"
+            real_ln = shutil.which("ln")
+            self.assertIsNotNone(real_ln)
+            shim = shim_dir / "ln"
+            shim.write_text(
+                "#!/usr/bin/env bash\n"
+                "count=0\n"
+                "[ ! -f \"$INSTALL_TEST_COUNT\" ] || count=$(<\"$INSTALL_TEST_COUNT\")\n"
+                "count=$((count + 1))\n"
+                "printf '%s\\n' \"$count\" >\"$INSTALL_TEST_COUNT\"\n"
+                "if [ \"$count\" -eq 1 ]; then exec \"$INSTALL_TEST_REAL_LN\" \"$@\"; fi\n"
+                "target=${!#}\n"
+                "printf 'competitor\\n' >\"$target\"\n"
+                "exit 1\n",
+                encoding="utf-8",
+            )
+            shim.chmod(0o755)
+            environment = {
+                "PATH": str(shim_dir) + os.pathsep + os.environ["PATH"],
+                "INSTALL_TEST_COUNT": str(counter),
+                "INSTALL_TEST_REAL_LN": real_ln,
+            }
+
+            completed = self.run_installer(
+                home, "--host", "codex", "--bin", environment_changes=environment
+            )
+
+            skill_link = home / ".agents/skills" / SKILL_NAME
+            binary_target = home / ".local/bin/data-infra-sync"
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertFalse(skill_link.exists())
+            self.assertFalse(skill_link.is_symlink())
+            self.assertEqual(binary_target.read_text(encoding="utf-8"), "competitor\n")
 
 
 if __name__ == "__main__":

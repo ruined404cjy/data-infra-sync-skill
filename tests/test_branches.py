@@ -2,6 +2,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -104,6 +105,63 @@ class DevelopmentBranchTest(unittest.TestCase):
         with self.assertRaises(GitError):
             start_branch(self.git, self.fixture.submodule, target, "feature/failed")
 
+    def test_start_switch_failure_after_tracked_content_change_is_partial(self):
+        """防止 HEAD/branch 未变时遗漏 switch 已改写的工作树内容。"""
+        target = self.fixture.target_pin
+        original = self.git.run
+
+        def run(repo, args, *, check=True):
+            if args[:2] == ("switch", "-c"):
+                (Path(repo) / "README.md").write_text("switch changed content\n", encoding="utf-8")
+                raise GitError(("git",) + tuple(args), "switch failed after content write", 1)
+            return original(repo, args, check=check)
+
+        self.git.run = run
+
+        result = start_branch(self.git, self.fixture.submodule, target, "feature/content")
+
+        self.assertEqual((result.state, result.changed), ("partial", True))
+        self.assertEqual(result.reason_codes, ("branch_postcondition_failed",))
+
+    def test_start_switch_failure_after_unrelated_ref_change_is_partial(self):
+        """防止只检查请求分支而遗漏其他本地 ref 写入。"""
+        target = self.fixture.target_pin
+        original = self.git.run
+
+        def run(repo, args, *, check=True):
+            if args[:2] == ("switch", "-c"):
+                original(repo, ("branch", "unexpected/ref", target))
+                raise GitError(("git",) + tuple(args), "switch failed after ref write", 1)
+            return original(repo, args, check=check)
+
+        self.git.run = run
+
+        result = start_branch(self.git, self.fixture.submodule, target, "feature/requested")
+
+        self.assertEqual((result.state, result.changed), ("partial", True))
+        self.assertEqual(result.reason_codes, ("branch_postcondition_failed",))
+
+    def test_start_switch_failure_with_unreadable_fingerprint_is_partial(self):
+        """防止指纹读取失败时把无法证明零副作用的 switch 误报为 failed。"""
+        target = self.fixture.target_pin
+        original = self.git.run
+
+        def run(repo, args, *, check=True):
+            if args[:2] == ("switch", "-c"):
+                raise GitError(("git",) + tuple(args), "switch failed", 1)
+            return original(repo, args, check=check)
+
+        self.git.run = run
+        with patch(
+            "data_infra_sync.branches.repository_fingerprint",
+            side_effect=ValueError("fingerprint unreadable"),
+        ):
+            result = start_branch(
+                self.git, self.fixture.submodule, target, "feature/unknown-state"
+            )
+
+        self.assertEqual((result.state, result.changed), ("partial", True))
+
     def test_detached_switch_failure_with_unreadable_branch_is_partial(self):
         target = self.fixture.target_pin
         self.fixture.detach(self.fixture.submodule)
@@ -145,6 +203,27 @@ class DevelopmentBranchTest(unittest.TestCase):
         self.assertEqual(result.reason_codes, ("branch_postcondition_failed",))
         self.assertEqual(result.repositories[0]["branch"], "feature/resume")
         self.assertTrue(result.next_actions)
+
+    def test_resume_switch_failure_after_untracked_write_is_partial(self):
+        """防止 resume 在 HEAD/branch 未变时遗漏新增文件。"""
+        target = self.fixture.target_pin
+        self.fixture.create_branch(self.fixture.submodule, "feature/resume", target)
+        original = self.git.run
+
+        def run(repo, args, *, check=True):
+            if args == ("switch", "feature/resume"):
+                (Path(repo) / "switch-output.tmp").write_text("partial\n", encoding="utf-8")
+                raise OSError("switch failed after untracked write")
+            return original(repo, args, check=check)
+
+        self.git.run = run
+
+        result = resume_branch(
+            self.git, self.fixture.submodule, target, "feature/resume"
+        )
+
+        self.assertEqual((result.state, result.changed), ("partial", True))
+        self.assertEqual(result.reason_codes, ("branch_postcondition_failed",))
 
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="branch fixture ")

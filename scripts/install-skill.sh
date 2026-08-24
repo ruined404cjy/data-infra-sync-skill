@@ -59,12 +59,37 @@ repository_root="$(CDPATH= cd -- "$script_directory/.." && pwd -P)"
 cli_source="$repository_root/scripts/data-infra-sync"
 skill_target="$HOME/$host_directory/skills/data-infra-sync-skill"
 binary_target="$HOME/.local/bin/data-infra-sync"
+created_targets=()
+created_sources=()
+installation_complete=0
 
 [ -x "$cli_source" ] || fail_usage "CLI entry is not executable: $cli_source"
 
 is_same_link() {
     [ -L "$1" ] && [ "$(readlink -f -- "$1")" = "$2" ]
 }
+
+rollback_install() {
+    local index target source
+    for ((index=${#created_targets[@]} - 1; index >= 0; index--)); do
+        target=${created_targets[$index]}
+        source=${created_sources[$index]}
+        if is_same_link "$target" "$source"; then
+            unlink -- "$target" || true
+        fi
+    done
+}
+
+finish_install() {
+    local status=$?
+    trap - EXIT
+    if [ "$installation_complete" -eq 0 ] && [ "$status" -ne 0 ]; then
+        rollback_install
+    fi
+    exit "$status"
+}
+
+trap finish_install EXIT
 
 validate_target() {
     target="$1"
@@ -99,7 +124,12 @@ install_link() {
         return 0
     fi
     mkdir -p -- "$(dirname -- "$target")"
-    ln -s -- "$source" "$target"
+    if ln -s -- "$source" "$target"; then
+        created_targets+=("$target")
+        created_sources+=("$source")
+        return 0
+    fi
+    return 1
 }
 
 # Validate every requested destination before the first filesystem write.
@@ -115,4 +145,5 @@ if [ "$install_bin" -eq 1 ]; then
     install_link "$cli_source" "$binary_target"
 fi
 
+installation_complete=1
 echo "Installed data-infra-sync-skill for $host."

@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Callable, Tuple
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
-from data_infra_sync.git import GitError, RepoFacts
+from data_infra_sync.git import GitError, RepoFacts, git_environment
 from data_infra_sync.planner import PlanFacts, RepositoryPlanFacts, SubmoduleSpec
 
 
@@ -144,6 +144,7 @@ class DataInfraInstallAdapter:
             check=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            env=git_environment(),
         ).stdout
 
     @staticmethod
@@ -154,15 +155,20 @@ class DataInfraInstallAdapter:
             if not process.name.isdigit():
                 continue
             try:
-                name = (process / "comm").read_text(encoding="utf-8").strip()
-            except (FileNotFoundError, ProcessLookupError, PermissionError):
+                name = _read_proc_text(process / "comm").strip()
+                if name != "gaussdb":
+                    continue
+                exe = os.readlink(process / "exe")
+                maps = _read_proc_text(process / "maps").splitlines()
+            except OSError:
                 continue
-            if name != "gaussdb":
-                continue
-            exe = os.readlink(process / "exe")
-            maps = (process / "maps").read_text(encoding="utf-8").splitlines()
             records.append({"name": name, "exe": exe, "maps": tuple(maps)})
         return tuple(records)
+
+
+def _read_proc_text(path: Path) -> str:
+    """以替换字符容忍 Linux procfs 中的非 UTF-8 瞬时字节。"""
+    return path.read_text(encoding="utf-8", errors="replace")
 
 
 @dataclass(frozen=True)
@@ -319,31 +325,36 @@ class DataInfraAdapter:
             return status == ""
 
     def _target_accepts_patches(self, git, path, target_pin, patches) -> bool:
-        """在隔离临时 worktree 中验证目标 pin 可应用或已等价。"""
+        """在独立临时仓库中验证目标 pin 可应用或已等价。"""
         repository = _safe_directory(self.root, path)
         if repository is None:
             return False
         with tempfile.TemporaryDirectory(prefix="data-infra-sync-target-") as directory:
             worktree = Path(directory) / "target"
+            worktree.mkdir()
+            git.run(worktree, ("init", "--quiet"))
             git.run(
-                repository,
-                ("worktree", "add", "--detach", str(worktree), target_pin),
+                worktree,
+                (
+                    "fetch",
+                    "--no-tags",
+                    "--no-recurse-submodules",
+                    "--refmap=",
+                    "--",
+                    str(repository),
+                    target_pin,
+                ),
             )
-            try:
-                for patch in patches:
-                    if _safe_directory(worktree, patch.apply_path) is None:
-                        return False
-                    state = self._patch_state_at(git, worktree, patch)
-                    if state == "absent":
-                        self._apply_patch_at(git, worktree, patch, reverse=False)
-                    elif state != "applied":
-                        return False
-                return True
-            finally:
-                git.run(
-                    repository,
-                    ("worktree", "remove", "--force", str(worktree)),
-                )
+            git.run(worktree, ("checkout", "--detach", "FETCH_HEAD"))
+            for patch in patches:
+                if _safe_directory(worktree, patch.apply_path) is None:
+                    return False
+                state = self._patch_state_at(git, worktree, patch)
+                if state == "absent":
+                    self._apply_patch_at(git, worktree, patch, reverse=False)
+                elif state != "applied":
+                    return False
+            return True
 
     def _patch_state_at(
         self, git, repository, patch, *, git_options=()
@@ -929,9 +940,12 @@ def _parent_non_submodule_dirty(git, root, current_submodules):
         if entry[0] in ("R", "C") and index < len(entries):
             second_path = entries[index]
             index += 1
-        if path not in submodule_paths or (
-            second_path is not None and second_path not in submodule_paths
-        ):
+        pure_worktree_gitlink = (
+            path in submodule_paths
+            and second_path is None
+            and entry[0:2] == " M"
+        )
+        if not pure_worktree_gitlink:
             return True
     return False
 
@@ -972,6 +986,7 @@ def _load_managed_patches(git, root, parent_commit):
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         shell=False,
+        env=git_environment(),
     )
     if completed.returncode != 0:
         raise GitError(
@@ -1017,13 +1032,12 @@ def _with_managed_patch_states(adapter, git, facts):
         dirty = paths.issubset(repositories) and all(
             repositories[path].facts.worktree == "dirty" for path in paths
         )
-        if dirty and not global_transition:
-            state = (
-                "continuous"
-                if adapter.preflight_managed_patches(git, facts, current, target)
-                else "transition"
-            )
-            states.update((path, state) for path in paths)
+        state = "transition"
+        if dirty and not global_transition and adapter.preflight_managed_patches(
+            git, facts, current, target
+        ):
+            state = "continuous"
+        states.update((path, state) for path in paths)
     repositories = tuple(
         RepositoryPlanFacts(
             item.path,

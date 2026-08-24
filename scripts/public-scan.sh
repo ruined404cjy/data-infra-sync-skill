@@ -3,6 +3,16 @@
 
 set -u
 
+# Git 的仓库、index、对象库和命令级配置始终由显式候选目录决定。
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR
+unset GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+unset GIT_CONFIG GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT
+while IFS='=' read -r variable _; do
+    case "$variable" in
+        GIT_CONFIG_KEY_[0-9]*|GIT_CONFIG_VALUE_[0-9]*) unset "$variable" ;;
+    esac
+done < <(env)
+
 scan_error() {
     printf 'scan-error: %s\n' "$1" >&2
     exit 2
@@ -114,7 +124,7 @@ for relative_path in "${candidates[@]}"; do
     fi
 
     case "$lowercase" in
-        *.log|*.jsonl|latest.json|*.lock|*.pid|*.sqlite|*.sqlite3|*.db)
+        *.log|*.jsonl|latest.json|manifest.json|*.lock|*.pid|*.sqlite|*.sqlite3|*.db)
             report local-artifact "$relative_path"
             continue
             ;;
@@ -122,7 +132,7 @@ for relative_path in "${candidates[@]}"; do
 
     if [[ -z ${tracked_paths["$relative_path"]+tracked} ]]; then
         case "$lowercase" in
-            *.py|*.sh|*.md|*.rst|*.txt|*.json|*.yaml|*.yml|*.toml|*.ini|*.cfg|*.conf|*.c|*.h|*.cc|*.cpp|*.go|*.rs|*.js|*.jsx|*.ts|*.tsx)
+            *.py|*.sh|*.md|*.rst|*.txt|*.json|*.yaml|*.yml|*.toml|*.ini|*.cfg|*.conf|*.c|*.h|*.cc|*.cpp|*.go|*.rs|*.js|*.jsx|*.ts|*.tsx|dockerfile|makefile|cmakelists.txt|build|build.bazel|workspace|workspace.bazel)
                 report untracked-source "$relative_path"
                 ;;
         esac

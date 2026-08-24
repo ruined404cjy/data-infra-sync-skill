@@ -42,6 +42,18 @@ _GIT_REDIRECT_ENV = frozenset(
 _GIT_CONFIG_ENTRY_ENV = re.compile(r"^GIT_CONFIG_(?:KEY|VALUE)_[0-9]+$")
 
 
+def git_environment() -> Dict[str, str]:
+    """返回清除仓库、对象库、index 与命令级配置重定向的 Git 环境。"""
+    environment = {
+        name: value
+        for name, value in os.environ.items()
+        if name not in _GIT_REDIRECT_ENV
+        and _GIT_CONFIG_ENTRY_ENV.fullmatch(name) is None
+    }
+    environment["GIT_TERMINAL_PROMPT"] = "0"
+    return environment
+
+
 @dataclass(frozen=True)
 class Gitlink:
     """描述父仓树中一个一级 submodule 的精确提交。"""
@@ -87,13 +99,6 @@ class Git:
         self, repo: Path, args: Sequence[str], *, check: bool = True
     ) -> subprocess.CompletedProcess[str]:
         """在 repo 中执行 Git argv，并在失败时抛出脱敏 GitError。"""
-        environment = {
-            name: value
-            for name, value in os.environ.items()
-            if name not in _GIT_REDIRECT_ENV
-            and _GIT_CONFIG_ENTRY_ENV.fullmatch(name) is None
-        }
-        environment["GIT_TERMINAL_PROMPT"] = "0"
         completed = subprocess.run(
             ["git", *args],
             cwd=str(repo),
@@ -104,7 +109,7 @@ class Git:
             encoding="utf-8",
             errors="replace",
             shell=False,
-            env=environment,
+            env=git_environment(),
         )
         if check and completed.returncode != 0:
             raise GitError(tuple(str(item) for item in completed.args), completed.stderr, completed.returncode)

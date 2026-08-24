@@ -13,7 +13,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from data_infra_sync.adapters.datainfra import DataInfraInstallAdapter
+from data_infra_sync.adapters.datainfra import DataInfraInstallAdapter, _read_proc_text
 from data_infra_sync.state import StateStore
 from data_infra_sync.verify import InstallIdentity, collect_install_identity, verify_install
 
@@ -70,6 +70,16 @@ def _config(root, state_dir):
 
 
 class InstallIdentityTest(unittest.TestCase):
+    def test_proc_text_reader_replaces_non_utf8_bytes(self):
+        """防止 /proc 的瞬时非 UTF-8 字节使安装核验异常终止。"""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "maps"
+            path.write_bytes(b"valid\xffline\n")
+
+            content = _read_proc_text(path)
+
+            self.assertEqual(content, "valid\ufffdline\n")
+
     def test_install_identity_is_immutable_and_manifest_is_root_independent(self):
         """防止安装身份携带绝对 checkout 路径或可被调用方修改。"""
         identity = InstallIdentity(
@@ -210,6 +220,30 @@ class InstallIdentityTest(unittest.TestCase):
                     (child, ("rev-parse", "HEAD")),
                 ],
             )
+
+    def test_default_git_reader_ignores_repository_redirection_environment(self):
+        """防止环境变量把安装身份的 Git HEAD 读取重定向到其他仓库。"""
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            root = base / "checkout"
+            _, parent_head, child_head = _make_workspace(root)
+            decoy = base / "decoy"
+            decoy_head = _init_repository(decoy, "decoy\n")
+            adapter = DataInfraInstallAdapter(root, proc_reader=lambda: ())
+            redirected = {
+                "GIT_DIR": str(decoy / ".git"),
+                "GIT_WORK_TREE": str(decoy),
+                "GIT_INDEX_FILE": str(decoy / ".git/index"),
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": "core.bare",
+                "GIT_CONFIG_VALUE_0": "true",
+            }
+
+            with mock.patch.dict(os.environ, redirected, clear=False):
+                heads = dict(adapter.repository_heads())
+
+            self.assertEqual(heads, {".": parent_head, "modules/child": child_head})
+            self.assertNotIn(decoy_head, heads.values())
 
     def test_identical_checkouts_at_different_absolute_roots_have_same_manifest(self):
         """防止绝对 workspace 路径使相同安装身份产生不同 manifest。"""

@@ -1,13 +1,16 @@
+import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from data_infra_sync.adapters.datainfra import DataInfraAdapter, _resolve_submodule_url
 from data_infra_sync.config import WorkspaceConfig
+from data_infra_sync.executor import execute_sync
 from data_infra_sync.git import Git, GitError
 from data_infra_sync.planner import plan_sync, snapshot_for
 from tests.git_fixture import CompositeFixture
@@ -334,20 +337,34 @@ class DataInfraAdapterCollectionTest(unittest.TestCase):
             self.assertEqual(repository.managed_patch_state, "none")
             self.assertEqual(plan_sync(facts).state, "up_to_date")
 
-    def test_parent_dirty_ignores_gitlink_only_status_but_keeps_regular_changes(self):
-        """防止子仓 dirty 被重复计为父仓 dirty，并保留普通父仓改动。"""
+    def test_parent_dirty_ignores_only_unstaged_gitlink_drift(self):
+        """防止已暂存 gitlink 更新绕过父仓 dirty 阻塞。"""
         with tempfile.TemporaryDirectory() as temp_dir:
             fixture = CompositeFixture.create(Path(temp_dir))
             fixture.commit_file(
                 fixture.submodule, "local-child.txt", "local\n", "local child"
             )
-            fixture.stage(fixture.parent, "modules/component")
             git = Git()
             adapter = DataInfraAdapter.for_workspace(config_for(fixture), git)
 
-            submodule_only = adapter.collect_plan_facts(git, fresh=False)
-            self.assertFalse(submodule_only.parent_non_submodule_dirty)
-            self.assertTrue(submodule_only.parent.index_dirty)
+            unstaged = adapter.collect_plan_facts(git, fresh=False)
+            self.assertFalse(unstaged.parent_non_submodule_dirty)
+            self.assertFalse(unstaged.parent.index_dirty)
+
+            fixture.stage(fixture.parent, "modules/component")
+            staged = adapter.collect_plan_facts(git, fresh=False)
+            self.assertTrue(staged.parent_non_submodule_dirty)
+            self.assertTrue(staged.parent.index_dirty)
+            self.assertEqual(plan_sync(staged).state, "blocked")
+
+            fixture.commit_file(
+                fixture.submodule, "second-child.txt", "second\n", "second child"
+            )
+            mixed = adapter.collect_plan_facts(git, fresh=False)
+            self.assertTrue(mixed.parent_non_submodule_dirty)
+            self.assertTrue(mixed.parent.index_dirty)
+            self.assertTrue(mixed.parent.worktree_dirty)
+            self.assertEqual(plan_sync(mixed).state, "blocked")
 
             fixture.make_dirty(fixture.parent, "ordinary.txt")
             ordinary = adapter.collect_plan_facts(git, fresh=False)
@@ -773,7 +790,19 @@ class DataInfraAdapterManagedPatchTest(unittest.TestCase):
             git = Git()
             adapter = DataInfraAdapter.for_workspace(config_for(fixture), git)
 
-            patches = adapter.managed_patches(commit)
+            decoy = fixture.root / "decoy"
+            decoy.mkdir()
+            fixture._run(decoy, ("init", "--initial-branch=main"))
+            fixture._configure_user(decoy)
+            fixture.commit_file(decoy, "README.md", "decoy\n", "decoy")
+            redirected = {
+                "GIT_DIR": str(decoy / ".git"),
+                "GIT_WORK_TREE": str(decoy),
+                "GIT_CONFIG_PARAMETERS": "'core.bare=true'",
+            }
+
+            with mock.patch.dict(os.environ, redirected, clear=False):
+                patches = adapter.managed_patches(commit)
 
             self.assertEqual(len(patches), 1)
             self.assertEqual(patches[0].content, content)
@@ -796,6 +825,82 @@ class DataInfraAdapterManagedPatchTest(unittest.TestCase):
             self.assertEqual(delta.managed_patch_state, "continuous")
             self.assertEqual(len(adapter.managed_patches(facts.current_parent)), 1)
             self.assertEqual(plan_sync(facts).state, "update_ready")
+
+    def test_unchanged_declared_patch_absent_from_clean_worktree_blocks(self):
+        """防止同步主动把未应用的受控补丁引入干净工作树。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fixture, _ = self._delta_fixture(Path(temp_dir))
+            publisher = fixture.clone_parent("publisher")
+            fixture.commit_file(publisher, "target.txt", "advance\n", "advance parent")
+            fixture.push(publisher)
+            git = Git()
+
+            facts = DataInfraAdapter.for_workspace(
+                config_for(fixture), git
+            ).collect_plan_facts(git, fresh=True)
+            result = plan_sync(facts)
+
+            self.assertEqual(facts.repositories[0].facts.worktree, "clean")
+            self.assertEqual(facts.repositories[0].managed_patch_state, "transition")
+            self.assertEqual(result.state, "blocked")
+            self.assertIn("managed_patch_transition_required", result.reason_codes)
+
+            before = (
+                fixture.rev_parse(fixture.parent, "HEAD"),
+                fixture.rev_parse(fixture.submodule, "HEAD"),
+                fixture._run(
+                    fixture.submodule,
+                    ("status", "--porcelain=v1", "-z", "--untracked-files=all"),
+                ).stdout,
+            )
+            applied = execute_sync(
+                git,
+                DataInfraAdapter.for_workspace(config_for(fixture), git),
+                None,
+                True,
+            )
+            after = (
+                fixture.rev_parse(fixture.parent, "HEAD"),
+                fixture.rev_parse(fixture.submodule, "HEAD"),
+                fixture._run(
+                    fixture.submodule,
+                    ("status", "--porcelain=v1", "-z", "--untracked-files=all"),
+                ).stdout,
+            )
+            self.assertEqual(applied.state, "blocked")
+            self.assertIn("managed_patch_transition_required", applied.reason_codes)
+            self.assertFalse(applied.changed)
+            self.assertEqual(after, before)
+
+    def test_target_patch_preflight_never_registers_a_real_worktree(self):
+        """防止临时验证清理失败在真实子仓留下 worktree metadata。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fixture, patch_content = self._delta_fixture(Path(temp_dir))
+            self._apply_patch(fixture, patch_content)
+            delegate = Git()
+
+            class RejectWorktreeRemovalGit:
+                def __getattr__(self, name):
+                    return getattr(delegate, name)
+
+                def run(self, repo, args, *, check=True):
+                    if args[:2] == ("worktree", "remove"):
+                        raise OSError("injected worktree cleanup failure")
+                    return delegate.run(repo, args, check=check)
+
+            git = RejectWorktreeRemovalGit()
+            before = delegate.run(
+                fixture.submodule, ("worktree", "list", "--porcelain")
+            ).stdout
+            adapter = DataInfraAdapter.for_workspace(config_for(fixture), git)
+
+            facts = adapter.collect_plan_facts(git, fresh=False)
+
+            after = delegate.run(
+                fixture.submodule, ("worktree", "list", "--porcelain")
+            ).stdout
+            self.assertEqual(facts.repositories[0].managed_patch_state, "continuous")
+            self.assertEqual(after, before)
 
     def test_changed_patch_or_extra_dirty_is_transition(self):
         """防止声明变化或额外 dirty 获得连续补丁例外。"""

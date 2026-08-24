@@ -162,6 +162,37 @@ class PublicScanTests(unittest.TestCase):
         self.write("config/release.ini", "safe=true\n")
         self.assert_finding("credential", "config/release.ini", secret)
 
+    def test_git_redirection_environment_cannot_replace_the_candidate_index(self):
+        """防止 Git 环境变量把候选集合重定向到另一个干净仓库。"""
+        secret = "redirected-secret-value-12345"
+        self.write("config/release.ini", "api_key={}\n".format(secret))
+        self.git("add", "config/release.ini")
+        decoy = Path(self.temporary.name) / "decoy"
+        decoy.mkdir()
+        subprocess.run(("git", "init", "-b", "main", str(decoy)), check=True,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        environment = {
+            "GIT_DIR": str(decoy / ".git"),
+            "GIT_WORK_TREE": str(decoy),
+            "GIT_INDEX_FILE": str(decoy / ".git/index"),
+            "GIT_COMMON_DIR": str(decoy / ".git"),
+            "GIT_OBJECT_DIRECTORY": str(decoy / ".git/objects"),
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(decoy / ".git/objects"),
+            "GIT_CONFIG": str(decoy / ".git/config"),
+            "GIT_CONFIG_PARAMETERS": "'core.bare=true'",
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "core.bare",
+            "GIT_CONFIG_VALUE_0": "true",
+            "GIT_CONFIG_KEY_77": "alias.injected",
+            "GIT_CONFIG_VALUE_77": "status",
+        }
+
+        completed = self.run_scan(environment)
+
+        self.assertEqual(completed.returncode, 1, completed.stderr)
+        self.assertEqual(completed.stdout.strip(), "credential: config/release.ini")
+        self.assertNotIn(secret, completed.stdout + completed.stderr)
+
     def test_staged_symlink_scans_link_blob_without_dereferencing(self):
         """防止 staged symlink 绕过个人路径扫描或读取链接目标。"""
         link = self.repo / "docs/home-link.txt"
@@ -194,10 +225,24 @@ class PublicScanTests(unittest.TestCase):
         self.git("add", "local/events.jsonl")
         self.assert_finding("local-artifact", "local/events.jsonl")
 
+    def test_staged_manifest_state_file_is_reported(self):
+        """防止固定 StateStore manifest 被普通 JSON 扩展名掩盖。"""
+        self.write("state/manifest.json", "{}\n")
+        self.git("add", "state/manifest.json")
+        self.assert_finding("local-artifact", "state/manifest.json")
+
     def test_untracked_source_document_or_config_fragment_is_reported(self):
         """防止未跟踪的实现或文档片段在发布前遗漏。"""
         self.write("notes/new check.py", "print('unfinished')\n")
         self.assert_finding("untracked-source", "notes/new check.py")
+
+    def test_untracked_extensionless_build_sources_are_reported(self):
+        """防止常见无扩展名构建入口遗漏在公开候选集合之外。"""
+        for filename in ("Dockerfile", "Makefile", "CMakeLists.txt", "BUILD", "WORKSPACE"):
+            with self.subTest(filename=filename):
+                self.write(filename, "fixture build input\n")
+                self.assert_finding("untracked-source", filename)
+                (self.repo / filename).unlink()
 
 
 if __name__ == "__main__":
