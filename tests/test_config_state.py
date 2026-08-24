@@ -11,12 +11,87 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from data_infra_sync.config import load_config
+from data_infra_sync.config import WorkspaceConfig, load_config, write_config
 from data_infra_sync.model import Result
 from data_infra_sync.state import StateStore
 
 
 class WorkspaceConfigTest(unittest.TestCase):
+    def test_write_config_round_trips_all_canonical_values(self):
+        """防止 init 写出的配置无法由公开读取入口恢复。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            config = WorkspaceConfig(
+                (temp_path / "parent checkout").resolve(),
+                "upstream",
+                "release/next",
+                temp_path / "nested/workspace.conf",
+                (temp_path / "state directory").resolve(),
+            )
+
+            write_config(config)
+
+            persisted = config.config_path.read_text(encoding="utf-8")
+            self.assertIn("targetRemote", persisted)
+            self.assertIn("targetBranch", persisted)
+            self.assertIn("stateDir", persisted)
+            self.assertEqual(load_config({}, {}, config.config_path), config)
+
+    def test_write_config_failure_preserves_old_bytes_and_removes_temporary_file(self):
+        """防止替换前失败破坏现有配置或遗留临时文件。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            config_path = temp_path / "workspace.conf"
+            old_bytes = b"[existing]\n\tvalue = preserved\n"
+            config_path.write_bytes(old_bytes)
+            config = WorkspaceConfig(
+                temp_path / "parent",
+                "origin",
+                "main",
+                config_path,
+                temp_path / "state",
+            )
+
+            with patch("data_infra_sync.config.os.replace", side_effect=OSError("injected")):
+                with self.assertRaisesRegex(OSError, "injected"):
+                    write_config(config)
+
+            self.assertEqual(config_path.read_bytes(), old_bytes)
+            self.assertEqual(list(temp_path.glob(".*.tmp")), [])
+
+    def test_write_config_rejects_values_that_can_inject_git_config_records(self):
+        """防止换行和 NUL 将单个配置值扩展为额外键。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            baseline = WorkspaceConfig(
+                temp_path / "parent",
+                "origin",
+                "main",
+                temp_path / "workspace.conf",
+                temp_path / "state",
+            )
+            cases = (
+                WorkspaceConfig(
+                    baseline.root,
+                    "origin\nmalicious.key=value",
+                    baseline.target_branch,
+                    baseline.config_path,
+                    baseline.state_dir,
+                ),
+                WorkspaceConfig(
+                    baseline.root,
+                    baseline.target_remote,
+                    "main\0malicious",
+                    baseline.config_path,
+                    baseline.state_dir,
+                ),
+            )
+
+            for config in cases:
+                with self.subTest(config=config):
+                    with self.assertRaises(ValueError):
+                        write_config(config)
+                    self.assertFalse(config.config_path.exists())
     def test_adapter_defaults_supply_current_root_origin_and_main(self):
         """防止缺少全部配置时偏离适配器的最小默认值。"""
         with tempfile.TemporaryDirectory() as temp_dir:

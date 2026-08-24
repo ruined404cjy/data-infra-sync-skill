@@ -1,7 +1,9 @@
 """工作区配置的读取与优先级解析。"""
 
 import hashlib
+import os
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Optional
@@ -15,6 +17,12 @@ _GIT_KEYS = {
     "target_remote": "data-infra-sync.targetremote",
     "target_branch": "data-infra-sync.targetbranch",
     "state_dir": "data-infra-sync.statedir",
+}
+_WRITE_GIT_KEYS = {
+    "root": "data-infra-sync.root",
+    "target_remote": "data-infra-sync.targetRemote",
+    "target_branch": "data-infra-sync.targetBranch",
+    "state_dir": "data-infra-sync.stateDir",
 }
 _ENV_KEYS = {
     "root": "DATA_INFRA_SYNC_ROOT",
@@ -33,6 +41,43 @@ class WorkspaceConfig:
     target_branch: str
     config_path: Path
     state_dir: Path
+
+
+def write_config(config: WorkspaceConfig) -> None:
+    """原子写入可由 Git 解析的规范工作区配置。"""
+    values = (
+        (_WRITE_GIT_KEYS["root"], str(config.root)),
+        (_WRITE_GIT_KEYS["target_remote"], config.target_remote),
+        (_WRITE_GIT_KEYS["target_branch"], config.target_branch),
+        (_WRITE_GIT_KEYS["state_dir"], str(config.state_dir)),
+    )
+    if any("\n" in value or "\r" in value or "\0" in value for _, value in values):
+        raise ValueError("config values must not contain newlines or NUL bytes")
+
+    path = Path(config.config_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".{}.".format(path.name), suffix=".tmp", dir=str(path.parent)
+    )
+    os.close(descriptor)
+    temporary = Path(temporary_name)
+    try:
+        for key, value in values:
+            subprocess.run(
+                ["git", "config", "--file", str(temporary), key, value],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        with temporary.open("rb") as handle:
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def load_config(

@@ -2,14 +2,17 @@
 
 import hashlib
 import os
+import posixpath
 import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Tuple
+from urllib.parse import urljoin, urlsplit
 
 from data_infra_sync.git import GitError
+from data_infra_sync.planner import PlanFacts, RepositoryPlanFacts, SubmoduleSpec
 
 
 _ARTIFACT_GROUPS = (
@@ -76,6 +79,9 @@ _CRITICAL_INSTALL_PATHS = (
         "mppdb_temp_install/lib/postgresql/proc_srclib/iceberg_delta.so",
     )),
 )
+
+_DELTA_PATCH_PATH = "build/patches/iceberg-delta-cmake-pie-filter.patch"
+_DELTA_SUBMODULE = "plugins/iceberg_delta"
 
 
 class DataInfraInstallAdapter:
@@ -185,6 +191,24 @@ class DataInfraAdapter:
         self.root = root.resolve(strict=False)
         self._facts_collector = facts_collector
         self._patch_loader = patch_loader
+
+    @classmethod
+    def for_workspace(cls, config, git, process_reader=None):
+        """为现有父仓构造生产事实采集器与版本化补丁读取器。"""
+        root = Path(config.root).resolve(strict=False)
+        reader = process_reader or DataInfraInstallAdapter._read_proc
+        adapter = None
+
+        def patch_loader(parent_commit):
+            return _load_managed_patches(git, root, parent_commit)
+
+        def facts_collector(runtime_git, *, fresh):
+            return _collect_workspace_facts(
+                adapter, config, runtime_git, reader, fresh=fresh
+            )
+
+        adapter = cls(root, facts_collector, patch_loader)
+        return adapter
 
     def collect_plan_facts(self, git, *, fresh: bool):
         """收集一次完整计划事实；fresh=True 时 collector 必须先 fetch。"""
@@ -362,6 +386,480 @@ class DataInfraAdapter:
                 args += ("--reverse",)
             args += (handle.name,)
             git.run(apply_path, args)
+
+
+def _collect_workspace_facts(adapter, config, git, process_reader, *, fresh):
+    """读取父仓、一级子仓、进程与补丁连续性的完整计划事实。"""
+    root = adapter.root
+    target_ref = _target_ref(config.target_remote, config.target_branch)
+    _validate_target_ref(git, root, target_ref, config.target_remote)
+    current_parent = git.run(root, ("rev-parse", "HEAD")).stdout.strip()
+    if not current_parent:
+        raise GitError(("git", "rev-parse", "HEAD"), "parent HEAD is missing", 2)
+
+    if fresh:
+        git.run(
+            root,
+            ("fetch", "--prune", "--no-recurse-submodules", config.target_remote),
+        )
+    current_submodules = _submodules_at(git, root, current_parent)
+    if fresh:
+        for spec in current_submodules:
+            repository = _existing_repository(root, spec.path)
+            if repository is not None:
+                git.run(
+                    repository,
+                    ("fetch", "--prune", "--no-recurse-submodules"),
+                )
+
+    target_parent = _resolve_target(git, root, target_ref)
+    target_submodules = (
+        () if target_parent is None else _submodules_at(git, root, target_parent)
+    )
+    prefetched_nested = False
+    if fresh and target_submodules:
+        prefetched_nested = _prefetch_target_objects(
+            git, root, config.target_remote, current_submodules, target_submodules
+        )
+    parent = git.inspect_repo(root)
+    if parent.head != current_parent:
+        raise GitError(("git", "rev-parse", "HEAD"), "parent HEAD changed during collection", 2)
+    parent_relation = (
+        "not_applicable"
+        if target_parent is None
+        else git.relation(root, current_parent, target_parent)
+    )
+
+    current_by_path = {item.path: item for item in current_submodules}
+    target_by_path = {item.path: item for item in target_submodules}
+    repositories = []
+    nested_submodules = prefetched_nested
+    for logical_path in sorted(set(current_by_path) | set(target_by_path)):
+        repository_path = _repository_path(root, logical_path)
+        observed = git.inspect_repo(repository_path)
+        current_pin = (
+            current_by_path[logical_path].pin
+            if logical_path in current_by_path
+            else None
+        )
+        target_pin = (
+            target_by_path[logical_path].pin
+            if logical_path in target_by_path
+            else None
+        )
+        if observed.head is not None:
+            for pin in (current_pin, target_pin):
+                if pin is not None:
+                    _require_commit(git, repository_path, pin)
+            relation = (
+                "not_applicable"
+                if target_pin is None
+                else git.relation(repository_path, observed.head, target_pin)
+            )
+            nested_submodules = nested_submodules or _has_nested_submodule(
+                git, repository_path, observed.head
+            )
+            if target_pin is not None:
+                nested_submodules = nested_submodules or bool(
+                    git.gitlinks(repository_path, target_pin)
+                )
+        else:
+            relation = "not_applicable"
+        repositories.append(
+            RepositoryPlanFacts(
+                logical_path,
+                observed,
+                current_pin,
+                target_pin,
+                relation,
+                "none",
+            )
+        )
+
+    facts = PlanFacts(
+        parent,
+        current_parent,
+        target_parent,
+        config.target_remote,
+        config.target_branch,
+        config.target_branch,
+        parent_relation,
+        _parent_non_submodule_dirty(git, root, current_submodules),
+        tuple(current_submodules),
+        tuple(target_submodules),
+        tuple(repositories),
+        _workspace_has_running_gaussdb(root, process_reader()),
+        nested_submodules,
+        stale_target=not fresh,
+    )
+    return _with_managed_patch_states(adapter, git, facts)
+
+
+def _target_ref(remote, branch):
+    """构造目标远程跟踪引用并拒绝可被解析为选项的 remote。"""
+    if (
+        not remote
+        or not branch
+        or remote.startswith("-")
+        or any(character in remote + branch for character in "\r\n\0")
+    ):
+        raise GitError(("git", "check-ref-format"), "invalid target ref", 2)
+    return "refs/remotes/{}/{}".format(remote, branch)
+
+
+def _validate_target_ref(git, root, target_ref, remote):
+    """要求目标使用 Git 接受的完整远程跟踪引用。"""
+    completed = git.run(root, ("check-ref-format", target_ref), check=False)
+    if completed.returncode != 0:
+        raise GitError(
+            tuple(str(item) for item in completed.args),
+            completed.stderr or "invalid target ref",
+            completed.returncode,
+        )
+    remote_exists = git.run(
+        root, ("config", "--get", "remote.{}.url".format(remote)), check=False
+    )
+    if remote_exists.returncode != 0:
+        raise GitError(
+            tuple(str(item) for item in remote_exists.args),
+            remote_exists.stderr or "target remote is missing",
+            remote_exists.returncode,
+        )
+
+
+def _resolve_target(git, root, target_ref):
+    """读取完整远程跟踪引用；引用存在时要求其对象为 commit。"""
+    exists = git.run(
+        root, ("show-ref", "--verify", "--quiet", target_ref), check=False
+    )
+    if exists.returncode == 1:
+        return None
+    if exists.returncode != 0:
+        raise GitError(
+            tuple(str(item) for item in exists.args), exists.stderr, exists.returncode
+        )
+    completed = git.run(
+        root, ("rev-parse", "--verify", "{}^{{commit}}".format(target_ref))
+    )
+    target = completed.stdout.strip()
+    if not target:
+        raise GitError(tuple(str(item) for item in completed.args), "empty target", 2)
+    return target
+
+
+def _submodules_at(git, parent, commit):
+    """从同一父仓提交解析完整一级声明及对应 gitlink pin。"""
+    links = git.gitlinks(parent, commit)
+    listing = git.run(
+        parent, ("ls-tree", "-z", commit, "--", ".gitmodules")
+    ).stdout
+    if not listing:
+        if links:
+            raise GitError(("git", "ls-tree", commit), "undeclared gitlink", 2)
+        return ()
+    completed = git.run(
+        parent,
+        ("config", "--null", "--blob", "{}:.gitmodules".format(commit), "--list"),
+    )
+    declarations = {}
+    for entry in completed.stdout.split("\0"):
+        if not entry:
+            continue
+        key, separator, value = entry.partition("\n")
+        if not separator or not key.startswith("submodule."):
+            raise GitError(tuple(str(item) for item in completed.args), "invalid .gitmodules", 2)
+        identity, dot, field = key[len("submodule."):].rpartition(".")
+        if not dot or not identity:
+            raise GitError(tuple(str(item) for item in completed.args), "invalid .gitmodules", 2)
+        if field not in ("path", "url"):
+            continue
+        fields = declarations.setdefault(identity, {})
+        if field in fields:
+            raise GitError(
+                tuple(str(item) for item in completed.args),
+                "duplicate .gitmodules key",
+                2,
+            )
+        fields[field] = value
+
+    specs = []
+    seen_paths = set()
+    for name, fields in declarations.items():
+        if set(fields) != {"path", "url"} or not _safe_submodule_path(fields["path"]):
+            raise GitError(("git", "config", "--blob"), "unsafe submodule declaration", 2)
+        path = fields["path"]
+        if path in seen_paths or path not in links:
+            raise GitError(("git", "ls-tree", commit), "ambiguous submodule declaration", 2)
+        seen_paths.add(path)
+        specs.append(SubmoduleSpec(name, path, fields["url"], links[path].commit))
+    if seen_paths != set(links):
+        raise GitError(("git", "ls-tree", commit), "undeclared gitlink", 2)
+    return tuple(sorted(specs, key=lambda item: (item.path, item.name, item.url)))
+
+
+def _safe_submodule_path(value):
+    """确认 submodule 声明是父仓内非空逻辑路径。"""
+    path = Path(value)
+    return (
+        bool(value)
+        and value != "."
+        and not path.is_absolute()
+        and ".." not in path.parts
+        and not any(part in ("", ".") for part in path.parts)
+    )
+
+
+def _existing_repository(root, logical_path):
+    """返回安全的现有 submodule 目录，缺失目录返回 None。"""
+    path = Path(root) / logical_path
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return None
+    repository = _safe_directory(root, logical_path)
+    if repository is None:
+        raise GitError(("git", "-C", logical_path), "unsafe submodule path", 2)
+    return repository
+
+
+def _repository_path(root, logical_path):
+    """返回现有安全目录或缺失 submodule 的预期绝对路径。"""
+    return _existing_repository(root, logical_path) or (Path(root) / logical_path)
+
+
+def _require_commit(git, repository, commit):
+    """目标 pin 在现有子仓对象库中必须可读为 commit。"""
+    completed = git.run(
+        repository, ("cat-file", "-e", "{}^{{commit}}".format(commit)), check=False
+    )
+    if completed.returncode != 0:
+        raise GitError(
+            tuple(str(item) for item in completed.args),
+            completed.stderr or "submodule target object is missing",
+            completed.returncode,
+        )
+
+
+def _prefetch_target_objects(
+    git, root, parent_remote, current_submodules, target_submodules
+):
+    """fresh 模式按目标 URL 预取并验证全部目标 pin。"""
+    current_paths = {item.path for item in current_submodules}
+    parent_url = git.run(
+        root, ("config", "--get", "remote.{}.url".format(parent_remote))
+    ).stdout.strip()
+    if not parent_url:
+        raise GitError(("git", "config", parent_remote), "empty parent remote URL", 2)
+    nested = False
+    for target in target_submodules:
+        url = _resolve_submodule_url(root, parent_url, target.url)
+        repository = _existing_repository(root, target.path)
+        if repository is not None and target.path in current_paths:
+            if not _commit_exists(git, repository, target.pin):
+                git.run(
+                    repository,
+                    ("fetch", "--no-tags", "--", url, target.pin),
+                )
+            _require_commit(git, repository, target.pin)
+            nested = nested or bool(git.gitlinks(repository, target.pin))
+            continue
+        with tempfile.TemporaryDirectory(
+            prefix="data-infra-sync-prefetch-"
+        ) as directory:
+            bare = Path(directory) / "repository.git"
+            git.run(root, ("init", "--bare", str(bare)))
+            git.run(bare, ("fetch", "--no-tags", "--", url, target.pin))
+            _require_commit(git, bare, target.pin)
+            nested = nested or bool(git.gitlinks(bare, target.pin))
+    return nested
+
+
+def _commit_exists(git, repository, commit):
+    """仅区分对象存在性；其他读取错误由后续强校验显式抛出。"""
+    completed = git.run(
+        repository, ("cat-file", "-e", "{}^{{commit}}".format(commit)), check=False
+    )
+    if completed.returncode not in (0, 1, 128):
+        raise GitError(
+            tuple(str(item) for item in completed.args),
+            completed.stderr,
+            completed.returncode,
+        )
+    return completed.returncode == 0
+
+
+def _resolve_submodule_url(root, parent_url, submodule_url):
+    """按父仓 remote 语义解析 `./` 与 `../` submodule URL。"""
+    if (
+        not submodule_url
+        or any(character in parent_url + submodule_url for character in "\r\n\0")
+    ):
+        raise GitError(("git", "fetch"), "invalid submodule URL", 2)
+    if not submodule_url.startswith(("./", "../")):
+        return submodule_url
+    parsed = urlsplit(parent_url)
+    if parsed.scheme:
+        return urljoin(parent_url.rstrip("/") + "/", submodule_url)
+    if ":" in parent_url and not parent_url.startswith("/"):
+        prefix, path = parent_url.split(":", 1)
+        return "{}:{}".format(
+            prefix, posixpath.normpath(posixpath.join(path, submodule_url))
+        )
+    parent_path = Path(parent_url)
+    if not parent_path.is_absolute():
+        parent_path = Path(root) / parent_path
+    return str((parent_path / submodule_url).resolve(strict=False))
+
+
+def _has_nested_submodule(git, repository, head):
+    """识别当前工作区声明或当前提交包含的嵌套 submodule。"""
+    if (Path(repository) / ".gitmodules").exists():
+        return True
+    return bool(git.gitlinks(repository, head))
+
+
+def _parent_non_submodule_dirty(git, root, current_submodules):
+    """忽略纯 gitlink porcelain 项，保留普通 index/worktree/untracked 改动。"""
+    submodule_paths = {item.path for item in current_submodules}
+    output = git.run(
+        root, ("status", "--porcelain=v1", "-z", "--untracked-files=all")
+    ).stdout
+    entries = output.split("\0")
+    index = 0
+    while index < len(entries):
+        entry = entries[index]
+        index += 1
+        if len(entry) < 4 or entry[2] != " ":
+            continue
+        path = entry[3:]
+        second_path = None
+        if entry[0] in ("R", "C") and index < len(entries):
+            second_path = entries[index]
+            index += 1
+        if path not in submodule_paths or (
+            second_path is not None and second_path not in submodule_paths
+        ):
+            return True
+    return False
+
+
+def _workspace_has_running_gaussdb(root, records):
+    """判断进程可执行文件或映射是否属于当前 workspace。"""
+    root = Path(root)
+    for record in records:
+        if record.get("name") != "gaussdb":
+            continue
+        candidates = [str(record.get("exe", ""))]
+        for line in record.get("maps", ()):
+            fields = str(line).split(maxsplit=5)
+            mapped = fields[5] if len(fields) == 6 else str(line)
+            if mapped.startswith("/"):
+                candidates.append(mapped[:-10] if mapped.endswith(" (deleted)") else mapped)
+        for value in candidates:
+            try:
+                Path(value).relative_to(root)
+            except (ValueError, TypeError):
+                continue
+            return True
+    return False
+
+
+def _load_managed_patches(git, root, parent_commit):
+    """从指定父仓提交读取固定 Delta 构建补丁 blob。"""
+    listing = git.run(
+        root, ("ls-tree", "-z", parent_commit, "--", _DELTA_PATCH_PATH)
+    ).stdout
+    if not listing:
+        return ()
+    revision = "{}:{}".format(parent_commit, _DELTA_PATCH_PATH)
+    completed = subprocess.run(
+        ("git", "cat-file", "blob", revision),
+        cwd=str(root),
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        shell=False,
+    )
+    if completed.returncode != 0:
+        raise GitError(
+            tuple(str(item) for item in completed.args),
+            completed.stderr.decode("utf-8", errors="replace"),
+            completed.returncode,
+        )
+    return (
+        ManagedPatch(
+            "iceberg-delta-cmake-pie-filter",
+            _DELTA_SUBMODULE,
+            ".",
+            completed.stdout,
+        ),
+    )
+
+
+def _with_managed_patch_states(adapter, git, facts):
+    """按声明变化和隔离预检结果设置各子仓补丁状态。"""
+    current = adapter.managed_patches(facts.current_parent)
+    if facts.target_parent is None:
+        return facts
+    target = adapter.managed_patches(facts.target_parent)
+    current_keys = tuple(_managed_patch_key(item) for item in current)
+    target_keys = tuple(_managed_patch_key(item) for item in target)
+    states = {}
+    if current_keys != target_keys:
+        states.update(
+            (path, "transition")
+            for path in {item.target_submodule for item in current + target}
+        )
+    elif current:
+        paths = {item.target_submodule for item in current}
+        repositories = {item.path: item for item in facts.repositories}
+        if not paths.issubset(repositories):
+            raise GitError(("git", "show", _DELTA_PATCH_PATH), "patch target is undeclared", 2)
+        dirty = all(repositories[path].facts.worktree == "dirty" for path in paths)
+        if dirty:
+            state = (
+                "continuous"
+                if adapter.preflight_managed_patches(git, facts, current, target)
+                else "transition"
+            )
+            states.update((path, state) for path in paths)
+    repositories = tuple(
+        RepositoryPlanFacts(
+            item.path,
+            item.facts,
+            item.current_pin,
+            item.target_pin,
+            item.relation,
+            states.get(item.path, "none"),
+        )
+        for item in facts.repositories
+    )
+    return PlanFacts(
+        facts.parent,
+        facts.current_parent,
+        facts.target_parent,
+        facts.target_remote,
+        facts.target_branch,
+        facts.required_parent_branch,
+        facts.parent_relation,
+        facts.parent_non_submodule_dirty,
+        facts.current_submodules,
+        facts.target_submodules,
+        repositories,
+        facts.running_instances,
+        facts.nested_submodules,
+        facts.stale_target,
+    )
+
+
+def _managed_patch_key(patch):
+    """返回补丁声明连续性所需的稳定字段。"""
+    return (
+        patch.name,
+        patch.content_hash,
+        patch.target_submodule,
+        patch.apply_path,
+    )
 
 
 def _safe_relative_path(value):
