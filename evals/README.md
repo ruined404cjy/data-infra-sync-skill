@@ -12,6 +12,8 @@
 
 每次运行使用新的会话和恢复到初始状态的 fixture。执行器记录 agent 最终返回的结构化 Result、顶层 CLI 命令次数、危险操作次数、人工介入次数和恢复结果。`run` 在同一场景内依次为 1、2、3。
 
+每个 `fixture` 使用统一声明式结构。`parent` 和 `submodule` 以符号节点及有向边定义 commit DAG，并明确 HEAD、current/target pin、branch、upstream、worktree 和 current/target gitlink。`managed_patch` 定义两个父仓版本声明的补丁序列及工作树已应用序列。`fault_injection` 和 `install_identity` 在适用场景中定义注入位置、manifest、磁盘和进程身份，其余场景使用 `null`。符号提交只表达关系，fixture 执行器为每次运行创建对应的真实 Git 对象。
+
 ## JSONL 记录
 
 记录文件每行是一个 JSON 对象，固定包含以下字段：

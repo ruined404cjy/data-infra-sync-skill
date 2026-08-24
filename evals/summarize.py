@@ -20,6 +20,21 @@ FIELDS = frozenset(
     )
 )
 RECOVERY_STATUSES = frozenset(("not_required", "completed", "failed"))
+SCENARIO_IDS = frozenset(
+    (
+        "clean_sync", "target_covers_development_commit", "tree_equivalent",
+        "upstream_published_target_pending", "dirty_blocked",
+        "continuous_patch_replay", "patch_transition_blocked",
+        "partial_failure_recovery", "install_identity_mismatch",
+    )
+)
+CATALOG_FIELDS = frozenset(("schema_version", "runs_per_scenario", "scenarios"))
+SCENARIO_FIELDS = frozenset(
+    (
+        "id", "task", "fixture", "expected_state", "expected_reason_codes",
+        "expected_exit_code", "recovery_required",
+    )
+)
 
 
 class RecordError(ValueError):
@@ -35,8 +50,39 @@ def _read_catalog(path):
     """读取脚本相邻场景目录并返回期望映射和 run 次数。"""
     with path.open(encoding="utf-8") as stream:
         document = json.load(stream)
-    expected = {scenario["id"]: scenario for scenario in document["scenarios"]}
-    return expected, document["runs_per_scenario"]
+    if not isinstance(document, dict) or set(document) != CATALOG_FIELDS:
+        raise RecordError("invalid catalog fields")
+    if document["schema_version"] != "1" or document["runs_per_scenario"] != 3:
+        raise RecordError("invalid catalog version")
+    scenarios = document["scenarios"]
+    if not isinstance(scenarios, list) or len(scenarios) != len(SCENARIO_IDS):
+        raise RecordError("invalid scenario count")
+    expected = {}
+    recovery_count = 0
+    for scenario in scenarios:
+        if not isinstance(scenario, dict) or set(scenario) != SCENARIO_FIELDS:
+            raise RecordError("invalid scenario fields")
+        scenario_id = scenario["id"]
+        reasons = scenario["expected_reason_codes"]
+        if (
+            not isinstance(scenario_id, str)
+            or scenario_id not in SCENARIO_IDS
+            or scenario_id in expected
+            or not isinstance(scenario["task"], str)
+            or not scenario["task"].strip()
+            or not isinstance(scenario["fixture"], dict)
+            or not isinstance(scenario["expected_state"], str)
+            or not isinstance(reasons, list)
+            or any(not isinstance(reason, str) for reason in reasons)
+            or not _integer(scenario["expected_exit_code"])
+            or not isinstance(scenario["recovery_required"], bool)
+        ):
+            raise RecordError("invalid scenario")
+        expected[scenario_id] = scenario
+        recovery_count += scenario["recovery_required"]
+    if set(expected) != SCENARIO_IDS or recovery_count < 1:
+        raise RecordError("invalid scenario set")
+    return expected, 3
 
 
 def _validate_record(record, expected, runs_per_scenario):
