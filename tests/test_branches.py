@@ -12,7 +12,7 @@ from data_infra_sync.branches import (
     resume_branch,
     start_branch,
 )
-from data_infra_sync.git import Git
+from data_infra_sync.git import Git, GitError
 from tests.git_fixture import CompositeFixture
 
 
@@ -103,6 +103,70 @@ class DevelopmentBranchTest(unittest.TestCase):
         self.assertEqual(result.state, "publish_verified")
         self.assertFalse(result.changed)
         self.assertEqual(repository["behind"], 1)
+
+    def test_publish_check_fetches_only_upstream_without_writing_local_heads(self):
+        """防止恶意 fetch refspec 与 upstream 符号引用改写本地分支。"""
+        initial = self.fixture.target_pin
+        self.fixture.create_branch(self.fixture.submodule, "victim", initial)
+        remote = self._clone_submodule("submodule remote update")
+        advanced = self.fixture.commit_file(remote, "remote.txt", "remote\n", "remote commit")
+        self.fixture._run(remote, ("push", "origin", "main"))
+        self.fixture._run(
+            self.fixture.submodule,
+            (
+                "config",
+                "--add",
+                "remote.origin.fetch",
+                "+refs/heads/main:refs/heads/victim",
+            ),
+        )
+        self.fixture._run(
+            self.fixture.submodule,
+            (
+                "symbolic-ref",
+                "refs/remotes/origin/main",
+                "refs/heads/victim",
+            ),
+        )
+        before_heads = self._local_heads()
+
+        result = publish_check(self.git, self.fixture.submodule, initial)
+
+        self.assertEqual(result.state, "publish_verified")
+        self.assertEqual(result.reason_codes, ())
+        self.assertEqual(result.repositories[0]["behind"], 1)
+        self.assertEqual(self._local_heads(), before_heads)
+        self.assertEqual(
+            self.fixture.rev_parse(self.fixture.submodule, "refs/remotes/origin/main"), advanced
+        )
+        symbolic = self.git.run(
+            self.fixture.submodule,
+            ("symbolic-ref", "--quiet", "refs/remotes/origin/main"),
+            check=False,
+        )
+        self.assertEqual(symbolic.returncode, 1)
+
+    def test_publish_check_rejects_local_upstream_before_fetching(self):
+        """防止 local upstream 被当作远程跟踪引用更新。"""
+        self.fixture._run(self.fixture.submodule, ("config", "branch.main.remote", "."))
+        before_heads = self._local_heads()
+
+        with self.assertRaises(GitError):
+            publish_check(self.git, self.fixture.submodule, self.fixture.target_pin)
+
+        self.assertEqual(self._local_heads(), before_heads)
+
+    def test_publish_check_rejects_invalid_upstream_source_instead_of_hiding_it(self):
+        """防止畸形 merge source 被伪装为缺失 upstream。"""
+        self.fixture._run(
+            self.fixture.submodule, ("config", "branch.main.merge", "refs/evil")
+        )
+        before_heads = self._local_heads()
+
+        with self.assertRaises(GitError):
+            publish_check(self.git, self.fixture.submodule, self.fixture.target_pin)
+
+        self.assertEqual(self._local_heads(), before_heads)
 
     def test_publish_check_fetches_a_target_pin_missing_from_the_local_object_store(self):
         remote = self._clone_submodule("submodule target update")
@@ -226,6 +290,12 @@ class DevelopmentBranchTest(unittest.TestCase):
                 ("status", "--porcelain=v1", "-z", "--untracked-files=all"),
             ).stdout,
         )
+
+    def _local_heads(self):
+        return self.git.run(
+            self.fixture.submodule,
+            ("for-each-ref", "--format=%(refname)%00%(objectname)", "refs/heads"),
+        ).stdout
 
     def _clone_submodule(self, name):
         remote = self.fixture.root / name

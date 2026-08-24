@@ -89,7 +89,7 @@ def publish_check(git: Git, repo: Path, target_pin: str) -> Result:
             target_pin,
             "not_applicable",
         )
-    if facts.upstream is None:
+    if facts.upstream is None and not _branch_upstream_is_configured(git, repo, facts.branch):
         return _result(
             "branch publish-check",
             "blocked",
@@ -99,7 +99,7 @@ def publish_check(git: Git, repo: Path, target_pin: str) -> Result:
             "not_applicable",
         )
 
-    git.run(repo, ("fetch",))
+    _fetch_current_upstream(git, repo, facts.branch)
     fresh = git.inspect_repo(repo)
     if not _target_exists(git, repo, target_pin):
         return _result(
@@ -133,6 +133,85 @@ def publish_check(git: Git, repo: Path, target_pin: str) -> Result:
     return _result(
         "branch publish-check", "publish_verified", (), fresh, target_pin, fresh_relation
     )
+
+
+def _fetch_current_upstream(git: Git, repo: Path, branch: Optional[str]) -> None:
+    """仅抓取当前分支 upstream 的源引用，并安全更新其 tracking 引用。"""
+    if branch is None:
+        raise GitError(("git", "fetch"), "current branch is missing", 2)
+    local_branch = "refs/heads/{}".format(branch)
+    _require_valid_ref(git, repo, local_branch)
+    remote = git.run(
+        repo, ("config", "--get", "branch.{}.remote".format(branch)), check=False
+    )
+    merge = git.run(
+        repo, ("config", "--get", "branch.{}.merge".format(branch)), check=False
+    )
+    if remote.returncode != 0 or merge.returncode != 0:
+        failed = remote if remote.returncode != 0 else merge
+        raise GitError(
+            tuple(str(item) for item in failed.args),
+            failed.stderr or "current branch upstream is missing",
+            failed.returncode,
+        )
+    remote_name = remote.stdout.strip()
+    source = merge.stdout.strip()
+    if not remote_name or remote_name == ".":
+        raise GitError(("git", "fetch"), "unsafe local upstream", 2)
+    if not source.startswith("refs/heads/"):
+        raise GitError(("git", "fetch"), "unsafe upstream source", 2)
+    _require_valid_ref(git, repo, source)
+    upstream = git.run(
+        repo,
+        ("for-each-ref", "--format=%(upstream)", local_branch),
+        check=False,
+    )
+    if upstream.returncode != 0:
+        raise GitError(
+            tuple(str(item) for item in upstream.args),
+            upstream.stderr or "current branch upstream is missing",
+            upstream.returncode,
+        )
+    destination = upstream.stdout.strip()
+    if not destination.startswith("refs/remotes/"):
+        raise GitError(("git", "fetch"), "unsafe upstream destination", 2)
+    _require_valid_ref(git, repo, destination)
+    git.run(
+        repo,
+        (
+            "fetch",
+            "--no-recurse-submodules",
+            "--refmap=",
+            "--",
+            remote_name,
+            source,
+        ),
+    )
+    fetched = git.run(repo, ("rev-parse", "--verify", "FETCH_HEAD^{commit}"))
+    commit = fetched.stdout.strip()
+    if not commit:
+        raise GitError(tuple(str(item) for item in fetched.args), "empty fetched commit", 2)
+    git.run(repo, ("update-ref", "--no-deref", destination, commit))
+
+
+def _branch_upstream_is_configured(git: Git, repo: Path, branch: Optional[str]) -> bool:
+    """区分未配置 upstream 与配置存在但无法安全解析的情况。"""
+    if branch is None:
+        return False
+    remote = git.run(
+        repo, ("config", "--get", "branch.{}.remote".format(branch)), check=False
+    )
+    merge = git.run(
+        repo, ("config", "--get", "branch.{}.merge".format(branch)), check=False
+    )
+    if remote.returncode == 1 and merge.returncode == 1:
+        return False
+    if remote.returncode not in (0, 1) or merge.returncode not in (0, 1):
+        failed = remote if remote.returncode not in (0, 1) else merge
+        raise GitError(
+            tuple(str(item) for item in failed.args), failed.stderr, failed.returncode
+        )
+    return True
 
 
 def _prepare_switch(
@@ -187,6 +266,17 @@ def _local_branch_exists(git: Git, repo: Path, name: str) -> bool:
     raise GitError(
         tuple(str(item) for item in completed.args), completed.stderr, completed.returncode
     )
+
+
+def _require_valid_ref(git: Git, repo: Path, ref: str) -> None:
+    """要求引用通过 Git 的完整引用格式校验。"""
+    completed = git.run(repo, ("check-ref-format", ref), check=False)
+    if completed.returncode != 0:
+        raise GitError(
+            tuple(str(item) for item in completed.args),
+            completed.stderr or "invalid ref",
+            completed.returncode,
+        )
 
 
 def _relation(git: Git, repo: Path, facts: RepoFacts, target_pin: str, target_exists: bool) -> str:
