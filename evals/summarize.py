@@ -35,6 +35,20 @@ SCENARIO_FIELDS = frozenset(
         "expected_exit_code", "recovery_required",
     )
 )
+FIXTURE_FIELDS = frozenset(
+    ("parent", "submodule", "managed_patch", "fault_injection", "install_identity")
+)
+PARENT_FIELDS = frozenset(
+    ("commits", "head", "target", "branch", "upstream", "worktree", "current_gitlinks", "target_gitlinks")
+)
+SUBMODULE_FIELDS = frozenset(
+    ("path", "commits", "head", "current_pin", "target_pin", "branch", "upstream", "worktree")
+)
+PATCH_FIELDS = frozenset(
+    ("blob_path", "target", "apply_path", "contents", "current_declaration", "target_declaration", "worktree_applied")
+)
+PATCH_BLOB = "build/patches/iceberg-delta-cmake-pie-filter.patch"
+PATCH_TARGET = "plugins/iceberg_delta"
 
 
 class RecordError(ValueError):
@@ -44,6 +58,146 @@ class RecordError(ValueError):
 def _integer(value):
     """仅接受 JSON integer，排除 Python 中属于 int 子类的 bool。"""
     return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _graph(value, *, tree_equivalent=False):
+    """验证符号 commit DAG 的节点、边和 tree 等价引用。"""
+    fields = {"nodes", "edges", "tree_equivalent"} if tree_equivalent else {"nodes", "edges"}
+    if not isinstance(value, dict) or set(value) != fields:
+        raise RecordError("invalid graph fields")
+    nodes = value["nodes"]
+    if (
+        not isinstance(nodes, list)
+        or not nodes
+        or any(not isinstance(node, str) or not node for node in nodes)
+        or len(nodes) != len(set(nodes))
+    ):
+        raise RecordError("invalid graph nodes")
+    relations = [value["edges"]]
+    if tree_equivalent:
+        relations.append(value["tree_equivalent"])
+    for edges in relations:
+        if not isinstance(edges, list):
+            raise RecordError("invalid graph edges")
+        for edge in edges:
+            if (
+                not isinstance(edge, list)
+                or len(edge) != 2
+                or any(not isinstance(node, str) or node not in nodes for node in edge)
+            ):
+                raise RecordError("invalid graph edge")
+    remaining = set(nodes)
+    dag_edges = [tuple(edge) for edge in value["edges"]]
+    while remaining:
+        roots = {
+            node for node in remaining
+            if not any(target == node and source in remaining for source, target in dag_edges)
+        }
+        if not roots:
+            raise RecordError("cyclic graph")
+        remaining -= roots
+    return set(nodes)
+
+
+def _string_fields(value, fields):
+    """验证指定字段均为非空字符串。"""
+    return all(isinstance(value[field], str) and value[field] for field in fields)
+
+
+def _validate_fixture(fixture):
+    """验证声明式 fixture 的完整可重建关系。"""
+    if not isinstance(fixture, dict) or set(fixture) != FIXTURE_FIELDS:
+        raise RecordError("invalid fixture fields")
+    parent = fixture["parent"]
+    submodule = fixture["submodule"]
+    patch = fixture["managed_patch"]
+    if not isinstance(parent, dict) or set(parent) != PARENT_FIELDS:
+        raise RecordError("invalid parent fixture")
+    if not isinstance(submodule, dict) or set(submodule) != SUBMODULE_FIELDS:
+        raise RecordError("invalid submodule fixture")
+    parent_nodes = _graph(parent["commits"])
+    submodule_nodes = _graph(submodule["commits"], tree_equivalent=True)
+    if (
+        not _string_fields(parent, ("head", "target", "branch", "upstream", "worktree"))
+        or parent["head"] not in parent_nodes
+        or parent["target"] not in parent_nodes
+        or parent["worktree"] != "clean"
+        or not _string_fields(submodule, ("path", "head", "current_pin", "target_pin", "branch", "upstream", "worktree"))
+        or any(submodule[field] not in submodule_nodes for field in ("head", "current_pin", "target_pin"))
+        or submodule["worktree"] not in {"clean", "dirty_unmanaged", "dirty_managed"}
+    ):
+        raise RecordError("invalid repository fixture")
+    path = submodule["path"]
+    for field, pin in (("current_gitlinks", "current_pin"), ("target_gitlinks", "target_pin")):
+        links = parent[field]
+        if (
+            not isinstance(links, dict)
+            or set(links) != {path}
+            or links[path] != submodule[pin]
+            or links[path] not in submodule_nodes
+        ):
+            raise RecordError("invalid gitlink fixture")
+
+    if not isinstance(patch, dict) or set(patch) != PATCH_FIELDS:
+        raise RecordError("invalid patch fixture")
+    contents = patch["contents"]
+    declarations = (
+        patch["current_declaration"], patch["target_declaration"], patch["worktree_applied"]
+    )
+    if not isinstance(contents, dict) or any(not isinstance(items, list) for items in declarations):
+        raise RecordError("invalid patch declarations")
+    if patch["target"] is None:
+        if (
+            patch["blob_path"] is not None
+            or patch["apply_path"] is not None
+            or contents
+            or any(declarations)
+        ):
+            raise RecordError("invalid empty patch")
+    else:
+        if (
+            patch["blob_path"] != PATCH_BLOB
+            or patch["target"] != PATCH_TARGET
+            or patch["apply_path"] != "."
+            or path != PATCH_TARGET
+            or not contents
+        ):
+            raise RecordError("invalid fixed patch")
+        for name, content in contents.items():
+            if (
+                not isinstance(name, str)
+                or not isinstance(content, dict)
+                or set(content) != {"path", "baseline", "result"}
+                or not _string_fields(content, ("path", "baseline", "result"))
+                or Path(content["path"]).is_absolute()
+                or ".." in Path(content["path"]).parts
+                or content["baseline"] == content["result"]
+            ):
+                raise RecordError("invalid patch content")
+        if any(
+            len(declaration) != len(set(declaration))
+            or not all(isinstance(name, str) and name in contents for name in declaration)
+            for declaration in declarations
+        ):
+            raise RecordError("unknown patch declaration")
+
+    fault = fixture["fault_injection"]
+    if fault is not None and (
+        not isinstance(fault, dict)
+        or set(fault) != {"operation", "occurrence", "timing"}
+        or fault["operation"] != "submodule_checkout"
+        or not _integer(fault["occurrence"])
+        or fault["occurrence"] < 1
+        or fault["timing"] != "after_domain_write"
+    ):
+        raise RecordError("invalid fault injection")
+    identity = fixture["install_identity"]
+    if identity is not None and (
+        not isinstance(identity, dict)
+        or set(identity) != {"source_head", "manifest_artifact", "disk_artifact", "process_artifact"}
+        or not _string_fields(identity, identity)
+    ):
+        raise RecordError("invalid install identity")
 
 
 def _read_catalog(path):
@@ -78,6 +232,7 @@ def _read_catalog(path):
             or not isinstance(scenario["recovery_required"], bool)
         ):
             raise RecordError("invalid scenario")
+        _validate_fixture(scenario["fixture"])
         expected[scenario_id] = scenario
         recovery_count += scenario["recovery_required"]
     if set(expected) != SCENARIO_IDS or recovery_count < 1:

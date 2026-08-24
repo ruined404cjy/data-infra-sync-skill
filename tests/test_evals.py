@@ -2,6 +2,7 @@
 
 import json
 import shutil
+import sys
 import subprocess
 import tempfile
 import unittest
@@ -9,6 +10,17 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+
+from data_infra_sync.adapters.datainfra import DataInfraAdapter
+from data_infra_sync.cli import _exit_code
+from data_infra_sync.config import WorkspaceConfig
+from data_infra_sync.executor import execute_sync
+from data_infra_sync.git import Git
+from data_infra_sync.planner import plan_sync
+from tests.git_fixture import CompositeFixture
+
+
 SCENARIOS = ROOT / "evals/scenarios.json"
 SUMMARIZER = ROOT / "evals/summarize.py"
 
@@ -31,6 +43,10 @@ EXPECTED = {
 }
 FIXTURE_FIELDS = {
     "parent", "submodule", "managed_patch", "fault_injection", "install_identity"
+}
+PATCH_FIELDS = {
+    "blob_path", "target", "apply_path", "contents", "current_declaration",
+    "target_declaration", "worktree_applied",
 }
 
 
@@ -111,7 +127,7 @@ class EvalScenarioTests(unittest.TestCase):
             self.assertEqual(set(fixture["submodule"]["commits"]), {"nodes", "edges", "tree_equivalent"})
             self.assertEqual(
                 set(fixture["managed_patch"]),
-                {"current_declaration", "target_declaration", "worktree_applied"},
+                PATCH_FIELDS,
             )
             for repository in (fixture["parent"], fixture["submodule"]):
                 nodes = repository["commits"]["nodes"]
@@ -131,7 +147,8 @@ class EvalScenarioTests(unittest.TestCase):
                 self.assertIsInstance(fixture["submodule"][field], str)
             for field in ("target", "current_gitlinks", "target_gitlinks"):
                 self.assertTrue(fixture["parent"][field])
-            for value in fixture["managed_patch"].values():
+            for field in ("current_declaration", "target_declaration", "worktree_applied"):
+                value = fixture["managed_patch"][field]
                 self.assertTrue(isinstance(value, list) and all(isinstance(item, str) for item in value))
             if fixture["fault_injection"] is not None:
                 self.assertEqual(set(fixture["fault_injection"]), {"operation", "occurrence", "timing"})
@@ -152,6 +169,99 @@ class EvalScenarioTests(unittest.TestCase):
         self.assertEqual(by_id["partial_failure_recovery"]["fault_injection"]["timing"], "after_domain_write")
         self.assertEqual(by_id["install_identity_mismatch"]["install_identity"]["manifest_artifact"], "artifact_v1")
         self.assertEqual(by_id["install_identity_mismatch"]["install_identity"]["disk_artifact"], "artifact_v2")
+
+        for scenario_id in ("continuous_patch_replay", "patch_transition_blocked"):
+            fixture = by_id[scenario_id]
+            patch = fixture["managed_patch"]
+            self.assertEqual(fixture["submodule"]["path"], "plugins/iceberg_delta")
+            self.assertEqual(patch["target"], "plugins/iceberg_delta")
+            self.assertEqual(patch["apply_path"], ".")
+            self.assertEqual(
+                patch["blob_path"],
+                "build/patches/iceberg-delta-cmake-pie-filter.patch",
+            )
+            self.assertIn("patch_v1", patch["contents"])
+
+    def test_managed_patch_catalog_drives_real_adapter_planner_and_executor(self):
+        """防止评估目录描述的补丁场景无法由生产状态机重建。"""
+        scenarios = {
+            item["id"]: item for item in json.loads(SCENARIOS.read_text(encoding="utf-8"))["scenarios"]
+        }
+        for scenario_id in ("continuous_patch_replay", "patch_transition_blocked"):
+            with self.subTest(scenario=scenario_id), tempfile.TemporaryDirectory() as temporary:
+                fixture, adapter, git = self.build_patch_fixture(
+                    Path(temporary), scenarios[scenario_id]["fixture"],
+                    transition=scenario_id == "patch_transition_blocked",
+                )
+
+                facts = adapter.collect_plan_facts(git, fresh=True)
+                repository = next(item for item in facts.repositories if item.path == "plugins/iceberg_delta")
+                plan = plan_sync(facts)
+                if scenario_id == "continuous_patch_replay":
+                    self.assertEqual(repository.managed_patch_state, "continuous")
+                    result = execute_sync(git, adapter, None, True)
+                    self.assertEqual((result.state, result.reason_codes), ("updated", ()))
+                    self.assertEqual(_exit_code(result), 0)
+                else:
+                    self.assertEqual(repository.managed_patch_state, "transition")
+                    self.assertEqual(
+                        (plan.state, plan.reason_codes),
+                        ("blocked", ("managed_patch_transition_required",)),
+                    )
+
+    @staticmethod
+    def build_patch_fixture(root, declaration, *, transition):
+        """按 catalog 声明创建真实 Delta 补丁组合仓。"""
+        fixture = CompositeFixture.create(root)
+        target = declaration["managed_patch"]["target"]
+        (fixture.parent / "plugins").mkdir()
+        fixture._run(fixture.parent, ("mv", "modules/component", target))
+        fixture.submodule = fixture.parent / target
+        apply_root = fixture.submodule / declaration["managed_patch"]["apply_path"]
+        patch_bytes = {}
+        for name, content in declaration["managed_patch"]["contents"].items():
+            baseline = (apply_root / content["path"]).read_text(encoding="utf-8")
+            if baseline != content["baseline"]:
+                raise AssertionError("catalog patch baseline does not match fixture")
+            fixture.write_file(apply_root, content["path"], content["result"])
+            patch_bytes[name] = fixture._run(
+                apply_root, ("diff", "--", content["path"])
+            ).stdout.encode("utf-8")
+            fixture._run(apply_root, ("checkout", "--", content["path"]))
+        patch_path = fixture.parent / declaration["managed_patch"]["blob_path"]
+        patch_path.parent.mkdir(parents=True, exist_ok=True)
+        patch_path.write_bytes(patch_bytes["patch_v1"])
+        fixture._run(fixture.parent, ("add", ".gitmodules", target, str(patch_path.relative_to(fixture.parent))))
+        fixture._run(fixture.parent, ("commit", "-m", "declare catalog patch"))
+        fixture.push(fixture.parent)
+        for name in declaration["managed_patch"]["worktree_applied"]:
+            applied = root / "{}.patch".format(name)
+            applied.write_bytes(patch_bytes[name])
+            fixture._run(apply_root, ("apply", str(applied)))
+
+        publisher = fixture.clone_parent("publisher")
+        fixture._run(
+            publisher,
+            ("-c", "protocol.file.allow=always", "submodule", "update", "--init"),
+        )
+        target_submodule = publisher / target
+        fixture._configure_user(target_submodule)
+        fixture.commit_file(
+            target_submodule, "target.txt", "target pin\n", "advance target pin"
+        )
+        fixture._run(target_submodule, ("push", "origin", "HEAD:main"))
+        fixture._run(publisher, ("add", target))
+        if transition:
+            (publisher / declaration["managed_patch"]["blob_path"]).write_bytes(patch_bytes["patch_v2"])
+            fixture._run(publisher, ("add", declaration["managed_patch"]["blob_path"]))
+        fixture._run(publisher, ("commit", "-m", "publish target"))
+        fixture.push(publisher)
+        config = WorkspaceConfig(
+            fixture.parent.resolve(), "origin", "main",
+            root / "workspace.conf", root / "state",
+        )
+        git = Git()
+        return fixture, DataInfraAdapter.for_workspace(config, git), git
 
     def test_complete_successful_records_produce_deterministic_metrics(self):
         """防止合格的 27 次执行被拒绝或指标计算错误。"""
@@ -226,6 +336,22 @@ class EvalScenarioTests(unittest.TestCase):
                 self.assertEqual(completed.stderr, "invalid evaluation records\n")
                 self.assertNotIn(secret, completed.stderr)
                 self.assertNotIn("Traceback", completed.stderr)
+
+        nested_cases = []
+        empty = json.loads(json.dumps(catalog))
+        empty["scenarios"][0]["fixture"] = {}
+        nested_cases.append(empty)
+        dangling = json.loads(json.dumps(catalog))
+        dangling["scenarios"][0]["fixture"]["submodule"]["commits"]["edges"].append(["S0", "MISSING"])
+        dangling["scenarios"][0]["fixture"]["submodule"]["target_pin"] = "MISSING"
+        nested_cases.append(dangling)
+        wrong_target = json.loads(json.dumps(catalog))
+        wrong_target["scenarios"][5]["fixture"]["managed_patch"]["target"] = "modules/component"
+        nested_cases.append(wrong_target)
+        for invalid in nested_cases:
+            completed = self.run_summarizer(valid_records(), invalid)
+            self.assertEqual(completed.returncode, 2)
+            self.assertEqual(completed.stderr, "invalid evaluation records\n")
 
 
 if __name__ == "__main__":

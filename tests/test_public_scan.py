@@ -130,6 +130,19 @@ class PublicScanTests(unittest.TestCase):
         self.git("add", "docs/url.txt")
         self.assert_finding("userinfo-url", "docs/url.txt", "user:pass")
 
+    def test_invalid_userinfo_host_is_case_insensitive_and_accepts_dns_root_dot(self):
+        """防止大小写或 DNS absolute name 使 `.invalid` fixture 误报。"""
+        cases = (
+            "https://user:pass@fixture.INVALID/path",
+            "https://user:pass@fixture.invalid.?query=yes",
+        )
+        for url in cases:
+            with self.subTest(url=url):
+                self.write("docs/url.txt", 'remote="{}"\n'.format(url))
+                self.git("add", "docs/url.txt")
+                completed = self.run_scan()
+                self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+
     def test_tracked_content_is_scanned_from_index_not_worktree(self):
         """防止 staged credential 被未暂存的干净工作树内容遮蔽。"""
         secret = "staged-secret-value-12345"
