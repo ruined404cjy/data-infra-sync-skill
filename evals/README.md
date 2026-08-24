@@ -14,6 +14,8 @@
 
 每个 `fixture` 使用统一声明式结构。`parent` 和 `submodule` 以符号节点及有向边定义 commit DAG，并明确 HEAD、current/target pin、branch、upstream、worktree 和 current/target gitlink。`managed_patch` 定义固定 blob 路径、目标子仓、apply path、可生成补丁的基线/结果内容、两个父仓版本声明的补丁序列及工作树已应用序列。`fault_injection` 和 `install_identity` 在适用场景中定义注入位置、manifest、磁盘和进程身份，其余场景使用 `null`。符号提交只表达关系，fixture 执行器为每次运行创建对应的真实 Git 对象。
 
+汇总器按固定场景 ID 校验发布期望和最小 fixture 语义。commit 关系按 DAG 传递可达性判断；场景目录中的状态、原因码、退出码、恢复要求、pin 覆盖关系及不适用字段均属于版本化验收契约。
+
 ## JSONL 记录
 
 记录文件每行是一个 JSON 对象，固定包含以下字段：

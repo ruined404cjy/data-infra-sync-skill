@@ -49,6 +49,23 @@ PATCH_FIELDS = frozenset(
 )
 PATCH_BLOB = "build/patches/iceberg-delta-cmake-pie-filter.patch"
 PATCH_TARGET = "plugins/iceberg_delta"
+EXPECTED_SCENARIOS = {
+    "clean_sync": ("updated", [], 0, False),
+    "target_covers_development_commit": ("publish_verified", [], 0, False),
+    "tree_equivalent": ("updated", [], 0, False),
+    "upstream_published_target_pending": (
+        "waiting_for_pin", ["target_pin_does_not_cover_head"], 2, False,
+    ),
+    "dirty_blocked": ("blocked", ["dirty_worktree"], 2, False),
+    "continuous_patch_replay": ("updated", [], 0, False),
+    "patch_transition_blocked": (
+        "blocked", ["managed_patch_transition_required"], 2, False,
+    ),
+    "partial_failure_recovery": ("updated", [], 0, True),
+    "install_identity_mismatch": (
+        "deployment_mismatch", ["artifact_manifest_mismatch"], 2, False,
+    ),
+}
 
 
 class RecordError(ValueError):
@@ -200,6 +217,156 @@ def _validate_fixture(fixture):
         raise RecordError("invalid install identity")
 
 
+def _reachable(graph, source, target, *, strict=False):
+    """按 DAG 传递闭包判断 source 是否可达 target。"""
+    if source == target:
+        return not strict
+    edges = graph["edges"]
+    pending = [source]
+    visited = set()
+    while pending:
+        current = pending.pop()
+        if current in visited:
+            continue
+        visited.add(current)
+        for edge_source, edge_target in edges:
+            if edge_source != current:
+                continue
+            if edge_target == target:
+                return True
+            pending.append(edge_target)
+    return False
+
+
+def _tree_equivalent(graph, left, right):
+    """判断两个不同节点是否在显式 tree 等价关系中。"""
+    return left != right and any(
+        {left, right} == set(pair) for pair in graph["tree_equivalent"]
+    )
+
+
+def _patch_empty(patch):
+    """判断所有不适用的补丁字段均为空。"""
+    return (
+        patch["blob_path"] is None
+        and patch["target"] is None
+        and patch["apply_path"] is None
+        and patch["contents"] == {}
+        and patch["current_declaration"] == []
+        and patch["target_declaration"] == []
+        and patch["worktree_applied"] == []
+    )
+
+
+def _sync_difference(parent, submodule):
+    """判断父仓和子仓目标均为当前状态的严格后继。"""
+    return (
+        _reachable(parent["commits"], parent["head"], parent["target"], strict=True)
+        and submodule["head"] == submodule["current_pin"]
+        and _reachable(
+            submodule["commits"], submodule["current_pin"],
+            submodule["target_pin"], strict=True,
+        )
+    )
+
+
+def _validate_scenario_semantics(scenario):
+    """按固定 ID 绑定可执行 fixture 的最小业务语义。"""
+    scenario_id = scenario["id"]
+    expected = (
+        scenario["expected_state"], scenario["expected_reason_codes"],
+        scenario["expected_exit_code"], scenario["recovery_required"],
+    )
+    if expected != EXPECTED_SCENARIOS[scenario_id]:
+        raise RecordError("invalid published expectation")
+    fixture = scenario["fixture"]
+    parent = fixture["parent"]
+    submodule = fixture["submodule"]
+    patch = fixture["managed_patch"]
+    fault = fixture["fault_injection"]
+    identity = fixture["install_identity"]
+    clean = parent["worktree"] == "clean" and submodule["worktree"] == "clean"
+    no_auxiliary = _patch_empty(patch) and fault is None and identity is None
+
+    valid = False
+    if scenario_id == "clean_sync":
+        valid = clean and no_auxiliary and _sync_difference(parent, submodule)
+    elif scenario_id == "target_covers_development_commit":
+        valid = (
+            clean and no_auxiliary and parent["head"] == parent["target"]
+            and submodule["current_pin"] == submodule["target_pin"]
+            and _reachable(
+                submodule["commits"], submodule["head"],
+                submodule["target_pin"], strict=True,
+            )
+            and submodule["upstream"].endswith("@" + submodule["head"])
+        )
+    elif scenario_id == "tree_equivalent":
+        valid = (
+            clean and no_auxiliary
+            and _reachable(
+                parent["commits"], parent["head"], parent["target"], strict=True
+            )
+            and submodule["head"] == submodule["current_pin"]
+            and _tree_equivalent(
+                submodule["commits"], submodule["head"], submodule["target_pin"]
+            )
+        )
+    elif scenario_id == "upstream_published_target_pending":
+        valid = (
+            clean and no_auxiliary and parent["head"] == parent["target"]
+            and submodule["current_pin"] == submodule["target_pin"]
+            and _reachable(
+                submodule["commits"], submodule["target_pin"],
+                submodule["head"], strict=True,
+            )
+            and submodule["upstream"].endswith("@" + submodule["head"])
+        )
+    elif scenario_id == "dirty_blocked":
+        valid = (
+            parent["worktree"] == "clean"
+            and submodule["worktree"] == "dirty_unmanaged"
+            and no_auxiliary and _sync_difference(parent, submodule)
+        )
+    elif scenario_id == "continuous_patch_replay":
+        valid = (
+            patch["target"] == PATCH_TARGET
+            and submodule["worktree"] == "dirty_managed"
+            and _sync_difference(parent, submodule)
+            and patch["current_declaration"]
+            and patch["current_declaration"] == patch["target_declaration"]
+            and patch["current_declaration"] == patch["worktree_applied"]
+            and fault is None and identity is None
+        )
+    elif scenario_id == "patch_transition_blocked":
+        valid = (
+            patch["target"] == PATCH_TARGET
+            and submodule["worktree"] == "dirty_managed"
+            and _sync_difference(parent, submodule)
+            and patch["current_declaration"]
+            and patch["target_declaration"]
+            and patch["current_declaration"] != patch["target_declaration"]
+            and patch["worktree_applied"] == patch["current_declaration"]
+            and fault is None and identity is None
+        )
+    elif scenario_id == "partial_failure_recovery":
+        valid = (
+            clean and _patch_empty(patch) and identity is None
+            and fault is not None and _sync_difference(parent, submodule)
+        )
+    elif scenario_id == "install_identity_mismatch":
+        valid = (
+            clean and _patch_empty(patch) and fault is None and identity is not None
+            and parent["head"] == parent["target"]
+            and submodule["head"] == submodule["current_pin"] == submodule["target_pin"]
+            and identity["source_head"] == parent["head"] + "+" + submodule["head"]
+            and identity["manifest_artifact"] != identity["disk_artifact"]
+            and identity["disk_artifact"] == identity["process_artifact"]
+        )
+    if not valid:
+        raise RecordError("invalid scenario semantics")
+
+
 def _read_catalog(path):
     """读取脚本相邻场景目录并返回期望映射和 run 次数。"""
     with path.open(encoding="utf-8") as stream:
@@ -233,6 +400,7 @@ def _read_catalog(path):
         ):
             raise RecordError("invalid scenario")
         _validate_fixture(scenario["fixture"])
+        _validate_scenario_semantics(scenario)
         expected[scenario_id] = scenario
         recovery_count += scenario["recovery_required"]
     if set(expected) != SCENARIO_IDS or recovery_count < 1:

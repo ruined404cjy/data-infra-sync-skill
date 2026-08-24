@@ -60,8 +60,8 @@
       "id": "patch_transition_blocked", "task": "检查受控构建补丁声明发生迁移的 DataInfra checkout 是否可同步，并报告最终 Result。",
       "fixture": {
         "parent": {"commits": {"nodes": ["P0", "P1"], "edges": [["P0", "P1"]]}, "head": "P0", "target": "P1", "branch": "main", "upstream": "origin/main", "worktree": "clean", "current_gitlinks": {"plugins/iceberg_delta": "S0"}, "target_gitlinks": {"plugins/iceberg_delta": "S1"}},
-        "submodule": {"path": "plugins/iceberg_delta", "commits": {"nodes": ["S0", "S1"], "edges": [["S0", "S1"]], "tree_equivalent": []}, "head": "S0", "current_pin": "S0", "target_pin": "S1", "branch": "main", "upstream": "origin/main", "worktree": "clean"},
-        "managed_patch": {"blob_path": "build/patches/iceberg-delta-cmake-pie-filter.patch", "target": "plugins/iceberg_delta", "apply_path": ".", "contents": {"patch_v1": {"path": "README.md", "baseline": "initial submodule\n", "result": "patched submodule v1\n"}, "patch_v2": {"path": "README.md", "baseline": "initial submodule\n", "result": "patched submodule v2\n"}}, "current_declaration": ["patch_v1"], "target_declaration": ["patch_v2"], "worktree_applied": []}, "fault_injection": null, "install_identity": null
+        "submodule": {"path": "plugins/iceberg_delta", "commits": {"nodes": ["S0", "S1"], "edges": [["S0", "S1"]], "tree_equivalent": []}, "head": "S0", "current_pin": "S0", "target_pin": "S1", "branch": "main", "upstream": "origin/main", "worktree": "dirty_managed"},
+        "managed_patch": {"blob_path": "build/patches/iceberg-delta-cmake-pie-filter.patch", "target": "plugins/iceberg_delta", "apply_path": ".", "contents": {"patch_v1": {"path": "README.md", "baseline": "initial submodule\n", "result": "patched submodule v1\n"}, "patch_v2": {"path": "README.md", "baseline": "initial submodule\n", "result": "patched submodule v2\n"}}, "current_declaration": ["patch_v1"], "target_declaration": ["patch_v2"], "worktree_applied": ["patch_v1"]}, "fault_injection": null, "install_identity": null
       },
       "expected_state": "blocked", "expected_reason_codes": ["managed_patch_transition_required"], "expected_exit_code": 2, "recovery_required": false
     },

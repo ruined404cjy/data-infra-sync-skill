@@ -112,10 +112,17 @@ class PublicScanTests(unittest.TestCase):
 
     def test_non_invalid_userinfo_url_is_reported_without_credentials(self):
         """防止包含 userinfo 的真实域 URL 进入公开候选内容。"""
-        secret_url = "https://" + "private-user:private-pass@example.com/repo.git"
-        self.write("config/remote.txt", secret_url + "\n")
-        self.git("add", "config/remote.txt")
-        self.assert_finding("userinfo-url", "config/remote.txt", secret_url)
+        urls = (
+            "https://" + "private-user:private-pass@example.com/repo.git",
+            "https://" + "private-user@example.com/repo.git",
+            "https://" + "private-user:@example.com/repo.git",
+            "ssh://" + "private-user:private-pass@example.com/repo",
+        )
+        for secret_url in urls:
+            with self.subTest(url=secret_url):
+                self.write("config/remote.txt", secret_url + "\n")
+                self.git("add", "config/remote.txt")
+                self.assert_finding("userinfo-url", "config/remote.txt", secret_url)
 
     def test_invalid_userinfo_host_boundary_allows_punctuation_but_not_suffix(self):
         """防止 `.invalid` 文本边界误报或恶意后缀绕过 URL 扫描。"""
@@ -135,6 +142,8 @@ class PublicScanTests(unittest.TestCase):
         cases = (
             "https://user:pass@fixture.INVALID/path",
             "https://user:pass@fixture.invalid.?query=yes",
+            "https://user:pass@fixture.invalid#fragment",
+            "<https://user:pass@fixture.invalid>",
         )
         for url in cases:
             with self.subTest(url=url):

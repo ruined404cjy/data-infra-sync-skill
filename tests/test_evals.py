@@ -166,6 +166,11 @@ class EvalScenarioTests(unittest.TestCase):
         self.assertTrue(by_id["tree_equivalent"]["submodule"]["commits"]["tree_equivalent"])
         self.assertEqual(by_id["continuous_patch_replay"]["managed_patch"]["worktree_applied"], ["patch_v1"])
         self.assertNotEqual(by_id["patch_transition_blocked"]["managed_patch"]["current_declaration"], by_id["patch_transition_blocked"]["managed_patch"]["target_declaration"])
+        self.assertEqual(
+            by_id["patch_transition_blocked"]["managed_patch"]["worktree_applied"],
+            by_id["patch_transition_blocked"]["managed_patch"]["current_declaration"],
+        )
+        self.assertEqual(by_id["patch_transition_blocked"]["submodule"]["worktree"], "dirty_managed")
         self.assertEqual(by_id["partial_failure_recovery"]["fault_injection"]["timing"], "after_domain_write")
         self.assertEqual(by_id["install_identity_mismatch"]["install_identity"]["manifest_artifact"], "artifact_v1")
         self.assertEqual(by_id["install_identity_mismatch"]["install_identity"]["disk_artifact"], "artifact_v2")
@@ -191,26 +196,24 @@ class EvalScenarioTests(unittest.TestCase):
             with self.subTest(scenario=scenario_id), tempfile.TemporaryDirectory() as temporary:
                 fixture, adapter, git = self.build_patch_fixture(
                     Path(temporary), scenarios[scenario_id]["fixture"],
-                    transition=scenario_id == "patch_transition_blocked",
                 )
 
                 facts = adapter.collect_plan_facts(git, fresh=True)
                 repository = next(item for item in facts.repositories if item.path == "plugins/iceberg_delta")
                 plan = plan_sync(facts)
-                if scenario_id == "continuous_patch_replay":
+                patch = scenarios[scenario_id]["fixture"]["managed_patch"]
+                if patch["current_declaration"] == patch["target_declaration"]:
                     self.assertEqual(repository.managed_patch_state, "continuous")
                     result = execute_sync(git, adapter, None, True)
                     self.assertEqual((result.state, result.reason_codes), ("updated", ()))
                     self.assertEqual(_exit_code(result), 0)
                 else:
                     self.assertEqual(repository.managed_patch_state, "transition")
-                    self.assertEqual(
-                        (plan.state, plan.reason_codes),
-                        ("blocked", ("managed_patch_transition_required",)),
-                    )
+                    self.assertEqual(plan.state, "blocked")
+                    self.assertIn("managed_patch_transition_required", plan.reason_codes)
 
     @staticmethod
-    def build_patch_fixture(root, declaration, *, transition):
+    def build_patch_fixture(root, declaration):
         """按 catalog 声明创建真实 Delta 补丁组合仓。"""
         fixture = CompositeFixture.create(root)
         target = declaration["managed_patch"]["target"]
@@ -230,7 +233,9 @@ class EvalScenarioTests(unittest.TestCase):
             fixture._run(apply_root, ("checkout", "--", content["path"]))
         patch_path = fixture.parent / declaration["managed_patch"]["blob_path"]
         patch_path.parent.mkdir(parents=True, exist_ok=True)
-        patch_path.write_bytes(patch_bytes["patch_v1"])
+        current_name = declaration["managed_patch"]["current_declaration"][0]
+        target_name = declaration["managed_patch"]["target_declaration"][0]
+        patch_path.write_bytes(patch_bytes[current_name])
         fixture._run(fixture.parent, ("add", ".gitmodules", target, str(patch_path.relative_to(fixture.parent))))
         fixture._run(fixture.parent, ("commit", "-m", "declare catalog patch"))
         fixture.push(fixture.parent)
@@ -251,8 +256,8 @@ class EvalScenarioTests(unittest.TestCase):
         )
         fixture._run(target_submodule, ("push", "origin", "HEAD:main"))
         fixture._run(publisher, ("add", target))
-        if transition:
-            (publisher / declaration["managed_patch"]["blob_path"]).write_bytes(patch_bytes["patch_v2"])
+        if current_name != target_name:
+            (publisher / declaration["managed_patch"]["blob_path"]).write_bytes(patch_bytes[target_name])
             fixture._run(publisher, ("add", declaration["managed_patch"]["blob_path"]))
         fixture._run(publisher, ("commit", "-m", "publish target"))
         fixture.push(publisher)
@@ -349,6 +354,44 @@ class EvalScenarioTests(unittest.TestCase):
         wrong_target["scenarios"][5]["fixture"]["managed_patch"]["target"] = "modules/component"
         nested_cases.append(wrong_target)
         for invalid in nested_cases:
+            completed = self.run_summarizer(valid_records(), invalid)
+            self.assertEqual(completed.returncode, 2)
+            self.assertEqual(completed.stderr, "invalid evaluation records\n")
+
+        # 每个固定期望字段均由发布契约决定，catalog 不能自定义答案。
+        for position, scenario in enumerate(catalog["scenarios"]):
+            mutations = {
+                "expected_state": scenario["expected_state"] + "_changed",
+                "expected_reason_codes": scenario["expected_reason_codes"] + ["changed"],
+                "expected_exit_code": scenario["expected_exit_code"] + 1,
+                "recovery_required": not scenario["recovery_required"],
+            }
+            for field, value in mutations.items():
+                invalid = json.loads(json.dumps(catalog))
+                invalid["scenarios"][position][field] = value
+                completed = self.run_summarizer(valid_records(), invalid)
+                self.assertEqual(completed.returncode, 2, (scenario["id"], field))
+
+        semantic_cases = []
+        missing_fault = json.loads(json.dumps(catalog))
+        missing_fault["scenarios"][7]["fixture"]["fault_injection"] = None
+        semantic_cases.append(missing_fault)
+        missing_install = json.loads(json.dumps(catalog))
+        missing_install["scenarios"][8]["fixture"]["install_identity"] = None
+        semantic_cases.append(missing_install)
+        no_fast_forward = json.loads(json.dumps(catalog))
+        no_fast_forward["scenarios"][0]["fixture"]["parent"]["commits"]["edges"] = []
+        semantic_cases.append(no_fast_forward)
+        no_continuous_patch = json.loads(json.dumps(catalog))
+        continuous = no_continuous_patch["scenarios"][5]["fixture"]
+        continuous["submodule"]["worktree"] = "clean"
+        continuous["managed_patch"] = {
+            "blob_path": None, "target": None, "apply_path": None,
+            "contents": {}, "current_declaration": [],
+            "target_declaration": [], "worktree_applied": [],
+        }
+        semantic_cases.append(no_continuous_patch)
+        for invalid in semantic_cases:
             completed = self.run_summarizer(valid_records(), invalid)
             self.assertEqual(completed.returncode, 2)
             self.assertEqual(completed.stderr, "invalid evaluation records\n")

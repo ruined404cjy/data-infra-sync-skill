@@ -107,7 +107,7 @@ for relative_path in "${candidates[@]}"; do
     fi
 
     if rg_match --quiet --ignore-case --pcre2 -- \
-        'https?://[^/@\s\x22\x27]+:[^/@\s\x22\x27]+@(?!(?:[A-Za-z0-9-]+\.)*invalid\.?(?=$|[/?#:,)\]}\x22\x27]|\s))[^/\s\x22\x27]+' \
+        '[a-z][a-z0-9+.-]*://[^/@:\s\x22\x27<>]+(?::[^/@\s\x22\x27<>]*)?@(?!(?:[A-Za-z0-9-]+\.)*invalid\.?(?=[^A-Za-z0-9.-]|$))(?:[A-Za-z0-9.-]+|\[[0-9A-F:.]+\])' \
         "$content_file"; then
         report userinfo-url "$relative_path"
         continue
