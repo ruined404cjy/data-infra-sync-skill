@@ -3,6 +3,7 @@
 import contextlib
 import io
 import json
+import os
 import stat
 import subprocess
 import sys
@@ -262,12 +263,14 @@ class RoutingTests(unittest.TestCase):
                     "relation": "equal", "reason_codes": [],
                 },
             ),
+            next_actions=(Action("branch_status", ("data-infra-sync", "branch", "status", "--repo", str(self.config.root)), False, False, ()),),
         )
         with patch.object(cli, "branch_status", return_value=service_result):
             _, output, _ = self.run_main(("branch", "status", "--repo", ".", "--format", "json"))
         document = json.loads(output)
         self.assertEqual(document["repositories"][0]["path"], ".")
         self.assertEqual(document["repositories"][0]["role"], "parent")
+        self.assertEqual(document["next_actions"][0]["argv"][-1], ".")
         self.assertNotIn(str(self.config.root), output)
 
     def test_audit_order_precedes_render(self):
@@ -283,6 +286,52 @@ class RoutingTests(unittest.TestCase):
     def test_service_and_audit_errors_are_failed_and_never_success(self):
         self.adapter.collect_plan_facts.side_effect = GitError(("git", "fetch"), "secret", 1)
         code, output, _ = self.run_main(("inspect", "--format", "json"))
+        self.assertEqual((code, json.loads(output)["state"]), (3, "failed"))
+
+    def test_write_phase_failures_preserve_domain_write_results_as_partial(self):
+        repository = {
+            "path": ".", "role": "parent", "head": OID, "target_pin": OID,
+            "branch": "main", "upstream": None, "ahead": None, "behind": None,
+            "worktree": "clean", "relation": "equal", "reason_codes": [],
+        }
+        action = Action("resume_sync", ("data-infra-sync", "sync", "apply", "--non-interactive"), True, False, ())
+        target = {"parent_commit": OID, "remote": "origin", "branch": "main", "gitlinks": {}}
+        cases = (
+            (("sync", "apply", "--non-interactive"), result(command="sync apply", state="partial", changed=True, target=target, repositories=(repository,), next_actions=(action,))),
+            (("branch", "start", "--repo", ".", "--name", "work"), result(command="branch start", state="branch_started", changed=True, repositories=(repository,))),
+        )
+        for argv, service_result in cases:
+            for failing in ("write_latest", "append_event"):
+                with self.subTest(argv=argv, failing=failing):
+                    self.store.reset_mock()
+                    self.store.lock.return_value = contextlib.nullcontext()
+                    getattr(self.store, failing).side_effect = OSError("disk full")
+                    with patch.object(cli, "_dispatch", return_value=service_result):
+                        code, output, _ = self.run_main((*argv, "--format", "json"))
+                    document = json.loads(output)
+                    self.assertEqual((code, document["state"], document["changed"]), (4, "partial", True))
+                    self.assertEqual(document["repositories"], [repository])
+                    self.assertEqual(document["target"], service_result.to_dict()["target"])
+                    self.assertEqual(document["snapshot"], SNAPSHOT)
+                    self.assertEqual(document["next_actions"], service_result.to_dict()["next_actions"])
+                    self.assertIn("audit_write_failed", document["reason_codes"])
+
+    def test_render_failure_preserves_domain_write_exit_and_best_effort_audit(self):
+        action = Action("resume_sync", ("data-infra-sync", "sync", "apply", "--non-interactive"), True, False, ())
+        written = result(command="sync apply", state="updated", changed=True, target={"parent_commit": OID, "remote": "origin", "branch": "main", "gitlinks": {}}, next_actions=(action,))
+        with patch.object(cli, "_dispatch", return_value=written), patch.object(cli, "_render", side_effect=OSError("closed")):
+            code, output, _ = self.run_main(("sync", "apply", "--non-interactive", "--format", "json"))
+        self.assertEqual((code, output), (4, ""))
+        recorded = self.store.write_latest.call_args_list[-1].args[0]
+        self.assertEqual((recorded.state, recorded.changed), ("partial", True))
+        self.assertIn("render_failed", recorded.reason_codes)
+        self.assertEqual((recorded.target, recorded.snapshot, recorded.next_actions), (written.target, written.snapshot, written.next_actions))
+
+    def test_verify_record_audit_failure_is_not_a_worktree_partial(self):
+        recorded = result(command="verify install", state="deployment_consistent", changed=True)
+        self.store.write_latest.side_effect = OSError("disk full")
+        with patch.object(cli, "_dispatch", return_value=recorded):
+            code, output, _ = self.run_main(("verify", "install", "--record", "--format", "json"))
         self.assertEqual((code, json.loads(output)["state"]), (3, "failed"))
         self.assertEqual(self.store.write_latest.call_args.args[0].state, "failed")
 
@@ -362,6 +411,25 @@ class ConfigurationTests(unittest.TestCase):
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
                 code = cli.main(("init", "--root", str(root), "--config", str(config_path), "--format", "json"))
+            self.assertEqual((code, json.loads(output.getvalue())["state"]), (3, "failed"))
+            self.assertFalse(config_path.exists())
+
+    def test_init_ignores_git_environment_pointing_at_another_repository(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            repository = base / "repository"
+            plain = base / "plain"
+            repository.mkdir()
+            plain.mkdir()
+            subprocess.run(("git", "init", "-b", "main", str(repository)), check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            config_path = base / "workspace.conf"
+            environment = {
+                "GIT_DIR": str(repository / ".git"),
+                "GIT_WORK_TREE": str(repository),
+            }
+            output = io.StringIO()
+            with patch.dict(os.environ, environment, clear=False), contextlib.redirect_stdout(output):
+                code = cli.main(("init", "--root", str(plain), "--config", str(config_path), "--state-dir", str(base / "state"), "--format", "json"))
             self.assertEqual((code, json.loads(output.getvalue())["state"]), (3, "failed"))
             self.assertFalse(config_path.exists())
 

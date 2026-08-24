@@ -23,7 +23,7 @@ def execute_sync(
 
     try:
         facts = adapter.collect_plan_facts(git, fresh=True)
-    except GitError:
+    except (GitError, OSError):
         return _failed(None, "git_precondition_failed")
 
     plan = plan_sync(facts)
@@ -39,7 +39,7 @@ def execute_sync(
     try:
         current_patches = adapter.managed_patches(facts.current_parent)
         target_patches = adapter.managed_patches(facts.target_parent)
-    except GitError:
+    except (GitError, OSError):
         return _failed(plan, "git_precondition_failed")
     if not _continuous_declarations(current_patches, target_patches):
         return _from_plan(
@@ -49,7 +49,7 @@ def execute_sync(
         preflight_ok = adapter.preflight_managed_patches(
             git, facts, current_patches, target_patches
         )
-    except GitError:
+    except (GitError, OSError):
         return _failed(plan, "git_precondition_failed")
     if not preflight_ok:
         return _from_plan(
@@ -61,7 +61,7 @@ def execute_sync(
                 adapter.patch_state(git, patch) == "applied"
                 for patch in target_patches
             )
-        except GitError:
+        except (GitError, OSError):
             return _failed(plan, "git_precondition_failed")
         if all_applied:
             return _from_plan(plan, "updated", (), changed=False)
@@ -126,7 +126,7 @@ def execute_sync(
         if post_plan.state != "up_to_date":
             return _partial(_actual_from_plan(post_plan), failure_reason)
         return _from_plan(post_plan, "updated", (), changed=True)
-    except GitError:
+    except (GitError, OSError):
         actual = _read_actual_state(git, adapter, facts, plan)
         after_fingerprint = _domain_fingerprint(git, adapter, facts)
         proven_unchanged = (
@@ -182,7 +182,7 @@ def _read_actual_state(git, adapter, facts, before_plan):
         actual_plan = plan_sync(actual_facts)
         actual = _actual_from_plan(actual_plan)
         return actual
-    except GitError:
+    except (GitError, OSError):
         return _read_repositories_individually(git, adapter, facts, before_plan)
 
 
@@ -238,7 +238,7 @@ def _repository_with_unread_auxiliary(git, path, previous, head):
     if head is not None and previous["target_pin"] is not None:
         try:
             relation = git.relation(path, head, previous["target_pin"])
-        except GitError:
+        except (GitError, OSError):
             pass
     item = dict(previous)
     item.update(
@@ -264,7 +264,7 @@ def _observed_repository(git, path, logical_path, previous, observed, head):
     if head is not None and target_pin is not None:
         try:
             relation = git.relation(path, head, target_pin)
-        except GitError:
+        except (GitError, OSError):
             reason_codes.append("actual_state_read_failed")
     return (
         {

@@ -1,10 +1,11 @@
 """开发分支的状态检查、创建、恢复和发布前检查。"""
 
+from dataclasses import replace
 from pathlib import Path
 from typing import Optional, Tuple
 
 from data_infra_sync.git import Git, GitError, RepoFacts
-from data_infra_sync.model import Result
+from data_infra_sync.model import Action, Result
 
 
 _COVERED_RELATIONS = frozenset(("equal", "contained", "tree_equal"))
@@ -41,8 +42,21 @@ def start_branch(git: Git, repo: Path, target_pin: str, name: str) -> Result:
     if _local_branch_exists(git, repo, name):
         return _result("branch start", "blocked", ("branch_exists",), facts, target_pin, relation)
 
-    git.run(repo, ("switch", "-c", name, target_pin))
-    updated = git.inspect_repo(repo)
+    try:
+        git.run(repo, ("switch", "-c", name, target_pin))
+    except (GitError, OSError):
+        identity = _read_branch_identity(git, repo)
+        partial = _branch_postcondition_failed(
+            git, repo, facts, target_pin, "branch start", identity
+        )
+        actual = partial.repositories[0]
+        if identity[2] and actual["head"] == facts.head and actual["branch"] == facts.branch:
+            raise
+        return partial
+    try:
+        updated = git.inspect_repo(repo)
+    except (GitError, OSError):
+        return _branch_postcondition_failed(git, repo, facts, target_pin, "branch start")
     return _result("branch start", "branch_started", (), updated, target_pin, "equal", changed=True)
 
 
@@ -60,9 +74,22 @@ def resume_branch(git: Git, repo: Path, target_pin: str, name: str) -> Result:
     if facts.branch == name:
         return _result("branch resume", "branch_resumed", (), facts, target_pin, relation)
 
-    git.run(repo, ("switch", name))
-    updated = git.inspect_repo(repo)
-    updated_relation = _relation(git, repo, updated, target_pin, True)
+    try:
+        git.run(repo, ("switch", name))
+    except (GitError, OSError):
+        identity = _read_branch_identity(git, repo)
+        partial = _branch_postcondition_failed(
+            git, repo, facts, target_pin, "branch resume", identity
+        )
+        actual = partial.repositories[0]
+        if identity[2] and actual["head"] == facts.head and actual["branch"] == facts.branch:
+            raise
+        return partial
+    try:
+        updated = git.inspect_repo(repo)
+        updated_relation = _relation(git, repo, updated, target_pin, True)
+    except (GitError, OSError):
+        return _branch_postcondition_failed(git, repo, facts, target_pin, "branch resume")
     return _result(
         "branch resume", "branch_resumed", (), updated, target_pin, updated_relation, changed=True
     )
@@ -299,6 +326,53 @@ def _precondition_result(
     """返回目标缺失或安全前置条件不满足的结果。"""
     state = "waiting_for_pin" if reason == "target_pin_missing" else "blocked"
     return _result(command, state, (reason,), facts, target_pin, relation)
+
+
+def _read_branch_identity(git, repo):
+    """独立读取实际 HEAD/branch，并标记两项是否均可确认。"""
+    readable = True
+    head = None
+    branch = None
+    try:
+        head = git.run(repo, ("rev-parse", "HEAD")).stdout.strip() or None
+    except (GitError, OSError):
+        readable = False
+    try:
+        observed = git.run(
+            repo, ("symbolic-ref", "--quiet", "--short", "HEAD"), check=False
+        )
+        if observed.returncode == 0:
+            branch = observed.stdout.strip() or None
+        elif observed.returncode != 1:
+            readable = False
+    except (GitError, OSError):
+        readable = False
+    return head, branch, readable
+
+
+def _branch_postcondition_failed(
+    git, repo, previous, target_pin, command, identity=None
+):
+    """切换成功后尽力读取实际 HEAD/branch，并返回可恢复的 partial。"""
+    head, branch, _ = identity or _read_branch_identity(git, repo)
+    actual = replace(previous, head=head, branch=branch)
+    result = _result(
+        command,
+        "partial",
+        ("branch_postcondition_failed",),
+        actual,
+        target_pin,
+        "not_applicable",
+        changed=True,
+    )
+    action = Action(
+        "branch_status",
+        ("data-infra-sync", "branch", "status", "--repo", str(repo)),
+        False,
+        False,
+        ("full_recheck",),
+    )
+    return replace(result, next_actions=(action,))
 
 
 def _result(

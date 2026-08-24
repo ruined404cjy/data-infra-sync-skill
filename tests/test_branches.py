@@ -17,6 +17,100 @@ from tests.git_fixture import CompositeFixture
 
 
 class DevelopmentBranchTest(unittest.TestCase):
+    def test_start_postcondition_read_failure_returns_actual_partial(self):
+        target = self.fixture.target_pin
+        original = self.git.inspect_repo
+        calls = [0]
+
+        def inspect(path):
+            calls[0] += 1
+            if calls[0] == 2:
+                raise OSError("postcondition unavailable")
+            return original(path)
+
+        self.git.inspect_repo = inspect
+
+        result = start_branch(self.git, self.fixture.submodule, target, "feature/post")
+
+        self.assertEqual((result.state, result.changed), ("partial", True))
+        self.assertEqual(result.reason_codes, ("branch_postcondition_failed",))
+        self.assertEqual(result.repositories[0]["head"], target)
+        self.assertEqual(result.repositories[0]["branch"], "feature/post")
+        self.assertEqual(result.next_actions[0].argv[:4], ("data-infra-sync", "branch", "status", "--repo"))
+
+    def test_start_switch_that_changes_branch_then_raises_is_partial(self):
+        target = self.fixture.target_pin
+        original = self.git.run
+
+        def run(repo, args, *, check=True):
+            if args[:2] == ("switch", "-c"):
+                original(repo, args, check=check)
+                raise OSError("write completed before error")
+            return original(repo, args, check=check)
+
+        self.git.run = run
+
+        result = start_branch(self.git, self.fixture.submodule, target, "feature/partial")
+
+        self.assertEqual((result.state, result.changed), ("partial", True))
+        self.assertEqual(result.repositories[0]["branch"], "feature/partial")
+
+    def test_start_switch_failure_without_state_change_still_raises(self):
+        target = self.fixture.target_pin
+        original = self.git.run
+
+        def run(repo, args, *, check=True):
+            if args[:2] == ("switch", "-c"):
+                raise GitError(("git",) + tuple(args), "regular switch failure", 1)
+            return original(repo, args, check=check)
+
+        self.git.run = run
+
+        with self.assertRaises(GitError):
+            start_branch(self.git, self.fixture.submodule, target, "feature/failed")
+
+    def test_detached_switch_failure_with_unreadable_branch_is_partial(self):
+        target = self.fixture.target_pin
+        self.fixture.detach(self.fixture.submodule)
+        original = self.git.run
+        attempted = [False]
+
+        def run(repo, args, *, check=True):
+            if args[:2] == ("switch", "-c"):
+                attempted[0] = True
+                raise GitError(("git",) + tuple(args), "regular switch failure", 1)
+            if attempted[0] and args[:2] == ("symbolic-ref", "--quiet"):
+                raise OSError("branch unreadable")
+            return original(repo, args, check=check)
+
+        self.git.run = run
+
+        result = start_branch(self.git, self.fixture.submodule, target, "feature/unknown")
+
+        self.assertEqual((result.state, result.changed), ("partial", True))
+
+    def test_resume_relation_failure_after_switch_returns_actual_partial(self):
+        target = self.fixture.target_pin
+        self.fixture.create_branch(self.fixture.submodule, "feature/resume", target)
+        self.fixture.switch(self.fixture.submodule, "main")
+        original = self.git.relation
+        calls = [0]
+
+        def relation(repo, head, pin):
+            calls[0] += 1
+            if calls[0] == 2:
+                raise OSError("relation unavailable")
+            return original(repo, head, pin)
+
+        self.git.relation = relation
+
+        result = resume_branch(self.git, self.fixture.submodule, target, "feature/resume")
+
+        self.assertEqual((result.state, result.changed), ("partial", True))
+        self.assertEqual(result.reason_codes, ("branch_postcondition_failed",))
+        self.assertEqual(result.repositories[0]["branch"], "feature/resume")
+        self.assertTrue(result.next_actions)
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="branch fixture ")
         self.fixture = CompositeFixture.create(Path(self.temporary.name))

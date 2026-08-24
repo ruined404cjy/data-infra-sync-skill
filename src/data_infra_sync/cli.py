@@ -162,6 +162,9 @@ def _dispatch(arguments, config, store, git: Git) -> Result:
     """仅调用当前叶子命令对应的领域服务。"""
     command = _command_name(arguments)
     if arguments.root_command == "init":
+        inside = git.run(config.root, ("rev-parse", "--is-inside-work-tree"))
+        if inside.stdout.strip() != "true":
+            return _empty_result(command, "failed", ("invalid_git_checkout",))
         completed = git.run(config.root, ("rev-parse", "--show-toplevel"))
         checkout = Path(completed.stdout.strip()).resolve(strict=False)
         if checkout != config.root.resolve(strict=False):
@@ -229,7 +232,23 @@ def _logical_branch_result(result: Result, command: str, logical_path: str) -> R
         }
         for repository in result.repositories
     )
-    return replace(result, command=command, repositories=repositories)
+    actions = tuple(
+        replace(action, argv=_logical_repo_argv(action.argv, logical_path))
+        for action in result.next_actions
+    )
+    return replace(
+        result, command=command, repositories=repositories, next_actions=actions
+    )
+
+
+def _logical_repo_argv(argv, logical_path: str):
+    """将 branch 恢复动作中的物理仓库参数转换为公开逻辑路径。"""
+    values = list(argv)
+    if "--repo" in values:
+        position = values.index("--repo") + 1
+        if position < len(values):
+            values[position] = logical_path
+    return tuple(values)
 
 
 def _audit(store: StateStore, result: Result) -> None:
@@ -245,6 +264,27 @@ def _best_effort_failure_audit(store: StateStore, result: Result) -> None:
         store.append_event(result)
     except _EXPECTED_ERRORS:
         pass
+
+
+def _domain_write_completed(result: Result) -> bool:
+    """根据服务结果判断本命令是否已经越过首次领域写入边界。"""
+    if result.state == "partial":
+        return True
+    return result.changed and result.command in (
+        "sync apply",
+        "branch start",
+        "branch resume",
+    )
+
+
+def _persistence_failure(result: Result, reason: str) -> Result:
+    """保留写后实际状态；写前失败返回不携带误导性成功数据的结果。"""
+    if not _domain_write_completed(result):
+        return _empty_result(result.command, "failed", (reason,))
+    reasons = result.reason_codes
+    if reason not in reasons:
+        reasons += (reason,)
+    return replace(result, state="partial", reason_codes=reasons, changed=True)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -269,12 +309,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             try:
                 _audit(store, current)
             except _EXPECTED_ERRORS:
-                current = _empty_result(command, "failed", ("audit_write_failed",))
+                current = _persistence_failure(current, "audit_write_failed")
                 _best_effort_failure_audit(store, current)
             try:
                 _render(current, output_format)
             except _EXPECTED_ERRORS:
-                return 3
+                current = _persistence_failure(current, "render_failed")
+                _best_effort_failure_audit(store, current)
+                return _exit_code(current)
             return _exit_code(current)
     except _EXPECTED_ERRORS:
         current = _empty_result(command, "failed", ("command_failed",))

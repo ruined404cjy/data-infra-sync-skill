@@ -26,6 +26,20 @@ _OPERATION_MARKERS: Tuple[Tuple[str, str], ...] = (
     ("sequencer", "sequencer"),
     ("BISECT_LOG", "bisect"),
 )
+_GIT_REDIRECT_ENV = frozenset(
+    (
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_COMMON_DIR",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CONFIG",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_COUNT",
+    )
+)
+_GIT_CONFIG_ENTRY_ENV = re.compile(r"^GIT_CONFIG_(?:KEY|VALUE)_[0-9]+$")
 
 
 @dataclass(frozen=True)
@@ -73,7 +87,12 @@ class Git:
         self, repo: Path, args: Sequence[str], *, check: bool = True
     ) -> subprocess.CompletedProcess[str]:
         """在 repo 中执行 Git argv，并在失败时抛出脱敏 GitError。"""
-        environment = dict(os.environ)
+        environment = {
+            name: value
+            for name, value in os.environ.items()
+            if name not in _GIT_REDIRECT_ENV
+            and _GIT_CONFIG_ENTRY_ENV.fullmatch(name) is None
+        }
         environment["GIT_TERMINAL_PROMPT"] = "0"
         completed = subprocess.run(
             ["git", *args],

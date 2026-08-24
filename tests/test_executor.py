@@ -541,6 +541,18 @@ def _single_line_patch(path, before, after):
 
 
 class ExecutorPreflightTest(unittest.TestCase):
+    def test_preflight_os_error_is_failed_before_domain_writes(self):
+        git = RecordingGit()
+        git.patch_applied = False
+        adapter = ScriptedAdapter(git, (), ())
+        adapter.preflight_managed_patches = lambda *args: (_ for _ in ()).throw(OSError("temporary file"))
+
+        result = execute_sync(git, adapter, None, True)
+
+        self.assertEqual((result.state, result.changed), ("failed", False))
+        self.assertEqual(result.reason_codes, ("git_precondition_failed",))
+        self.assertEqual(git.writes, [])
+
     def test_snapshot_mismatch_blocks_before_domain_writes(self):
         git = RecordingGit()
         adapter = ScriptedAdapter(git, (), ())
@@ -656,6 +668,49 @@ class ExecutorPreflightTest(unittest.TestCase):
 
 
 class ExecutorWriteTest(unittest.TestCase):
+    def test_postcondition_os_error_after_parent_update_is_partial(self):
+        git = RecordingGit()
+        git.patch_applied = False
+        adapter = ScriptedAdapter(git, (), ())
+        original = adapter.collect_plan_facts
+
+        def collect(runtime_git, *, fresh):
+            if not fresh and runtime_git.parent_head == TARGET_PARENT:
+                raise OSError("postcondition unavailable")
+            return original(runtime_git, fresh=fresh)
+
+        adapter.collect_plan_facts = collect
+
+        result = execute_sync(git, adapter, None, True)
+
+        self.assertEqual((result.state, result.changed), ("partial", True))
+        self.assertEqual(result.reason_codes, ("postcondition_failed",))
+        self.assertEqual(result.repositories[0]["head"], TARGET_PARENT)
+        self.assertEqual(result.next_actions[0].argv, ("data-infra-sync", "sync", "apply", "--non-interactive"))
+
+    def test_patch_os_error_after_content_change_is_partial_and_retry_converges(self):
+        git = RecordingGit()
+        patch = managed_patch()
+        adapter = ScriptedAdapter(git, (patch,), (patch,))
+        original = adapter.reverse_patch
+        failed = [False]
+
+        def reverse(runtime_git, declaration):
+            original(runtime_git, declaration)
+            if not failed[0]:
+                failed[0] = True
+                raise OSError("temporary patch file")
+
+        adapter.reverse_patch = reverse
+
+        partial = execute_sync(git, adapter, None, True)
+        recovered = execute_sync(git, adapter, None, True)
+
+        self.assertEqual((partial.state, partial.changed), ("partial", True))
+        self.assertEqual(partial.reason_codes, ("managed_patch_reverse_failed",))
+        self.assertEqual(partial.repositories[1]["head"], PIN)
+        self.assertEqual(recovered.state, "updated")
+
     def test_domain_fingerprint_rejects_repository_symlink_before_git_access(self):
         with tempfile.TemporaryDirectory(prefix="executor fingerprint symlink ") as directory:
             root = Path(directory)

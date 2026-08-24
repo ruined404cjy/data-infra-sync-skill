@@ -1,7 +1,10 @@
+import os
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -23,6 +26,49 @@ class GitFactsTest(unittest.TestCase):
         completed = self.git.run(self.fixture.parent, ("rev-parse", "HEAD"))
 
         self.assertEqual(completed.stdout.strip(), self.fixture.target_parent)
+
+    def test_run_ignores_repository_and_command_config_environment_redirection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plain = Path(directory)
+            injected = {
+                "GIT_DIR": str(self.fixture.parent / ".git"),
+                "GIT_WORK_TREE": str(self.fixture.parent),
+                "GIT_INDEX_FILE": str(self.fixture.parent / ".git/index"),
+                "GIT_COMMON_DIR": str(self.fixture.parent / ".git"),
+                "GIT_OBJECT_DIRECTORY": str(self.fixture.parent / ".git/objects"),
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(self.fixture.parent / ".git/objects"),
+                "GIT_CONFIG": str(self.fixture.parent / ".git/config"),
+                "GIT_CONFIG_PARAMETERS": "'sync-test.injected=evil'",
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": "sync-test.injected",
+                "GIT_CONFIG_VALUE_0": "evil",
+                "GIT_CONFIG_KEY_77": "alias.injected",
+                "GIT_CONFIG_VALUE_77": "status",
+            }
+            with patch.dict(os.environ, injected, clear=False):
+                with self.assertRaises(GitError):
+                    self.git.run(plain, ("rev-parse", "HEAD"))
+                configured = self.git.run(
+                    self.fixture.parent, ("config", "--get", "sync-test.injected"), check=False
+                )
+            self.assertEqual(configured.returncode, 1)
+
+    def test_run_preserves_authentication_transport_and_user_config_environment(self):
+        retained = {
+            "HOME": "/home/test",
+            "XDG_CONFIG_HOME": "/config/test",
+            "GIT_ASKPASS": "/bin/askpass",
+            "SSH_AUTH_SOCK": "/run/ssh.sock",
+            "GIT_SSH_COMMAND": "ssh -F /config/ssh",
+        }
+        completed = subprocess.CompletedProcess(("git", "status"), 0, "", "")
+        with patch.dict(os.environ, retained, clear=True), patch(
+            "data_infra_sync.git.subprocess.run", return_value=completed
+        ) as run:
+            self.git.run(Path("/repo"), ("status",))
+        environment = run.call_args.kwargs["env"]
+        for name, value in retained.items():
+            self.assertEqual(environment[name], value)
 
     def test_relation_distinguishes_equal_contained_tree_equal_and_diverged(self):
         base = self.fixture.target_parent
