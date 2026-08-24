@@ -1,0 +1,15 @@
+#!/usr/bin/env python3
+"""Repository-local entry point for the DataInfra sync CLI."""
+
+import sys
+from pathlib import Path
+
+
+SOURCE = Path(__file__).resolve().parents[1] / "src"
+sys.path.insert(0, str(SOURCE))
+
+from data_infra_sync.cli import main
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
