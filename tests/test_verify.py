@@ -168,6 +168,41 @@ class InstallIdentityTest(unittest.TestCase):
             self.assertEqual(len(reads), 24)
             self.assertEqual(set(reads), {path for _, paths in adapter.artifact_groups() for path in paths})
 
+    def test_install_adapter_uses_injected_git_reader_for_composite_heads(self):
+        """防止安装身份 Git 读取硬编码为真实 subprocess。"""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "checkout"
+            child = root / "modules/child"
+            child.mkdir(parents=True)
+            parent_head = "a" * 40
+            child_head = "b" * 40
+            calls = []
+
+            def read_git(repository, args):
+                calls.append((repository, args))
+                if args == ("ls-files", "-s", "-z"):
+                    return (
+                        "160000 {} 0\tmodules/child\0".format(child_head)
+                    ).encode("utf-8")
+                return (parent_head if repository == root else child_head).encode("ascii")
+
+            adapter = DataInfraInstallAdapter(
+                root, git_reader=read_git, proc_reader=lambda: ()
+            )
+
+            self.assertEqual(
+                adapter.repository_heads(),
+                ((".", parent_head), ("modules/child", child_head)),
+            )
+            self.assertEqual(
+                calls,
+                [
+                    (root, ("rev-parse", "HEAD")),
+                    (root, ("ls-files", "-s", "-z")),
+                    (child, ("rev-parse", "HEAD")),
+                ],
+            )
+
     def test_identical_checkouts_at_different_absolute_roots_have_same_manifest(self):
         """防止绝对 workspace 路径使相同安装身份产生不同 manifest。"""
         with tempfile.TemporaryDirectory() as directory:
@@ -273,6 +308,31 @@ class VerifyInstallTest(unittest.TestCase):
         self.assertEqual(failed.state, "deployment_mismatch")
         self.assertEqual(path.read_bytes(), stable)
 
+    def test_manifest_rejects_noncanonical_repository_and_artifact_hashes(self):
+        """防止格式错误的 OID 或 SHA 被误分为源码或部署变化。"""
+        verify_install(self.config, self.store, record=True)
+        path = self.config.state_dir / "manifest.json"
+        original = json.loads(path.read_text(encoding="utf-8"))
+        artifact_path = next(iter(original["artifacts"]))
+        cases = (
+            ("uppercase-head", "repositories", ".", "A" * 40),
+            ("short-head", "repositories", ".", "a" * 39),
+            ("nonhex-head", "repositories", ".", "g" * 40),
+            ("uppercase-digest", "artifacts", artifact_path, "B" * 64),
+            ("short-digest", "artifacts", artifact_path, "b" * 63),
+            ("nonhex-digest", "artifacts", artifact_path, "z" * 64),
+        )
+        for name, section, key, value in cases:
+            with self.subTest(name=name):
+                manifest = json.loads(json.dumps(original))
+                manifest[section][key] = value
+                path.write_text(json.dumps(manifest), encoding="utf-8")
+
+                result = verify_install(self.config, self.store, record=False)
+
+                self.assertEqual(result.state, "failed")
+                self.assertEqual(result.reason_codes, ("manifest_read_failed",))
+
     def test_deleted_library_and_other_workspace_mappings_are_mismatch_but_sysv_is_normal(self):
         """防止 gaussdb 保留已删除库或从其他 checkout 加载关键库。"""
         good_exe = str(self.root / "mppdb_temp_install/bin/gaussdb")
@@ -280,12 +340,38 @@ class VerifyInstallTest(unittest.TestCase):
             (({"name": "gaussdb", "exe": good_exe, "maps": ("/tmp/libother.so (deleted)",)},), "deleted_library_mapping"),
             (({"name": "gaussdb", "exe": good_exe, "maps": ("/SYSV00000000 (deleted)",)},), None),
             (({"name": "gaussdb", "exe": good_exe, "maps": ("/other/workspace/iceberg_fdw.so",)},), "other_workspace_mapping"),
-            (({"name": "gaussdb", "exe": "/other/workspace/gaussdb", "maps": ()},), "other_workspace_mapping"),
+            (({"name": "gaussdb", "exe": "/other/workspace/gaussdb", "maps": ()},), None),
             (({"name": "postgres", "exe": "/other/workspace/gaussdb", "maps": ("/tmp/a.so (deleted)",)},), None),
         )
         for processes, expected in cases:
             with self.subTest(expected=expected, processes=processes):
                 self.adapter.proc_reader = lambda processes=processes: processes
+                result = verify_install(self.config, self.store, record=True)
+                if expected is None:
+                    self.assertEqual(result.state, "deployment_consistent")
+                else:
+                    self.assertEqual(result.state, "deployment_mismatch")
+                    self.assertEqual(result.reason_codes, (expected,))
+
+    def test_process_checks_only_workspace_related_gaussdb_and_real_deleted_libraries(self):
+        """防止系统 gaussdb 误报，并精确识别已关联进程的共享库名称。"""
+        current_exe = str(self.root / "mppdb_temp_install/bin/gaussdb")
+        expected_library = str(
+            self.root / "mppdb_temp_install/lib/postgresql/iceberg_fdw.so"
+        )
+        build_library = str(self.root / "plugins/iceberg_fdw/iceberg_fdw.so")
+        cases = (
+            ("system-unrelated", "/usr/bin/gaussdb", ("/tmp/libssl.so.3 (deleted)",), None),
+            ("versioned-so", current_exe, ("/tmp/libssl.so.3 (deleted)",), "deleted_library_mapping"),
+            ("so-text", current_exe, ("/tmp/not.so.txt (deleted)",), None),
+            ("system-associated", "/usr/bin/gaussdb", (expected_library,), "other_workspace_mapping"),
+            ("build-copy", current_exe, (build_library,), "other_workspace_mapping"),
+        )
+        for name, exe, maps, expected in cases:
+            with self.subTest(name=name):
+                self.adapter.proc_reader = lambda exe=exe, maps=maps: (
+                    {"name": "gaussdb", "exe": exe, "maps": maps},
+                )
                 result = verify_install(self.config, self.store, record=True)
                 if expected is None:
                     self.assertEqual(result.state, "deployment_consistent")
@@ -303,6 +389,33 @@ class VerifyInstallTest(unittest.TestCase):
         self.adapter.proc_reader = lambda: (_ for _ in ()).throw(OSError("proc denied"))
         self.assertEqual(verify_install(self.config, self.store, record=True).state, "failed")
 
+    def test_injected_git_reader_failure_maps_to_git_read_failed(self):
+        """防止 Git reader 异常逃逸或丢失确定性原因码。"""
+        for error in (RuntimeError("injected Git failure"), TypeError("bad result")):
+            with self.subTest(error=type(error).__name__):
+                self.adapter.git_reader = (
+                    lambda repository, args, error=error: (_ for _ in ()).throw(error)
+                )
+
+                result = verify_install(self.config, self.store, record=True)
+
+                self.assertEqual(result.state, "failed")
+                self.assertEqual(result.reason_codes, ("git_read_failed",))
+
+    def test_noncanonical_injected_git_head_is_a_git_read_failure(self):
+        """防止 Git reader 返回无效 HEAD 后 record 写出非法 manifest。"""
+        self.adapter.git_reader = lambda repository, args: (
+            b"invalid-head\n"
+            if args == ("rev-parse", "HEAD")
+            else b""
+        )
+
+        result = verify_install(self.config, self.store, record=True)
+
+        self.assertEqual(result.state, "failed")
+        self.assertEqual(result.reason_codes, ("git_read_failed",))
+        self.assertFalse((self.config.state_dir / "manifest.json").exists())
+
     def test_artifact_symlink_cannot_escape_workspace(self):
         """防止 hash 读取跟随产物 symlink 访问 workspace 外文件。"""
         target = self.base / "outside.so"
@@ -315,6 +428,41 @@ class VerifyInstallTest(unittest.TestCase):
 
         self.assertEqual(result.state, "deployment_mismatch")
         self.assertEqual(result.reason_codes, ("artifact_not_regular",))
+
+    def test_intermediate_directory_swap_cannot_redirect_artifact_open(self):
+        """防止逐段检查后重解析完整路径读取竞态替换的外部文件。"""
+        bridge_paths = self.adapter.artifact_groups()[0][1]
+        outside_content = b"outside-secret-content\n"
+        for relative in bridge_paths[1:]:
+            (self.root / relative).write_bytes(outside_content)
+        outside_deps = self.base / "outside/deps"
+        outside_artifact = outside_deps / Path(bridge_paths[0]).relative_to("deps")
+        outside_artifact.parent.mkdir(parents=True)
+        outside_artifact.write_bytes(outside_content)
+
+        real_open = os.open
+        swapped = False
+        full_artifact = os.fspath(self.root / bridge_paths[0])
+
+        def racing_open(path, flags, *args, **kwargs):
+            nonlocal swapped
+            value = os.fspath(path)
+            if not swapped and value in (full_artifact, "deps"):
+                (self.root / "deps").rename(self.root / "deps-original")
+                os.symlink(outside_deps, self.root / "deps")
+                swapped = True
+            return real_open(path, flags, *args, **kwargs)
+
+        with mock.patch("data_infra_sync.verify.os.open", side_effect=racing_open):
+            result = verify_install(self.config, self.store, record=True)
+
+        manifest = self.config.state_dir / "manifest.json"
+        self.assertIn(result.state, ("failed", "deployment_mismatch"))
+        self.assertFalse(manifest.exists())
+        self.assertNotIn(
+            hashlib.sha256(outside_content).hexdigest(),
+            manifest.read_text() if manifest.exists() else "",
+        )
 
 if __name__ == "__main__":
     unittest.main()

@@ -59,28 +59,50 @@ _ARTIFACT_GROUPS = (
     )),
 )
 
+_CRITICAL_INSTALL_PATHS = (
+    ("libiceberg_rust_bridge.so", (
+        "mppdb_temp_install/lib/postgresql/libiceberg_rust_bridge.so",
+    )),
+    ("iceberg_catalog.so", (
+        "mppdb_temp_install/lib/postgresql/iceberg_catalog.so",
+        "mppdb_temp_install/lib/postgresql/proc_srclib/iceberg_catalog.so",
+    )),
+    ("iceberg_fdw.so", (
+        "mppdb_temp_install/lib/postgresql/iceberg_fdw.so",
+        "mppdb_temp_install/lib/postgresql/proc_srclib/iceberg_fdw.so",
+    )),
+    ("iceberg_delta.so", (
+        "mppdb_temp_install/lib/postgresql/iceberg_delta.so",
+        "mppdb_temp_install/lib/postgresql/proc_srclib/iceberg_delta.so",
+    )),
+)
+
 
 class DataInfraInstallAdapter:
     """声明 DataInfra 原生安装布局和可注入进程读取边界。"""
 
-    def __init__(self, root: Path, *, file_reader=None, proc_reader=None):
+    def __init__(
+        self, root: Path, *, file_reader=None, git_reader=None, proc_reader=None
+    ):
         self.root = Path(root).resolve(strict=False)
         self.file_reader = file_reader
+        self.git_reader = git_reader or self._read_git
         self.proc_reader = proc_reader or self._read_proc
 
     def artifact_groups(self) -> tuple[tuple[str, tuple[str, ...]], ...]:
         """返回以 workspace root 为基准的产物一致性组。"""
         return _ARTIFACT_GROUPS
 
+    def critical_install_paths(self) -> tuple[tuple[str, tuple[str, ...]], ...]:
+        """返回运行中关键库允许映射的安装副本相对路径。"""
+        return _CRITICAL_INSTALL_PATHS
+
     def repository_heads(self) -> tuple[tuple[str, str], ...]:
         """读取父仓和 index 声明的全部一级 submodule 实际 HEAD。"""
         parent = self._git_head(self.root)
-        listing = subprocess.run(
-            ("git", "-C", str(self.root), "ls-files", "-s", "-z"),
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        ).stdout
+        listing = self.git_reader(self.root, ("ls-files", "-s", "-z"))
+        if isinstance(listing, str):
+            listing = listing.encode("utf-8")
         repositories = [(".", parent)]
         for entry in listing.split(b"\0"):
             if not entry:
@@ -100,16 +122,22 @@ class DataInfraInstallAdapter:
         """返回进程读取器产生的快照，供核验层应用映射规则。"""
         return tuple(self.proc_reader())
 
-    @staticmethod
-    def _git_head(repository: Path) -> str:
+    def _git_head(self, repository: Path) -> str:
         """读取指定仓库当前实际 HEAD。"""
+        output = self.git_reader(repository, ("rev-parse", "HEAD"))
+        if isinstance(output, bytes):
+            output = output.decode("ascii")
+        return output.strip()
+
+    @staticmethod
+    def _read_git(repository: Path, args) -> bytes:
+        """通过无 shell argv subprocess 执行只读 Git 命令。"""
         return subprocess.run(
-            ("git", "-C", str(repository), "rev-parse", "HEAD"),
+            ("git", "-C", str(repository)) + tuple(args),
             check=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
-        ).stdout.strip()
+        ).stdout
 
     @staticmethod
     def _read_proc():

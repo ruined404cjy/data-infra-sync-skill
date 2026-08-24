@@ -1,10 +1,12 @@
 """DataInfra 源码、安装产物与运行映射身份核验。"""
 
+import errno
 import hashlib
 import json
 import os
+import re
 import stat
-import subprocess
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Mapping, Optional
@@ -13,14 +15,11 @@ from data_infra_sync.adapters.datainfra import DataInfraInstallAdapter
 from data_infra_sync.model import Action, Result
 
 
-_CRITICAL_LIBRARIES = frozenset(
-    {
-        "libiceberg_rust_bridge.so",
-        "iceberg_catalog.so",
-        "iceberg_fdw.so",
-        "iceberg_delta.so",
-    }
+_SHARED_LIBRARY_NAME = re.compile(
+    r"^[^/]+\.so(?:\.[0-9]+(?:\.[0-9]+)*)?$"
 )
+_OBJECT_ID = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 @dataclass(frozen=True)
@@ -57,9 +56,14 @@ def collect_install_identity(config, adapter) -> InstallIdentity:
 
     try:
         repositories = tuple(adapter.repository_heads())
-        if any(not _safe_logical_path(path) for path, _ in repositories):
+        if any(
+            not _safe_logical_path(path)
+            or not isinstance(head, str)
+            or _OBJECT_ID.fullmatch(head) is None
+            for path, head in repositories
+        ):
             raise OSError("unsafe repository path")
-    except (OSError, RuntimeError, UnicodeError, subprocess.SubprocessError):
+    except Exception:
         raise _VerificationError("failed", ("git_read_failed",))
 
     artifacts = []
@@ -83,7 +87,9 @@ def collect_install_identity(config, adapter) -> InstallIdentity:
             mismatch_reasons.append("artifact_group_mismatch")
 
     try:
-        mismatch_reasons.extend(_process_mismatches(root, adapter.process_records()))
+        mismatch_reasons.extend(
+            _process_mismatches(root, adapter.process_records(), adapter)
+        )
     except (OSError, RuntimeError, TypeError, ValueError):
         raise _VerificationError("failed", ("proc_read_failed",))
     if mismatch_reasons:
@@ -100,7 +106,10 @@ def verify_install(config, store, *, record: bool) -> Result:
             store.write_manifest(identity.to_manifest())
             return _result(identity, "deployment_consistent", (), True)
 
-        manifest = _read_manifest(store.state_dir)
+        try:
+            manifest = _read_manifest(store.state_dir)
+        except (OSError, RuntimeError, ValueError, TypeError):
+            raise _VerificationError("failed", ("manifest_read_failed",))
         if manifest is None:
             return _result(identity, "build_required", ("manifest_missing",), False)
         reasons = _manifest_reasons(identity, manifest)
@@ -139,47 +148,81 @@ def _hash_regular_file(root: Path, relative: str) -> str:
     path = Path(relative)
     if path.is_absolute() or ".." in path.parts or not path.parts:
         raise _NotRegularFile(relative)
-    candidate = root
-    for index, part in enumerate(path.parts):
-        candidate = candidate / part
-        metadata = candidate.lstat()
-        if stat.S_ISLNK(metadata.st_mode):
-            raise _NotRegularFile(relative)
-        if index < len(path.parts) - 1 and not stat.S_ISDIR(metadata.st_mode):
-            raise _NotRegularFile(relative)
-    if not stat.S_ISREG(candidate.lstat().st_mode):
-        raise _NotRegularFile(relative)
     digest = hashlib.sha256()
-    descriptor = os.open(candidate, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-    with os.fdopen(descriptor, "rb") as source:
-        if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
-            raise _NotRegularFile(relative)
-        for block in iter(lambda: source.read(1024 * 1024), b""):
-            digest.update(block)
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        with ExitStack() as directories:
+            directory = os.open(root, directory_flags)
+            directories.callback(os.close, directory)
+            for part in path.parts[:-1]:
+                directory = os.open(part, directory_flags, dir_fd=directory)
+                directories.callback(os.close, directory)
+            descriptor = os.open(
+                path.parts[-1],
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=directory,
+            )
+            try:
+                source = os.fdopen(descriptor, "rb")
+            except BaseException:
+                os.close(descriptor)
+                raise
+            with source:
+                if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                    raise _NotRegularFile(relative)
+                for block in iter(lambda: source.read(1024 * 1024), b""):
+                    digest.update(block)
+    except OSError as error:
+        if error.errno in (errno.ELOOP, errno.ENOTDIR):
+            raise _NotRegularFile(relative) from error
+        raise
     return digest.hexdigest()
 
 
-def _process_mismatches(root: Path, records) -> tuple[str, ...]:
+def _process_mismatches(root: Path, records, adapter) -> tuple[str, ...]:
     """检查 gaussdb executable、deleted `.so` 和关键库 workspace 归属。"""
     reasons = []
+    expected_paths = {
+        name: frozenset(root / relative for relative in paths)
+        for name, paths in adapter.critical_install_paths()
+    }
     for record in records:
         if record.get("name") != "gaussdb":
             continue
         exe = str(record["exe"])
+        mappings = tuple(
+            mapped
+            for mapped in (_mapped_path(str(line)) for line in record["maps"])
+            if mapped is not None
+        )
+        critical_mappings = tuple(
+            mapped
+            for mapped in mappings
+            if Path(_without_deleted_suffix(mapped)).name in expected_paths
+        )
+        if not _is_within(root, exe) and not critical_mappings:
+            continue
         if not _is_within(root, exe):
             reasons.append("other_workspace_mapping")
-        for line in record["maps"]:
-            mapped = _mapped_path(str(line))
-            if mapped is None:
-                continue
+        for mapped in mappings:
             if mapped.endswith(" (deleted)"):
-                original = mapped[:-10]
-                if ".so" in Path(original).name:
+                original = _without_deleted_suffix(mapped)
+                if _SHARED_LIBRARY_NAME.fullmatch(Path(original).name):
                     reasons.append("deleted_library_mapping")
                 continue
-            if Path(mapped).name in _CRITICAL_LIBRARIES and not _is_within(root, mapped):
+            name = Path(mapped).name
+            if name in expected_paths and Path(mapped) not in expected_paths[name]:
                 reasons.append("other_workspace_mapping")
     return tuple(reasons)
+
+
+def _without_deleted_suffix(value: str) -> str:
+    """移除 proc maps 的 deleted 标记以便解析真实 basename。"""
+    return value[:-10] if value.endswith(" (deleted)") else value
 
 
 def _mapped_path(line: str) -> Optional[str]:
@@ -230,11 +273,16 @@ def _read_manifest(state_dir: Path) -> Optional[Mapping[str, object]]:
     artifacts = data["artifacts"]
     if (
         any(
-            not _safe_logical_path(path) or not isinstance(head, str)
+            not _safe_logical_path(path)
+            or not isinstance(head, str)
+            or _OBJECT_ID.fullmatch(head) is None
             for path, head in repositories.items()
         )
         or any(
-            path == "." or not _safe_logical_path(path) or not isinstance(digest, str)
+            path == "."
+            or not _safe_logical_path(path)
+            or not isinstance(digest, str)
+            or _SHA256.fullmatch(digest) is None
             for path, digest in artifacts.items()
         )
     ):
