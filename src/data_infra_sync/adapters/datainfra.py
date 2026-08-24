@@ -1,13 +1,133 @@
 """DataInfra 项目的同步事实与受控补丁声明边界。"""
 
 import hashlib
+import os
 import shutil
+import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Tuple
 
 from data_infra_sync.git import GitError
+
+
+_ARTIFACT_GROUPS = (
+    ("bridge", (
+        "deps/iceberg-rust-bridge/target/release/libiceberg_rust_bridge.so",
+        "plugins/openGauss-Catalog/deps/libiceberg_rust_bridge.so",
+        "mppdb_temp_install/lib/postgresql/libiceberg_rust_bridge.so",
+    )),
+    ("catalog", (
+        "plugins/openGauss-Catalog/iceberg_catalog.so",
+        "mppdb_temp_install/lib/postgresql/iceberg_catalog.so",
+        "mppdb_temp_install/lib/postgresql/proc_srclib/iceberg_catalog.so",
+    )),
+    ("fdw", (
+        "plugins/iceberg_fdw/iceberg_fdw.so",
+        "mppdb_temp_install/lib/postgresql/iceberg_fdw.so",
+        "mppdb_temp_install/lib/postgresql/proc_srclib/iceberg_fdw.so",
+    )),
+    ("delta", (
+        "plugins/iceberg_delta/tmp_build_gcc10/iceberg_delta.so",
+        "mppdb_temp_install/lib/postgresql/iceberg_delta.so",
+        "mppdb_temp_install/lib/postgresql/proc_srclib/iceberg_delta.so",
+    )),
+    ("catalog-control", (
+        "plugins/openGauss-Catalog/iceberg_catalog.control",
+        "mppdb_temp_install/share/postgresql/extension/iceberg_catalog.control",
+    )),
+    ("catalog-sql", (
+        "plugins/openGauss-Catalog/iceberg_catalog--1.0.0.sql",
+        "mppdb_temp_install/share/postgresql/extension/iceberg_catalog--1.0.0.sql",
+    )),
+    ("fdw-control", (
+        "plugins/iceberg_fdw/iceberg_fdw.control",
+        "mppdb_temp_install/share/postgresql/extension/iceberg_fdw.control",
+    )),
+    ("fdw-sql", (
+        "plugins/iceberg_fdw/iceberg_fdw--0.1.0.sql",
+        "mppdb_temp_install/share/postgresql/extension/iceberg_fdw--0.1.0.sql",
+    )),
+    ("delta-control", (
+        "plugins/iceberg_delta/iceberg_delta.control",
+        "mppdb_temp_install/share/postgresql/extension/iceberg_delta.control",
+    )),
+    ("delta-sql", (
+        "plugins/iceberg_delta/iceberg_delta--1.0.0.sql",
+        "mppdb_temp_install/share/postgresql/extension/iceberg_delta--1.0.0.sql",
+    )),
+)
+
+
+class DataInfraInstallAdapter:
+    """声明 DataInfra 原生安装布局和可注入进程读取边界。"""
+
+    def __init__(self, root: Path, *, file_reader=None, proc_reader=None):
+        self.root = Path(root).resolve(strict=False)
+        self.file_reader = file_reader
+        self.proc_reader = proc_reader or self._read_proc
+
+    def artifact_groups(self) -> tuple[tuple[str, tuple[str, ...]], ...]:
+        """返回以 workspace root 为基准的产物一致性组。"""
+        return _ARTIFACT_GROUPS
+
+    def repository_heads(self) -> tuple[tuple[str, str], ...]:
+        """读取父仓和 index 声明的全部一级 submodule 实际 HEAD。"""
+        parent = self._git_head(self.root)
+        listing = subprocess.run(
+            ("git", "-C", str(self.root), "ls-files", "-s", "-z"),
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        ).stdout
+        repositories = [(".", parent)]
+        for entry in listing.split(b"\0"):
+            if not entry:
+                continue
+            metadata, raw_path = entry.split(b"\t", 1)
+            mode = metadata.split(b" ", 1)[0]
+            if mode != b"160000":
+                continue
+            relative = raw_path.decode("utf-8", errors="strict")
+            repository = _safe_directory(self.root, relative)
+            if repository is None:
+                raise OSError("unsafe or missing submodule: " + relative)
+            repositories.append((relative, self._git_head(repository)))
+        return tuple(sorted(repositories))
+
+    def process_records(self):
+        """返回进程读取器产生的快照，供核验层应用映射规则。"""
+        return tuple(self.proc_reader())
+
+    @staticmethod
+    def _git_head(repository: Path) -> str:
+        """读取指定仓库当前实际 HEAD。"""
+        return subprocess.run(
+            ("git", "-C", str(repository), "rev-parse", "HEAD"),
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        ).stdout.strip()
+
+    @staticmethod
+    def _read_proc():
+        """仅为名称精确等于 gaussdb 的进程读取 exe 与 maps。"""
+        records = []
+        for process in Path("/proc").iterdir():
+            if not process.name.isdigit():
+                continue
+            try:
+                name = (process / "comm").read_text(encoding="utf-8").strip()
+            except (FileNotFoundError, ProcessLookupError, PermissionError):
+                continue
+            if name != "gaussdb":
+                continue
+            exe = os.readlink(process / "exe")
+            maps = (process / "maps").read_text(encoding="utf-8").splitlines()
+            records.append({"name": name, "exe": exe, "maps": tuple(maps)})
+        return tuple(records)
 
 
 @dataclass(frozen=True)
