@@ -3,6 +3,7 @@
 import hashlib
 import os
 import posixpath
+import re
 import shutil
 import subprocess
 import tempfile
@@ -537,6 +538,7 @@ def _fetch_parent_target(git, root, remote, branch, target_ref):
             "fetch",
             "--prune",
             "--no-recurse-submodules",
+            "--refmap=",
             "--",
             remote,
             "+{}:{}".format(source, target_ref),
@@ -579,9 +581,20 @@ def _fetch_submodule_upstream(git, repository):
         return
     if not source.startswith("refs/heads/"):
         raise GitError(("git", "fetch"), "unsafe submodule upstream", 2)
-    destination = "refs/remotes/{}/{}".format(
-        remote_name, source[len("refs/heads/"):]
+    upstream = git.run(
+        repository,
+        ("rev-parse", "--symbolic-full-name", "@{upstream}"),
+        check=False,
     )
+    if upstream.returncode != 0:
+        raise GitError(
+            tuple(str(item) for item in upstream.args),
+            upstream.stderr or "submodule upstream is missing",
+            upstream.returncode,
+        )
+    destination = upstream.stdout.strip()
+    if not destination.startswith("refs/remotes/"):
+        raise GitError(("git", "fetch"), "unsafe submodule upstream", 2)
     _require_valid_ref(git, repository, source)
     _require_valid_ref(git, repository, destination)
     git.run(
@@ -590,6 +603,7 @@ def _fetch_submodule_upstream(git, repository):
             "fetch",
             "--prune",
             "--no-recurse-submodules",
+            "--refmap=",
             "--",
             remote_name,
             "+{}:{}".format(source, destination),
@@ -638,6 +652,7 @@ def _submodules_at(git, parent, commit):
         if links:
             raise GitError(("git", "ls-tree", commit), "undeclared gitlink", 2)
         return ()
+    section_names = _submodule_section_names(git, parent, commit)
     completed = git.run(
         parent,
         ("config", "--null", "--blob", "{}:.gitmodules".format(commit), "--list"),
@@ -663,6 +678,15 @@ def _submodules_at(git, parent, commit):
             )
         fields[field] = value
 
+    if len(section_names) != len(set(section_names)) or set(section_names) != set(
+        declarations
+    ):
+        raise GitError(
+            ("git", "show", "{}:.gitmodules".format(commit)),
+            "ambiguous submodule section",
+            2,
+        )
+
     specs = []
     seen_paths = set()
     for name, fields in declarations.items():
@@ -680,6 +704,29 @@ def _submodules_at(git, parent, commit):
     if seen_paths != set(links):
         raise GitError(("git", "ls-tree", commit), "undeclared gitlink", 2)
     return tuple(sorted(specs, key=lambda item: (item.path, item.name, item.url)))
+
+
+_SUBMODULE_SECTION = re.compile(
+    r'^\s*\[\s*submodule\s+"((?:[^"\\]|\\["\\])*)"\s*\]\s*(?:[#;].*)?$'
+)
+
+
+def _submodule_section_names(git, parent, commit):
+    """读取原始 blob，并返回每个标准 quoted submodule section 的 name。"""
+    completed = git.run(parent, ("show", "{}:.gitmodules".format(commit)))
+    names = []
+    for line in completed.stdout.splitlines():
+        if not line.lstrip().lower().startswith("[submodule"):
+            continue
+        match = _SUBMODULE_SECTION.fullmatch(line)
+        if match is None:
+            raise GitError(
+                tuple(str(item) for item in completed.args),
+                "invalid submodule section",
+                2,
+            )
+        names.append(match.group(1).replace('\\"', '"').replace("\\\\", "\\"))
+    return tuple(names)
 
 
 def _safe_submodule_path(value):
@@ -774,6 +821,7 @@ def _prefetch_target_objects(
                         "fetch",
                         "--no-tags",
                         "--no-recurse-submodules",
+                        "--refmap=",
                         "--",
                         url,
                         target.pin,
@@ -793,6 +841,7 @@ def _prefetch_target_objects(
                     "fetch",
                     "--no-tags",
                     "--no-recurse-submodules",
+                    "--refmap=",
                     "--",
                     url,
                     target.pin,

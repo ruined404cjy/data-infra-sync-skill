@@ -81,10 +81,10 @@ def plan_facts(**overrides):
 
 
 class PlannerStateTest(unittest.TestCase):
-    def test_global_managed_patch_transition_blocks_without_action(self):
+    def test_managed_patch_transition_blocks_without_action(self):
         """防止补丁目标不在仓库 union 时迁移状态被丢弃。"""
         baseline = plan_facts(target_parent=TARGET_PARENT, parent_relation="contained")
-        facts = replace(baseline, global_managed_patch_transition=True)
+        facts = replace(baseline, managed_patch_transition=True)
 
         result = plan_sync(facts)
 

@@ -67,6 +67,16 @@ class DataInfraAdapterCollectionTest(unittest.TestCase):
         """防止 exact pin 预取继承递归配置并访问嵌套 remote。"""
         with tempfile.TemporaryDirectory() as temp_dir:
             fixture = CompositeFixture.create(Path(temp_dir))
+            modules = fixture.parent / ".gitmodules"
+            modules.write_text(
+                modules.read_text(encoding="utf-8").replace(
+                    str(fixture.submodule_remote), "origin"
+                ),
+                encoding="utf-8",
+            )
+            fixture._run(fixture.parent, ("add", ".gitmodules"))
+            fixture._run(fixture.parent, ("commit", "-m", "use named child remote"))
+            fixture.push(fixture.parent)
             nested_remote = fixture.root / "nested.git"
             fixture._run(fixture.root, ("init", "--bare", str(nested_remote)))
             fixture._run(
@@ -120,17 +130,37 @@ class DataInfraAdapterCollectionTest(unittest.TestCase):
             parent_publisher = fixture.clone_parent("parent publisher")
             fixture._run(
                 parent_publisher,
-                ("-c", "protocol.file.allow=always", "submodule", "update", "--init"),
+                (
+                    "update-index",
+                    "--cacheinfo",
+                    "160000,{},modules/component".format(target_pin),
+                ),
             )
-            child = parent_publisher / "modules/component"
-            fixture._run(child, ("fetch", "origin"))
-            fixture._run(child, ("checkout", "--detach", target_pin))
-            fixture._run(parent_publisher, ("add", "modules/component"))
             fixture._run(parent_publisher, ("commit", "-m", "advance child pin"))
             fixture.push(parent_publisher)
             fixture.detach(fixture.submodule)
+            fixture.create_branch(fixture.submodule, "victim", "HEAD")
+            fixture._run(
+                fixture.submodule,
+                (
+                    "config",
+                    "--replace-all",
+                    "remote.origin.fetch",
+                    "+refs/heads/main:refs/remotes/origin/main",
+                ),
+            )
+            fixture._run(
+                fixture.submodule,
+                (
+                    "config",
+                    "--add",
+                    "remote.origin.fetch",
+                    "+refs/heads/main:refs/heads/victim",
+                ),
+            )
             fixture._run(fixture.submodule, ("config", "fetch.recurseSubmodules", "true"))
             git = RecordingGit()
+            child_heads = self._heads(fixture.submodule)
 
             facts = DataInfraAdapter.for_workspace(
                 config_for(fixture), git
@@ -144,53 +174,65 @@ class DataInfraAdapterCollectionTest(unittest.TestCase):
             self.assertTrue(
                 all("--no-recurse-submodules" in args for args in exact_fetches)
             )
+            self.assertEqual(self._heads(fixture.submodule), child_heads)
+            self.assertTrue(all("--refmap=" in args for args in exact_fetches))
 
     def test_fresh_fetch_ignores_remote_refspecs_that_write_local_heads(self):
         """防止恶意 remote.fetch 在计划阶段改写父仓或子仓本地分支。"""
         with tempfile.TemporaryDirectory() as temp_dir:
             fixture = CompositeFixture.create(Path(temp_dir))
-            fixture.create_branch(fixture.parent, "victim", fixture.target_parent)
-            fixture.create_branch(fixture.submodule, "victim", fixture.target_pin)
+            initial_parent = fixture.target_parent
+            initial_pin = fixture.target_pin
+            fixture.create_branch(fixture.parent, "victim", initial_parent)
+            fixture.create_branch(fixture.submodule, "victim", initial_pin)
+            target = fixture.update_target_pin()
+            target_pin = fixture.target_pin
+            for repository, initial in (
+                (fixture.parent, initial_parent),
+                (fixture.submodule, initial_pin),
+            ):
+                fixture._run(repository, ("reset", "--hard", initial))
+                fixture._run(
+                    repository,
+                    ("update-ref", "refs/remotes/origin/main", initial),
+                )
 
-            parent_publisher = fixture.clone_parent("parent publisher")
-            fixture.create_branch(parent_publisher, "victim", "HEAD")
-            fixture.switch(parent_publisher, "victim")
-            fixture.commit_file(parent_publisher, "victim.txt", "remote\n", "advance victim")
-            fixture._run(parent_publisher, ("push", "origin", "victim"))
-            fixture.switch(parent_publisher, "main")
-            target = fixture.commit_file(
-                parent_publisher, "target.txt", "target\n", "advance main"
-            )
-            fixture.push(parent_publisher)
-
-            child_publisher = fixture.root / "child publisher"
-            fixture._run(
-                fixture.root,
-                ("clone", str(fixture.submodule_remote), str(child_publisher)),
-            )
-            fixture._configure_user(child_publisher)
-            fixture.create_branch(child_publisher, "victim", "HEAD")
-            fixture.switch(child_publisher, "victim")
-            fixture.commit_file(child_publisher, "victim.txt", "remote\n", "advance victim")
-            fixture._run(child_publisher, ("push", "origin", "victim"))
-
-            malicious = "+refs/heads/victim:refs/heads/victim"
+            malicious = "+refs/heads/main:refs/heads/victim"
             for repository in (fixture.parent, fixture.submodule):
                 fixture._run(
                     repository,
-                    ("config", "--replace-all", "remote.origin.fetch", malicious),
+                    (
+                        "config",
+                        "--replace-all",
+                        "remote.origin.fetch",
+                        "+refs/heads/main:refs/remotes/origin/main",
+                    ),
+                )
+                fixture._run(
+                    repository,
+                    ("config", "--add", "remote.origin.fetch", malicious),
                 )
             parent_heads = self._heads(fixture.parent)
             child_heads = self._heads(fixture.submodule)
-            git = Git()
+            git = RecordingGit()
 
             facts = DataInfraAdapter.for_workspace(
                 config_for(fixture), git
             ).collect_plan_facts(git, fresh=True)
 
             self.assertEqual(facts.target_parent, target)
+            self.assertEqual(
+                fixture.rev_parse(fixture.parent, "refs/remotes/origin/main"), target
+            )
+            self.assertEqual(
+                fixture.rev_parse(fixture.submodule, "refs/remotes/origin/main"),
+                target_pin,
+            )
             self.assertEqual(self._heads(fixture.parent), parent_heads)
             self.assertEqual(self._heads(fixture.submodule), child_heads)
+            fetches = [args for _, args in git.calls if args and args[0] == "fetch"]
+            self.assertTrue(fetches)
+            self.assertTrue(all("--refmap=" in args for args in fetches))
 
     def test_offline_uses_local_target_without_fetch_and_fresh_fetches_before_target(self):
         """防止 offline 访问网络，并防止 fresh 使用 fetch 前的目标引用。"""
@@ -217,14 +259,26 @@ class DataInfraAdapterCollectionTest(unittest.TestCase):
             self.assertEqual(fresh.parent.behind, 1)
             fetches = [args for _, args in git.calls if args and args[0] == "fetch"]
             self.assertEqual(
-                fetches[0][:4],
-                ("fetch", "--prune", "--no-recurse-submodules", "--"),
+                fetches[0][:5],
+                (
+                    "fetch",
+                    "--prune",
+                    "--no-recurse-submodules",
+                    "--refmap=",
+                    "--",
+                ),
             )
-            self.assertEqual(fetches[0][4], "origin")
-            self.assertTrue(fetches[0][5].endswith(":refs/remotes/origin/main"))
+            self.assertEqual(fetches[0][5], "origin")
+            self.assertTrue(fetches[0][6].endswith(":refs/remotes/origin/main"))
             self.assertEqual(
-                fetches[1][:4],
-                ("fetch", "--prune", "--no-recurse-submodules", "--"),
+                fetches[1][:5],
+                (
+                    "fetch",
+                    "--prune",
+                    "--no-recurse-submodules",
+                    "--refmap=",
+                    "--",
+                ),
             )
             parent_fetch = next(
                 index
@@ -447,6 +501,7 @@ class DataInfraAdapterLayoutTest(unittest.TestCase):
             "duplicate-url",
             "missing-path",
             "missing-url",
+            "split-section",
         )
         for side in ("current", "target"):
             for case in cases:
@@ -622,6 +677,13 @@ class DataInfraAdapterLayoutTest(unittest.TestCase):
             lines = [line for line in lines if not line.strip().startswith("path =")]
         elif case == "missing-url":
             lines = [line for line in lines if not line.strip().startswith("url =")]
+        elif case == "split-section":
+            url_index = next(
+                index
+                for index, line in enumerate(lines)
+                if line.strip().startswith("url =")
+            )
+            lines.insert(url_index, lines[0])
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -644,7 +706,7 @@ class DataInfraAdapterManagedPatchTest(unittest.TestCase):
             ).collect_plan_facts(git, fresh=True)
             result = plan_sync(facts)
 
-            self.assertTrue(facts.global_managed_patch_transition)
+            self.assertTrue(facts.managed_patch_transition)
             self.assertEqual(result.state, "blocked")
             self.assertIn("managed_patch_transition_required", result.reason_codes)
             self.assertEqual(result.next_actions, ())
