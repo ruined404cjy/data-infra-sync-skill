@@ -212,6 +212,14 @@ class DataInfraAdapterCollectionTest(unittest.TestCase):
                     repository,
                     ("config", "--add", "remote.origin.fetch", malicious),
                 )
+                fixture._run(
+                    repository,
+                    (
+                        "symbolic-ref",
+                        "refs/remotes/origin/main",
+                        "refs/heads/victim",
+                    ),
+                )
             parent_heads = self._heads(fixture.parent)
             child_heads = self._heads(fixture.submodule)
             git = RecordingGit()
@@ -230,6 +238,13 @@ class DataInfraAdapterCollectionTest(unittest.TestCase):
             )
             self.assertEqual(self._heads(fixture.parent), parent_heads)
             self.assertEqual(self._heads(fixture.submodule), child_heads)
+            for repository in (fixture.parent, fixture.submodule):
+                symbolic = git.run(
+                    repository,
+                    ("symbolic-ref", "--quiet", "refs/remotes/origin/main"),
+                    check=False,
+                )
+                self.assertEqual(symbolic.returncode, 1)
             fetches = [args for _, args in git.calls if args and args[0] == "fetch"]
             self.assertTrue(fetches)
             self.assertTrue(all("--refmap=" in args for args in fetches))
@@ -258,28 +273,16 @@ class DataInfraAdapterCollectionTest(unittest.TestCase):
             self.assertEqual(fresh.target_parent, target)
             self.assertEqual(fresh.parent.behind, 1)
             fetches = [args for _, args in git.calls if args and args[0] == "fetch"]
-            self.assertEqual(
-                fetches[0][:5],
-                (
-                    "fetch",
-                    "--prune",
-                    "--no-recurse-submodules",
-                    "--refmap=",
-                    "--",
-                ),
+            tracking_fetch = (
+                "fetch",
+                "--no-recurse-submodules",
+                "--refmap=",
+                "--",
+                "origin",
+                "refs/heads/main",
             )
-            self.assertEqual(fetches[0][5], "origin")
-            self.assertTrue(fetches[0][6].endswith(":refs/remotes/origin/main"))
-            self.assertEqual(
-                fetches[1][:5],
-                (
-                    "fetch",
-                    "--prune",
-                    "--no-recurse-submodules",
-                    "--refmap=",
-                    "--",
-                ),
-            )
+            self.assertEqual(fetches[0], tracking_fetch)
+            self.assertEqual(fetches[1], tracking_fetch)
             parent_fetch = next(
                 index
                 for index, (repo, args) in enumerate(git.calls)
@@ -492,6 +495,51 @@ class SubmoduleUrlTest(unittest.TestCase):
 
 
 class DataInfraAdapterLayoutTest(unittest.TestCase):
+    def test_current_and_target_accept_section_keyword_case_and_escaped_names(self):
+        """防止 section 关键字大小写改变 name 的原始 quoted 语义。"""
+        cases = (
+            ('[Submodule "component"]', "component"),
+            (
+                r'[submodule "component\"quoted\\path"]',
+                'component"quoted\\path',
+            ),
+        )
+        for side in ("current", "target"):
+            for header, expected_name in cases:
+                with self.subTest(side=side, header=header):
+                    with tempfile.TemporaryDirectory() as temp_dir:
+                        fixture = CompositeFixture.create(Path(temp_dir))
+                        repository = (
+                            fixture.parent
+                            if side == "current"
+                            else fixture.clone_parent("publisher")
+                        )
+                        modules = repository / ".gitmodules"
+                        lines = modules.read_text(encoding="utf-8").splitlines()
+                        lines[0] = header
+                        modules.write_text(
+                            "\n".join(lines) + "\n",
+                            encoding="utf-8",
+                        )
+                        fixture._run(repository, ("add", ".gitmodules"))
+                        fixture._run(
+                            repository, ("commit", "-m", "quote section name")
+                        )
+                        if side == "target":
+                            fixture.push(repository)
+                            fixture.fetch(fixture.parent)
+
+                        facts = DataInfraAdapter.for_workspace(
+                            config_for(fixture), Git()
+                        ).collect_plan_facts(Git(), fresh=False)
+
+                        specs = (
+                            facts.current_submodules
+                            if side == "current"
+                            else facts.target_submodules
+                        )
+                        self.assertEqual(specs[0].name, expected_name)
+
     def test_current_and_target_reject_incomplete_or_duplicate_gitmodules_fields(self):
         """防止任一父提交的空、缺失或重复声明被部分解析。"""
         cases = (

@@ -531,19 +531,7 @@ def _validate_target_ref(git, root, target_ref, remote):
 def _fetch_parent_target(git, root, remote, branch, target_ref):
     """仅将目标父仓分支更新到指定远程跟踪引用。"""
     source = "refs/heads/{}".format(branch)
-    _require_valid_ref(git, root, source)
-    git.run(
-        root,
-        (
-            "fetch",
-            "--prune",
-            "--no-recurse-submodules",
-            "--refmap=",
-            "--",
-            remote,
-            "+{}:{}".format(source, target_ref),
-        ),
-    )
+    _fetch_tracking_ref(git, root, remote, source, target_ref)
 
 
 def _fetch_submodule_upstream(git, repository):
@@ -581,9 +569,11 @@ def _fetch_submodule_upstream(git, repository):
         return
     if not source.startswith("refs/heads/"):
         raise GitError(("git", "fetch"), "unsafe submodule upstream", 2)
+    local_branch = "refs/heads/{}".format(name)
+    _require_valid_ref(git, repository, local_branch)
     upstream = git.run(
         repository,
-        ("rev-parse", "--symbolic-full-name", "@{upstream}"),
+        ("for-each-ref", "--format=%(upstream)", local_branch),
         check=False,
     )
     if upstream.returncode != 0:
@@ -595,20 +585,35 @@ def _fetch_submodule_upstream(git, repository):
     destination = upstream.stdout.strip()
     if not destination.startswith("refs/remotes/"):
         raise GitError(("git", "fetch"), "unsafe submodule upstream", 2)
+    _fetch_tracking_ref(git, repository, remote_name, source, destination)
+
+
+def _fetch_tracking_ref(git, repository, remote, source, destination):
+    """只抓取 source，再以不解引用方式原子更新安全 tracking ref。"""
     _require_valid_ref(git, repository, source)
     _require_valid_ref(git, repository, destination)
     git.run(
         repository,
         (
             "fetch",
-            "--prune",
             "--no-recurse-submodules",
             "--refmap=",
             "--",
-            remote_name,
-            "+{}:{}".format(source, destination),
+            remote,
+            source,
         ),
     )
+    fetched = git.run(
+        repository, ("rev-parse", "--verify", "FETCH_HEAD^{commit}")
+    )
+    commit = fetched.stdout.strip()
+    if not commit:
+        raise GitError(
+            tuple(str(item) for item in fetched.args),
+            "empty fetched commit",
+            2,
+        )
+    git.run(repository, ("update-ref", "--no-deref", destination, commit))
 
 
 def _require_valid_ref(git, repository, ref):
@@ -707,7 +712,8 @@ def _submodules_at(git, parent, commit):
 
 
 _SUBMODULE_SECTION = re.compile(
-    r'^\s*\[\s*submodule\s+"((?:[^"\\]|\\["\\])*)"\s*\]\s*(?:[#;].*)?$'
+    r'^\s*\[\s*submodule\s+"((?:[^"\\]|\\["\\])*)"\s*\]\s*(?:[#;].*)?$',
+    re.IGNORECASE,
 )
 
 
