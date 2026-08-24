@@ -19,10 +19,18 @@ from data_infra_sync.verify import InstallIdentity, collect_install_identity, ve
 
 
 def _git(repo, *args):
+    env = None
+    if args[0] == "commit":
+        env = os.environ.copy()
+        env.update({
+            "GIT_AUTHOR_DATE": "2000-01-01T00:00:00+00:00",
+            "GIT_COMMITTER_DATE": "2000-01-01T00:00:00+00:00",
+        })
     return subprocess.run(
         ("git",) + args,
         cwd=str(repo),
         check=True,
+        env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
