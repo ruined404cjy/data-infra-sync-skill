@@ -23,7 +23,7 @@
 $XDG_CONFIG_HOME/data-infra-sync-skill/<workspace-key>.conf
 ```
 
-`XDG_CONFIG_HOME` 缺省为 `~/.config`，`XDG_STATE_HOME` 缺省为 `~/.local/state`。显式配置文件缺失与默认配置文件缺失均返回 `unconfigured`、退出 2 和 `init` action。
+`XDG_CONFIG_HOME` 缺省为 `~/.config`，`XDG_STATE_HOME` 缺省为 `~/.local/state`。除 `init` 外，显式配置文件缺失与默认配置文件缺失均返回 `unconfigured`、退出 2 和 `init` action。
 
 在现有 checkout 中初始化：
 

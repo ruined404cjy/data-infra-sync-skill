@@ -78,6 +78,20 @@ validate_target() {
     fi
 }
 
+validate_parent_path() {
+    local parent_path next_parent
+    parent_path="$(dirname -- "$1")"
+    while true; do
+        if { [ -e "$parent_path" ] || [ -L "$parent_path" ]; } && [ ! -d "$parent_path" ]; then
+            echo "ERROR: install parent is not a directory: $parent_path" >&2
+            exit 1
+        fi
+        next_parent="$(dirname -- "$parent_path")"
+        [ "$next_parent" != "$parent_path" ] || break
+        parent_path="$next_parent"
+    done
+}
+
 install_link() {
     source="$1"
     target="$2"
@@ -90,8 +104,10 @@ install_link() {
 
 # Validate every requested destination before the first filesystem write.
 validate_target "$skill_target" "$repository_root"
+validate_parent_path "$skill_target"
 if [ "$install_bin" -eq 1 ]; then
     validate_target "$binary_target" "$cli_source"
+    validate_parent_path "$binary_target"
 fi
 
 install_link "$repository_root" "$skill_target"

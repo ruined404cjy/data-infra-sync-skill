@@ -109,6 +109,20 @@ class InstallSkillScriptTests(unittest.TestCase):
                 (home / ".local/bin/data-infra-sync").resolve(), CLI.resolve()
             )
 
+    def test_parent_file_conflict_is_preserved_before_any_install(self):
+        """防止链接父路径冲突时留下另一目标的半安装。"""
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            parent_conflict = home / ".local"
+            parent_conflict.write_text("keep\n", encoding="utf-8")
+
+            completed = self.run_installer(home, "--host", "codex", "--bin")
+
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn(str(parent_conflict), completed.stderr)
+            self.assertEqual(parent_conflict.read_text(encoding="utf-8"), "keep\n")
+            self.assertFalse((home / ".agents").exists())
+
     def test_skill_file_conflict_is_preserved_without_partial_bin_install(self):
         """防止 Skill 目标冲突时覆盖文件或仍创建可执行链接。"""
         with tempfile.TemporaryDirectory() as temporary:
