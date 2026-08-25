@@ -247,8 +247,8 @@ class StateStoreTest(unittest.TestCase):
             document = {
                 "format": "managed-patch-recovery-v1",
                 "workspace": "a" * 64,
-                "target_remote": "published",
-                "target_branch": "stable",
+                "target_remote": "f" * 64,
+                "target_branch": "1" * 64,
                 "source_parent": "b" * 40,
                 "target_parent": "c" * 40,
                 "target_gitlinks": {"plugins/iceberg_delta": "d" * 40},
@@ -294,8 +294,8 @@ class StateStoreTest(unittest.TestCase):
         document = {
             "format": "managed-patch-recovery-v1",
             "workspace": "a" * 64,
-            "target_remote": "origin",
-            "target_branch": "main",
+            "target_remote": "f" * 64,
+            "target_branch": "1" * 64,
             "source_parent": "b" * 40,
             "target_parent": "c" * 40,
             "target_gitlinks": {"plugins/iceberg_delta": "d" * 40},
@@ -311,6 +311,8 @@ class StateStoreTest(unittest.TestCase):
         }
         cases = (
             {**document, "token": "secret"},
+            {**document, "target_remote": "origin"},
+            {**document, "target_branch": "main"},
             {
                 **document,
                 "patches": [{**document["patches"][0], "content": "patch bytes"}],

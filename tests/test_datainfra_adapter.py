@@ -891,27 +891,30 @@ class DataInfraAdapterManagedPatchTest(unittest.TestCase):
                 )
                 self.assertFalse(recovery_path.exists())
 
-    def test_environment_config_partial_action_converges_in_new_process(self):
-        """防止环境配置被审计脱敏改写后使跨进程恢复 Action 阻塞。"""
+    def test_credential_shaped_config_uses_hashed_recovery_identity(self):
+        """防止可用 Git identity 携带凭据文本进入恢复文件。"""
         with tempfile.TemporaryDirectory(prefix="managed patch process ") as temp_dir:
             fixture, patch_content = self._delta_fixture(Path(temp_dir))
+            secret_value = "round" + "-two-private-value"
+            target_remote = "pass" + "word=" + secret_value
+            target_branch = "tok" + "en=" + secret_value
             fixture._run(
                 fixture.parent,
-                ("remote", "add", "published", str(fixture.parent_remote)),
+                ("remote", "add", target_remote, str(fixture.parent_remote)),
             )
-            fixture._run(fixture.parent, ("switch", "-c", "stable"))
+            fixture._run(fixture.parent, ("switch", "-c", target_branch))
             target_parent, _ = self._advance_parent_only(fixture)
             fixture._run(
                 fixture.root / "publisher",
-                ("push", "origin", "main:stable"),
+                ("push", "origin", "main:" + target_branch),
             )
             self._apply_patch(fixture, patch_content)
             environment = dict(os.environ)
             environment.update(
                 {
                     "DATA_INFRA_SYNC_ROOT": str(fixture.parent),
-                    "DATA_INFRA_SYNC_TARGET_REMOTE": "published",
-                    "DATA_INFRA_SYNC_TARGET_BRANCH": "stable",
+                    "DATA_INFRA_SYNC_TARGET_REMOTE": target_remote,
+                    "DATA_INFRA_SYNC_TARGET_BRANCH": target_branch,
                     "XDG_CONFIG_HOME": str(fixture.root / "config-home"),
                     "XDG_STATE_HOME": str(fixture.root / "state-home"),
                     "SERVICE_TOKEN": "unrelated-recovery-secret",
@@ -950,6 +953,7 @@ class DataInfraAdapterManagedPatchTest(unittest.TestCase):
                 if recovery_path.exists()
                 else None
             )
+            recovery_bytes = recovery_path.read_bytes()
 
             bin_dir = fixture.root / "bin"
             bin_dir.mkdir()
@@ -989,10 +993,19 @@ class DataInfraAdapterManagedPatchTest(unittest.TestCase):
             self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
             self.assertIn("state: updated", resumed.stdout)
             self.assertIsNotNone(recovery_document)
-            self.assertEqual(recovery_document["target_remote"], "published")
-            self.assertEqual(recovery_document["target_branch"], "stable")
+            self.assertEqual(
+                recovery_document["target_remote"],
+                hashlib.sha256(target_remote.encode("utf-8")).hexdigest(),
+            )
+            self.assertEqual(
+                recovery_document["target_branch"],
+                hashlib.sha256(target_branch.encode("utf-8")).hexdigest(),
+            )
             self.assertEqual(recovery_document["stage"], "parent_update")
             serialized_recovery = json.dumps(recovery_document)
+            self.assertNotIn(target_remote.encode("utf-8"), recovery_bytes)
+            self.assertNotIn(target_branch.encode("utf-8"), recovery_bytes)
+            self.assertNotIn(secret_value.encode("utf-8"), recovery_bytes)
             self.assertNotIn(str(fixture.parent), serialized_recovery)
             self.assertNotIn("unrelated-recovery-secret", serialized_recovery)
             self.assertNotIn("content", recovery_document["patches"][0])
@@ -1604,8 +1617,14 @@ class DataInfraAdapterManagedPatchTest(unittest.TestCase):
             "workspace": hashlib.sha256(
                 str(fixture.parent.resolve()).encode("utf-8")
             ).hexdigest(),
-            "target_remote": "origin",
-            "target_branch": "main",
+            "target_remote": (
+                "181fdd46fc4a7246b9f4f1eba3129ba5"
+                "d724011af5f10223b3589955d1df108a"
+            ),
+            "target_branch": (
+                "0d6e4079e36703ebd37c00722f5891d2"
+                "8b0e2811dc114b129215123adcce3605"
+            ),
             "source_parent": fixture.rev_parse(fixture.parent, "HEAD"),
             "target_parent": target_parent,
             "target_gitlinks": {"plugins/iceberg_delta": target_pin},

@@ -21,6 +21,7 @@ from data_infra_sync.state import (
     ManagedPatchRecoveryCleanupError,
     ManagedPatchRecoveryValidationError,
     StateStore,
+    managed_patch_recovery_identity,
     valid_managed_patch_recovery_document,
 )
 
@@ -339,8 +340,8 @@ class DataInfraAdapter:
         document = {
             "format": MANAGED_PATCH_RECOVERY_FORMAT,
             "workspace": self._workspace_identity,
-            "target_remote": facts.target_remote,
-            "target_branch": facts.target_branch,
+            "target_remote": managed_patch_recovery_identity(facts.target_remote),
+            "target_branch": managed_patch_recovery_identity(facts.target_branch),
             "source_parent": facts.current_parent,
             "target_parent": facts.target_parent,
             "target_gitlinks": {
@@ -515,8 +516,10 @@ class DataInfraAdapter:
         expected_patches = [_managed_patch_document(item) for item in target_patches]
         if (
             document["workspace"] != self._workspace_identity
-            or document["target_remote"] != facts.target_remote
-            or document["target_branch"] != facts.target_branch
+            or document["target_remote"]
+            != managed_patch_recovery_identity(facts.target_remote)
+            or document["target_branch"]
+            != managed_patch_recovery_identity(facts.target_branch)
             or document["target_parent"] != facts.target_parent
             or document["target_gitlinks"] != target_gitlinks
             or document["patches"] != expected_patches

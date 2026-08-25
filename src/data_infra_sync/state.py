@@ -1,6 +1,7 @@
 """状态文件、审计事件和进程锁。"""
 
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -213,8 +214,8 @@ def serialize_managed_patch_recovery_document(data: Mapping[str, Any]) -> dict:
         or _OBJECT_ID.fullmatch(data["source_parent"]) is None
         or _OBJECT_ID.fullmatch(data["target_parent"]) is None
         or data["stage"] not in MANAGED_PATCH_RECOVERY_STAGES
-        or not _valid_recovery_identity(data["target_remote"])
-        or not _valid_recovery_identity(data["target_branch"])
+        or _SHA256.fullmatch(data["target_remote"]) is None
+        or _SHA256.fullmatch(data["target_branch"]) is None
     ):
         raise ValueError("invalid managed patch recovery identity")
 
@@ -277,6 +278,13 @@ def valid_managed_patch_recovery_document(data: Any) -> bool:
     except (TypeError, ValueError):
         return False
     return True
+
+
+def managed_patch_recovery_identity(value: str) -> str:
+    """返回恢复协议用的规范 UTF-8 identity 摘要。"""
+    if not isinstance(value, str) or not _valid_recovery_identity(value):
+        raise ValueError("invalid managed patch recovery identity source")
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 def _valid_recovery_identity(value: str) -> bool:
