@@ -28,6 +28,8 @@ description: Use when an existing DataInfra composite checkout needs local versi
 
 dirty 工作树、活动 Git transition、submodule 布局 transition 或受控补丁 transition 均保持现场。此流程不执行 stash、reset、commit、push、merge、rebase、分支删除或手工 submodule checkout。用户另行明确授权这些操作时，结束本流程后单独处理。
 
+连续受控补丁的 `resume_sync` 使用状态目录中的独立恢复日志，并可跨 CLI 进程执行。普通 inspect 或 plan 不清除有效日志。Agent 原样执行 Result 的恢复 argv，不读取、编辑或删除 `managed-patch-recovery.json`。`managed_patch_recovery_write_failed` 或 `managed_patch_recovery_cleanup_failed` 按 Result 的 state、退出码和恢复 Action 处理。
+
 `branch publish-check` 返回 `publish_required` 时停止并报告发布需求。返回 `waiting_for_pin` 时等待 pin 更新，再重试 publish-check；返回 `publish_verified` 后重新执行 `sync plan`。源码完成状态仅为 `updated` 或 `up_to_date`。
 
 ## 构建与部署完成

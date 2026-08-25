@@ -7,6 +7,7 @@ from data_infra_sync.fingerprint import repository_fingerprint
 from data_infra_sync.git import GitError
 from data_infra_sync.model import Action, Result
 from data_infra_sync.planner import plan_sync
+from data_infra_sync.state import ManagedPatchRecoveryCleanupError
 
 
 _EXPECTED_OPERATION_ERRORS = (GitError, OSError, RuntimeError, ValueError)
@@ -24,6 +25,14 @@ def execute_sync(
 
     try:
         facts = adapter.collect_plan_facts(git, fresh=True)
+    except ManagedPatchRecoveryCleanupError as error:
+        actual_plan = plan_sync(error.facts)
+        if error.possible_domain_writes:
+            return _partial(
+                _actual_from_plan(actual_plan),
+                "managed_patch_recovery_cleanup_failed",
+            )
+        return _failed(actual_plan, "managed_patch_recovery_cleanup_failed")
     except _EXPECTED_OPERATION_ERRORS:
         return _failed(None, "git_precondition_failed")
 
@@ -65,12 +74,34 @@ def execute_sync(
         except _EXPECTED_OPERATION_ERRORS:
             return _failed(plan, "git_precondition_failed")
         if all_applied:
+            if _has_managed_patch_recovery(adapter):
+                try:
+                    _advance_managed_patch_recovery(adapter, "postcondition")
+                except _EXPECTED_OPERATION_ERRORS:
+                    return _partial(
+                        _actual_from_plan(plan),
+                        "managed_patch_recovery_write_failed",
+                    )
+                try:
+                    _clear_managed_patch_recovery(adapter)
+                except _EXPECTED_OPERATION_ERRORS:
+                    return _partial(
+                        _actual_from_plan(plan),
+                        "managed_patch_recovery_cleanup_failed",
+                    )
             return _from_plan(plan, "updated", (), changed=False)
 
     writes_started = False
     write_attempted = False
     failure_reason = "sync_write_failed"
     before_fingerprint = _domain_fingerprint(git, adapter, facts)
+    try:
+        recovery_created = _begin_managed_patch_recovery(
+            adapter, facts, current_patches, target_patches
+        )
+    except _EXPECTED_OPERATION_ERRORS:
+        return _failed(plan, "managed_patch_recovery_write_failed")
+    recovery_active = recovery_created is not None
     try:
         # partial 重入时父仓已到目标；此时补丁已暂停，无需再次 reverse。
         if facts.current_parent != facts.target_parent:
@@ -84,6 +115,9 @@ def execute_sync(
                 elif state != "absent":
                     raise _PatchTransitionError()
 
+            failure_reason = "managed_patch_recovery_write_failed"
+            if recovery_active:
+                _advance_managed_patch_recovery(adapter, "parent_update")
             failure_reason = "parent_update_failed"
             write_attempted = True
             git.run(
@@ -92,6 +126,9 @@ def execute_sync(
             )
             writes_started = True
 
+        failure_reason = "managed_patch_recovery_write_failed"
+        if recovery_active:
+            _advance_managed_patch_recovery(adapter, "submodule_update")
         repositories = {item.path: item for item in facts.repositories}
         for target in sorted(facts.target_submodules, key=lambda item: item.path):
             repository = repositories[target.path]
@@ -111,6 +148,9 @@ def execute_sync(
                 )
             writes_started = True
 
+        failure_reason = "managed_patch_recovery_write_failed"
+        if recovery_active:
+            _advance_managed_patch_recovery(adapter, "replay")
         for patch in target_patches:
             failure_reason = "managed_patch_apply_failed"
             state = adapter.patch_state(git, patch)
@@ -121,14 +161,55 @@ def execute_sync(
             elif state != "applied":
                 raise _PatchTransitionError()
 
+        failure_reason = "managed_patch_recovery_write_failed"
+        if recovery_active:
+            _advance_managed_patch_recovery(adapter, "postcondition")
         failure_reason = "postcondition_failed"
         post_facts = adapter.collect_plan_facts(git, fresh=False)
         post_plan = plan_sync(post_facts)
         if post_plan.state != "up_to_date":
             return _partial(_actual_from_plan(post_plan), failure_reason)
+        if recovery_active:
+            try:
+                _clear_managed_patch_recovery(adapter)
+            except _EXPECTED_OPERATION_ERRORS:
+                return _partial(
+                    _actual_from_plan(post_plan),
+                    "managed_patch_recovery_cleanup_failed",
+                )
         return _from_plan(post_plan, "updated", (), changed=True)
+    except ManagedPatchRecoveryCleanupError as error:
+        return _recovery_cleanup_result(
+            error, writes_started, recovery_created
+        )
+    except _PatchTransitionError:
+        if not writes_started:
+            if recovery_created is False:
+                try:
+                    actual = _read_actual_state(git, adapter, facts, plan)
+                except ManagedPatchRecoveryCleanupError as error:
+                    return _recovery_cleanup_result(error, False, False)
+                return _partial(actual, "managed_patch_transition_required")
+            cleanup_error = _clear_write_free_recovery(
+                adapter, recovery_created
+            )
+            if cleanup_error:
+                return _failed(plan, "managed_patch_recovery_cleanup_failed")
+            return _from_plan(
+                plan, "blocked", ("managed_patch_transition_required",)
+            )
+        try:
+            actual = _read_actual_state(git, adapter, facts, plan)
+        except ManagedPatchRecoveryCleanupError as error:
+            return _recovery_cleanup_result(error, True, recovery_created)
+        return _partial(actual, "managed_patch_transition_required")
     except _EXPECTED_OPERATION_ERRORS:
-        actual = _read_actual_state(git, adapter, facts, plan)
+        try:
+            actual = _read_actual_state(git, adapter, facts, plan)
+        except ManagedPatchRecoveryCleanupError as error:
+            return _recovery_cleanup_result(
+                error, writes_started, recovery_created
+            )
         after_fingerprint = _domain_fingerprint(git, adapter, facts)
         proven_unchanged = (
             before_fingerprint is not None
@@ -136,21 +217,69 @@ def execute_sync(
             and before_fingerprint == after_fingerprint
         )
         if not writes_started and (not write_attempted or proven_unchanged):
+            if recovery_created is False:
+                return _partial(actual, failure_reason)
+            if _clear_write_free_recovery(adapter, recovery_created):
+                return _failed(plan, "managed_patch_recovery_cleanup_failed")
             return _failed(plan, failure_reason)
         return _partial(actual, failure_reason)
-    except _PatchTransitionError:
-        if not writes_started:
-            return _from_plan(
-                plan, "blocked", ("managed_patch_transition_required",)
-            )
-        return _partial(
-            _read_actual_state(git, adapter, facts, plan),
-            "managed_patch_transition_required",
-        )
 
 
 class _PatchTransitionError(RuntimeError):
     """表示执行期间补丁状态偏离已完成的写前预检。"""
+
+
+def _begin_managed_patch_recovery(adapter, facts, current, target):
+    """调用可选 Adapter 恢复日志入口，None 表示该 Adapter 不持久化。"""
+    begin = getattr(adapter, "begin_managed_patch_recovery", None)
+    if begin is None:
+        return None
+    return begin(facts, current, target)
+
+
+def _advance_managed_patch_recovery(adapter, stage) -> None:
+    """推进可选 Adapter 恢复日志阶段。"""
+    advance = getattr(adapter, "advance_managed_patch_recovery", None)
+    if advance is not None:
+        advance(stage)
+
+
+def _clear_managed_patch_recovery(adapter) -> None:
+    """清理可选 Adapter 恢复日志。"""
+    clear = getattr(adapter, "clear_managed_patch_recovery", None)
+    if clear is not None:
+        clear()
+
+
+def _has_managed_patch_recovery(adapter) -> bool:
+    """判断 Adapter 本次采集是否加载了有效恢复日志。"""
+    check = getattr(adapter, "has_managed_patch_recovery", None)
+    return bool(check is not None and check())
+
+
+def _clear_write_free_recovery(adapter, recovery_created) -> bool:
+    """清理本次新建且尚未伴随领域写入的日志，返回是否清理失败。"""
+    if recovery_created is not True:
+        return False
+    try:
+        _clear_managed_patch_recovery(adapter)
+    except _EXPECTED_OPERATION_ERRORS:
+        return True
+    return False
+
+
+def _recovery_cleanup_result(error, writes_started, recovery_created):
+    """按已知领域写入边界返回恢复日志清理失败结果。"""
+    actual_plan = plan_sync(error.facts)
+    possible_writes = writes_started or recovery_created is False
+    if recovery_created is None:
+        possible_writes = writes_started or error.possible_domain_writes
+    if possible_writes:
+        return _partial(
+            _actual_from_plan(actual_plan),
+            "managed_patch_recovery_cleanup_failed",
+        )
+    return _failed(actual_plan, "managed_patch_recovery_cleanup_failed")
 
 
 def _continuous_declarations(current, target) -> bool:
@@ -183,6 +312,8 @@ def _read_actual_state(git, adapter, facts, before_plan):
         actual_plan = plan_sync(actual_facts)
         actual = _actual_from_plan(actual_plan)
         return actual
+    except ManagedPatchRecoveryCleanupError:
+        raise
     except _EXPECTED_OPERATION_ERRORS:
         return _read_repositories_individually(git, adapter, facts, before_plan)
 

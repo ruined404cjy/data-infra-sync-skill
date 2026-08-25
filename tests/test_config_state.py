@@ -239,6 +239,34 @@ class WorkspaceConfigTest(unittest.TestCase):
 
 
 class StateStoreTest(unittest.TestCase):
+    def test_managed_patch_recovery_is_independent_atomic_and_clearable(self):
+        """防止恢复资格依赖 latest.json 或留下半写状态。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            store = StateStore(root)
+            document = {
+                "format": "managed-patch-recovery-v1",
+                "workspace": "a" * 64,
+                "stage": "reversing",
+            }
+            result = Result(
+                "inspect", "up_to_date", (), None, (), False, (), None, False
+            )
+
+            store.write_managed_patch_recovery(document)
+            store.write_latest(result)
+
+            self.assertEqual(store.read_managed_patch_recovery(), document)
+            self.assertEqual(
+                json.loads((root / "latest.json").read_text(encoding="utf-8"))["state"],
+                "up_to_date",
+            )
+            self.assertEqual(list(root.glob("*.tmp")), [])
+
+            store.clear_managed_patch_recovery()
+
+            self.assertIsNone(store.read_managed_patch_recovery())
+
     def test_latest_replaces_atomically_without_temporary_files(self):
         """防止状态写入留下可被后续读取器误判的临时 JSON。"""
         with tempfile.TemporaryDirectory() as temp_dir:

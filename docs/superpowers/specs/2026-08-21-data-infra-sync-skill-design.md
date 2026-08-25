@@ -115,6 +115,8 @@ JSON 固定字段为：
 
 snapshot 是影响计划操作的规范化 JSON 的 SHA-256，输入包含目标父仓和 gitlink、当前 HEAD、index 与工作树状态、分支关系和受控补丁状态，不包含时间戳与输出格式。`sync apply --snapshot <hash>` fresh fetch 后重新计算完整计划，并与调用方提供的 snapshot 比对；不一致时返回 2，不修改工作树和本地分支。`sync apply --non-interactive` 在同一进程锁内生成计划、复检并应用，不接收外部 snapshot。通过后暂停连续受控补丁、fast-forward 父仓、checkout 精确 gitlink、重放补丁并执行后置校验。中途失败不自动回滚，返回 `partial` 和实际 HEAD、已完成项、未完成项及结构化恢复操作。同一命令可重入执行并继续收敛。
 
+连续补丁同步在首次 reverse 前原子写入独立恢复日志，并按 `reversing`、`parent_update`、`submodule_update`、`replay`、`postcondition` 单调推进。日志绑定工作区标识哈希、目标 remote/branch、源和目标父仓、目标 gitlink 及有序补丁声明。恢复只接受与当前父仓、gitlink、无额外修改的有序补丁前缀和记录阶段一致的现场。日志缺失、失配或格式错误不授予 clean/absent 工作树恢复资格；失配日志清理后按普通 transition 阻塞。阶段写入失败保留上一阶段，成功后清理日志。清理失败显式返回失败或 `partial`，不返回成功状态。
+
 ## 8. 受控构建补丁
 
 DataInfra 适配器声明父仓补丁文件、目标 submodule、适用路径和构建入口引用。自动重放同时要求：
@@ -124,7 +126,7 @@ DataInfra 适配器声明父仓补丁文件、目标 submodule、适用路径和
 - 当前 dirty diff 通过反向应用检查，且不含其他改动。
 - 目标 pin 可以应用该补丁，或已包含等价内容。
 
-补丁新增、删除、内容变化、适用路径变化或目标无法应用时，返回 `managed_patch_transition_required` 并保留现场。
+补丁新增、删除、内容变化、适用路径变化或目标无法应用时，返回 `managed_patch_transition_required` 并保留现场。fresh clean/absent 工作树保持 transition；有效恢复日志允许继续已暂停的补丁序列。目标父仓和全部 gitlink 已精确到位且 clean 目标内容已等价包含完整补丁序列时，同步返回 `updated`，不重放补丁。
 
 ## 9. DataInfra 安装身份
 
@@ -145,7 +147,7 @@ $XDG_CONFIG_HOME/data-infra-sync-skill/<workspace>.conf
 $XDG_STATE_HOME/data-infra-sync-skill/<workspace>/
 ```
 
-状态目录保存原子替换的 `latest.json`、追加写入的 `events.jsonl`、安装 manifest 和 `flock` 锁。持久化输出使用逻辑仓库路径，不记录 token、credential helper 输出、带 userinfo 的 remote URL 和环境变量值。
+状态目录保存原子替换的 `latest.json`、追加写入的 `events.jsonl`、安装 manifest、`managed-patch-recovery.json` 和 `flock` 锁。恢复日志独立于审计结果，普通 inspect 或 plan 覆盖 `latest.json` 不影响恢复；日志不记录时间戳、凭据、补丁字节或绝对 checkout 路径。持久化输出使用逻辑仓库路径，不记录 token、credential helper 输出、带 userinfo 的 remote URL 和环境变量值。
 
 ## 11. Skill 与发布
 

@@ -12,9 +12,11 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from data_infra_sync.adapters.datainfra import DataInfraAdapter, ManagedPatch
+from data_infra_sync.cli import _exit_code
 from data_infra_sync.executor import _domain_fingerprint, execute_sync
 from data_infra_sync.git import Git, GitError, RepoFacts
 from data_infra_sync.planner import PlanFacts, RepositoryPlanFacts, SubmoduleSpec, snapshot_for
+from data_infra_sync.state import ManagedPatchRecoveryCleanupError
 from tests.git_fixture import CompositeFixture
 
 
@@ -668,6 +670,146 @@ class ExecutorPreflightTest(unittest.TestCase):
 
 
 class ExecutorWriteTest(unittest.TestCase):
+    def test_postcondition_recovery_cleanup_failure_is_explicit_partial(self):
+        """防止后置采集的恢复日志清理失败被通用异常改写原因。"""
+        git = RecordingGit()
+        patch = managed_patch()
+        adapter = ScriptedAdapter(git, (patch,), (patch,))
+        original_collect = adapter.collect_plan_facts
+        collections = [0]
+
+        def collect(runtime_git, *, fresh):
+            facts = original_collect(runtime_git, fresh=fresh)
+            collections[0] += 1
+            if collections[0] == 2:
+                raise ManagedPatchRecoveryCleanupError(facts, True)
+            return facts
+
+        adapter.collect_plan_facts = collect
+
+        result = execute_sync(git, adapter, None, True)
+
+        self.assertEqual((result.state, result.changed), ("partial", True))
+        self.assertEqual(
+            result.reason_codes, ("managed_patch_recovery_cleanup_failed",)
+        )
+        self.assertEqual(_exit_code(result), 4)
+        self.assertEqual(result.next_actions[0].kind, "resume_sync")
+
+    def test_actual_read_recovery_cleanup_failure_is_explicit_partial(self):
+        """防止失败后的实际状态重读吞掉恢复日志清理失败。"""
+        git = RecordingGit()
+        patch = managed_patch()
+        adapter = ScriptedAdapter(git, (patch,), (patch,))
+        original_collect = adapter.collect_plan_facts
+        collections = [0]
+
+        def collect(runtime_git, *, fresh):
+            facts = original_collect(runtime_git, fresh=fresh)
+            collections[0] += 1
+            if collections[0] == 2:
+                raise GitError(("git", "status"), "injected postcondition", 1)
+            if collections[0] == 3:
+                raise ManagedPatchRecoveryCleanupError(facts, True)
+            return facts
+
+        adapter.collect_plan_facts = collect
+
+        result = execute_sync(git, adapter, None, True)
+
+        self.assertEqual((result.state, result.changed), ("partial", True))
+        self.assertEqual(
+            result.reason_codes, ("managed_patch_recovery_cleanup_failed",)
+        )
+        self.assertEqual(_exit_code(result), 4)
+        self.assertEqual(result.next_actions[0].kind, "resume_sync")
+
+    def test_recovery_write_failure_before_domain_write_is_failed(self):
+        """防止恢复日志创建失败后仍开始领域写入或误报 partial。"""
+        git = RecordingGit()
+        patch = managed_patch()
+        adapter = ScriptedAdapter(git, (patch,), (patch,))
+
+        def fail_recovery_write(facts, current_patches, target_patches):
+            raise OSError("state storage unavailable")
+
+        adapter.begin_managed_patch_recovery = fail_recovery_write
+
+        result = execute_sync(git, adapter, None, True)
+
+        self.assertEqual((result.state, result.changed), ("failed", False))
+        self.assertEqual(
+            result.reason_codes, ("managed_patch_recovery_write_failed",)
+        )
+        self.assertEqual(_exit_code(result), 3)
+        self.assertEqual(git.writes, [])
+        self.assertEqual(adapter.operations, [])
+
+    def test_invalid_patch_state_before_first_write_is_blocked_transition(self):
+        """防止写前 transition 被 RuntimeError 通用分支误报为 failed。"""
+        git = RecordingGit()
+        patch = managed_patch()
+        adapter = ScriptedAdapter(git, (patch,), (patch,))
+        adapter.patch_state = lambda runtime_git, declaration: "invalid"
+
+        result = execute_sync(git, adapter, None, True)
+
+        self.assertEqual((result.state, result.changed), ("blocked", False))
+        self.assertEqual(
+            result.reason_codes, ("managed_patch_transition_required",)
+        )
+        self.assertEqual(_exit_code(result), 2)
+        self.assertEqual(git.writes, [])
+        self.assertEqual(adapter.operations, [])
+
+    def test_invalid_patch_state_with_existing_recovery_is_partial_transition(self):
+        """防止既有恢复日志所代表的领域写入被本次零写入误报为 blocked。"""
+        git = RecordingGit()
+        patch = managed_patch()
+        adapter = ScriptedAdapter(git, (patch,), (patch,))
+        adapter.begin_managed_patch_recovery = (
+            lambda facts, current_patches, target_patches: False
+        )
+        adapter.patch_state = lambda runtime_git, declaration: "invalid"
+
+        result = execute_sync(git, adapter, None, True)
+
+        self.assertEqual((result.state, result.changed), ("partial", True))
+        self.assertEqual(
+            result.reason_codes, ("managed_patch_transition_required",)
+        )
+        self.assertEqual(_exit_code(result), 4)
+        self.assertEqual(result.next_actions[0].kind, "resume_sync")
+        self.assertEqual(git.writes, [])
+        self.assertEqual(adapter.operations, [])
+
+    def test_invalid_patch_state_after_first_write_is_partial_transition(self):
+        """防止写后 transition 丢失实际状态与可执行恢复 Action。"""
+        git = RecordingGit()
+        patch = managed_patch()
+        adapter = ScriptedAdapter(git, (patch,), (patch,))
+        original_state = adapter.patch_state
+
+        def patch_state(runtime_git, declaration):
+            if runtime_git.parent_head == TARGET_PARENT:
+                return "invalid"
+            return original_state(runtime_git, declaration)
+
+        adapter.patch_state = patch_state
+
+        result = execute_sync(git, adapter, None, True)
+
+        self.assertEqual((result.state, result.changed), ("partial", True))
+        self.assertEqual(
+            result.reason_codes, ("managed_patch_transition_required",)
+        )
+        self.assertEqual(_exit_code(result), 4)
+        self.assertEqual(result.repositories[0]["head"], TARGET_PARENT)
+        self.assertEqual(
+            result.next_actions[0].argv,
+            ("data-infra-sync", "sync", "apply", "--non-interactive"),
+        )
+
     def test_postcondition_os_error_after_parent_update_is_partial(self):
         git = RecordingGit()
         git.patch_applied = False
@@ -688,11 +830,12 @@ class ExecutorWriteTest(unittest.TestCase):
         self.assertEqual(result.repositories[0]["head"], TARGET_PARENT)
         self.assertEqual(result.next_actions[0].argv, ("data-infra-sync", "sync", "apply", "--non-interactive"))
 
-    def test_postcondition_decode_value_error_after_write_is_partial(self):
+    def test_postcondition_expected_errors_after_write_are_partial(self):
         """防止写后事实解码失败越过 Executor 并被 CLI 误报为写前失败。"""
         for error in (
             UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid byte"),
             ValueError("invalid collected value"),
+            RuntimeError("invalid runtime state"),
         ):
             with self.subTest(error=type(error).__name__):
                 git = RecordingGit()

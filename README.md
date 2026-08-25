@@ -54,6 +54,8 @@ data-infra-sync --format json sync plan
 
 `update_ready` 时将 Result 的 `next_actions[].argv` 作为参数数组直接执行。snapshot apply 与 `--non-interactive` 严格二选一。源码到达 `updated` 或 `up_to_date` 后，按 [DataInfra 构建与安装核验](references/datainfra-build-and-verify.md) 完成部署检查。
 
+连续受控补丁同步使用状态目录中的独立恢复日志。`partial` 后原样执行 Result 的 `resume_sync` argv；普通 inspect 或 plan 可以覆盖最近审计结果，不影响恢复资格。恢复日志由 CLI 在 workspace lock 内原子维护，调用方不编辑或删除。fresh clean/absent、失配或陈旧日志继续返回 `managed_patch_transition_required`。
+
 配置键与优先级见 [配置参考](references/configuration.md)。明确的无人值守任务见 [调度示例](references/scheduler-examples.md)。
 
 ## 开发

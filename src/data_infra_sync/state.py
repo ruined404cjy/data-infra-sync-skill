@@ -21,6 +21,7 @@ _SENSITIVE_ASSIGNMENT = re.compile(
 _SENSITIVE_KEY = re.compile(_SENSITIVE_WORDS, re.IGNORECASE)
 _SENSITIVE_ENV_NAME = re.compile(_SENSITIVE_WORDS, re.IGNORECASE)
 _REDACTED = "[REDACTED]"
+_MANAGED_PATCH_RECOVERY = "managed-patch-recovery.json"
 _TOP_LEVEL_PROTOCOL_FIELDS = frozenset(
     {
         "schema_version",
@@ -39,6 +40,15 @@ _REPOSITORY_PROTOCOL_FIELDS = frozenset(
     {"role", "head", "target_pin", "ahead", "behind", "worktree", "relation", "reason_codes"}
 )
 _TARGET_PROTOCOL_FIELDS = frozenset({"parent_commit", "gitlinks"})
+
+
+class ManagedPatchRecoveryCleanupError(RuntimeError):
+    """携带恢复日志清理失败时已经完成采集的实际 facts。"""
+
+    def __init__(self, facts, possible_domain_writes):
+        super().__init__("managed patch recovery cleanup failed")
+        self.facts = facts
+        self.possible_domain_writes = possible_domain_writes
 
 
 class StateStore:
@@ -64,6 +74,27 @@ class StateStore:
         """原子替换脱敏后的安装身份 manifest。"""
         self._write_json("manifest.json", data)
 
+    def read_managed_patch_recovery(self):
+        """读取独立补丁恢复日志；文件不存在时返回 None。"""
+        path = self.state_dir / _MANAGED_PATCH_RECOVERY
+        try:
+            with path.open("r", encoding="utf-8") as source:
+                return json.load(source)
+        except FileNotFoundError:
+            return None
+
+    def write_managed_patch_recovery(self, data: Mapping[str, Any]) -> None:
+        """原子替换受控补丁恢复日志。"""
+        self._write_json(_MANAGED_PATCH_RECOVERY, data, sync_directory=True)
+
+    def clear_managed_patch_recovery(self) -> None:
+        """删除受控补丁恢复日志并持久化目录项。"""
+        try:
+            (self.state_dir / _MANAGED_PATCH_RECOVERY).unlink()
+        except FileNotFoundError:
+            return
+        self._sync_state_dir()
+
     @contextmanager
     def lock(self) -> Iterator[None]:
         """获取非阻塞的工作区进程锁，冲突时抛出 BlockingIOError。"""
@@ -76,7 +107,9 @@ class StateStore:
             finally:
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
-    def _write_json(self, name: str, data: Any) -> None:
+    def _write_json(
+        self, name: str, data: Any, *, sync_directory: bool = False
+    ) -> None:
         """以临时文件和 replace 原子写入一份脱敏 JSON。"""
         self._ensure_state_dir()
         temporary_name = None
@@ -95,6 +128,8 @@ class StateStore:
                 os.fsync(temporary.fileno())
             os.replace(temporary_name, self.state_dir / name)
             temporary_name = None
+            if sync_directory:
+                self._sync_state_dir()
         finally:
             if temporary_name is not None:
                 Path(temporary_name).unlink(missing_ok=True)
@@ -102,6 +137,14 @@ class StateStore:
     def _ensure_state_dir(self) -> None:
         """创建状态目录，使首次命令也可记录状态。"""
         self.state_dir.mkdir(parents=True, exist_ok=True)
+
+    def _sync_state_dir(self) -> None:
+        """同步状态目录，持久化原子替换或删除的目录项。"""
+        descriptor = os.open(str(self.state_dir), os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
 
 
 def _redact(value: Any, path: Tuple[object, ...] = ()) -> Any:
