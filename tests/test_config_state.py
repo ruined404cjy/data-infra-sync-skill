@@ -247,14 +247,36 @@ class StateStoreTest(unittest.TestCase):
             document = {
                 "format": "managed-patch-recovery-v1",
                 "workspace": "a" * 64,
+                "target_remote": "published",
+                "target_branch": "stable",
+                "source_parent": "b" * 40,
+                "target_parent": "c" * 40,
+                "target_gitlinks": {"plugins/iceberg_delta": "d" * 40},
+                "patches": [
+                    {
+                        "name": "delta-filter",
+                        "content_hash": "e" * 64,
+                        "target_submodule": "plugins/iceberg_delta",
+                        "apply_path": ".",
+                    }
+                ],
                 "stage": "reversing",
             }
             result = Result(
                 "inspect", "up_to_date", (), None, (), False, (), None, False
             )
 
-            store.write_managed_patch_recovery(document)
-            store.write_latest(result)
+            with patch.dict(
+                os.environ,
+                {
+                    "DATA_INFRA_SYNC_TARGET_REMOTE": "published",
+                    "DATA_INFRA_SYNC_TARGET_BRANCH": "stable",
+                    "SERVICE_TOKEN": "unrelated-secret",
+                },
+                clear=False,
+            ):
+                store.write_managed_patch_recovery(document)
+                store.write_latest(result)
 
             self.assertEqual(store.read_managed_patch_recovery(), document)
             self.assertEqual(
@@ -266,6 +288,46 @@ class StateStoreTest(unittest.TestCase):
             store.clear_managed_patch_recovery()
 
             self.assertIsNone(store.read_managed_patch_recovery())
+
+    def test_managed_patch_recovery_rejects_non_protocol_data(self):
+        """防止恢复序列化写入 secret、补丁内容或绝对 checkout 路径。"""
+        document = {
+            "format": "managed-patch-recovery-v1",
+            "workspace": "a" * 64,
+            "target_remote": "origin",
+            "target_branch": "main",
+            "source_parent": "b" * 40,
+            "target_parent": "c" * 40,
+            "target_gitlinks": {"plugins/iceberg_delta": "d" * 40},
+            "patches": [
+                {
+                    "name": "delta-filter",
+                    "content_hash": "e" * 64,
+                    "target_submodule": "plugins/iceberg_delta",
+                    "apply_path": ".",
+                }
+            ],
+            "stage": "reversing",
+        }
+        cases = (
+            {**document, "token": "secret"},
+            {
+                **document,
+                "patches": [{**document["patches"][0], "content": "patch bytes"}],
+            },
+            {
+                **document,
+                "target_gitlinks": {"/absolute/checkout": "d" * 40},
+            },
+        )
+        for candidate in cases:
+            with self.subTest(candidate=tuple(candidate)), tempfile.TemporaryDirectory() as temp_dir:
+                store = StateStore(Path(temp_dir))
+
+                with self.assertRaises(ValueError):
+                    store.write_managed_patch_recovery(candidate)
+
+                self.assertIsNone(store.read_managed_patch_recovery())
 
     def test_latest_replaces_atomically_without_temporary_files(self):
         """防止状态写入留下可被后续读取器误判的临时 JSON。"""

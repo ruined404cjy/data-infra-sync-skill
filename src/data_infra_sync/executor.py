@@ -7,7 +7,10 @@ from data_infra_sync.fingerprint import repository_fingerprint
 from data_infra_sync.git import GitError
 from data_infra_sync.model import Action, Result
 from data_infra_sync.planner import plan_sync
-from data_infra_sync.state import ManagedPatchRecoveryCleanupError
+from data_infra_sync.state import (
+    ManagedPatchRecoveryCleanupError,
+    ManagedPatchRecoveryValidationError,
+)
 
 
 _EXPECTED_OPERATION_ERRORS = (GitError, OSError, RuntimeError, ValueError)
@@ -25,6 +28,12 @@ def execute_sync(
 
     try:
         facts = adapter.collect_plan_facts(git, fresh=True)
+    except ManagedPatchRecoveryValidationError as error:
+        actual_plan = plan_sync(error.facts)
+        return _partial(
+            _actual_from_plan(actual_plan),
+            "git_precondition_failed",
+        )
     except ManagedPatchRecoveryCleanupError as error:
         actual_plan = plan_sync(error.facts)
         if error.possible_domain_writes:
@@ -67,10 +76,13 @@ def execute_sync(
         )
     if plan.state == "up_to_date":
         try:
-            all_applied = all(
-                adapter.patch_state(git, patch) == "applied"
-                for patch in target_patches
+            states = _managed_patch_states(
+                adapter,
+                git,
+                target_patches,
+                {item.path: item.pin for item in facts.target_submodules},
             )
+            all_applied = all(state == "applied" for state in states)
         except _EXPECTED_OPERATION_ERRORS:
             return _failed(plan, "git_precondition_failed")
         if all_applied:
@@ -105,9 +117,9 @@ def execute_sync(
     try:
         # partial 重入时父仓已到目标；此时补丁已暂停，无需再次 reverse。
         if facts.current_parent != facts.target_parent:
-            for patch in reversed(current_patches):
+            states = _managed_patch_states(adapter, git, current_patches)
+            for patch, state in reversed(tuple(zip(current_patches, states))):
                 failure_reason = "managed_patch_reverse_failed"
-                state = adapter.patch_state(git, patch)
                 if state == "applied":
                     write_attempted = True
                     adapter.reverse_patch(git, patch)
@@ -151,9 +163,10 @@ def execute_sync(
         failure_reason = "managed_patch_recovery_write_failed"
         if recovery_active:
             _advance_managed_patch_recovery(adapter, "replay")
-        for patch in target_patches:
+        target_pins = {item.path: item.pin for item in facts.target_submodules}
+        states = _managed_patch_states(adapter, git, target_patches, target_pins)
+        for patch, state in zip(target_patches, states):
             failure_reason = "managed_patch_apply_failed"
-            state = adapter.patch_state(git, patch)
             if state == "absent":
                 write_attempted = True
                 adapter.apply_patch(git, patch)
@@ -178,6 +191,11 @@ def execute_sync(
                     "managed_patch_recovery_cleanup_failed",
                 )
         return _from_plan(post_plan, "updated", (), changed=True)
+    except ManagedPatchRecoveryValidationError as error:
+        return _partial(
+            _actual_from_plan(plan_sync(error.facts)),
+            "git_precondition_failed",
+        )
     except ManagedPatchRecoveryCleanupError as error:
         return _recovery_cleanup_result(
             error, writes_started, recovery_created
@@ -255,6 +273,14 @@ def _has_managed_patch_recovery(adapter) -> bool:
     """判断 Adapter 本次采集是否加载了有效恢复日志。"""
     check = getattr(adapter, "has_managed_patch_recovery", None)
     return bool(check is not None and check())
+
+
+def _managed_patch_states(adapter, git, patches, target_pins=None):
+    """读取有序补丁组进度；旧 Adapter 保持逐项状态接口。"""
+    read = getattr(adapter, "managed_patch_states", None)
+    if read is not None:
+        return tuple(read(git, patches, target_pins))
+    return tuple(adapter.patch_state(git, patch) for patch in patches)
 
 
 def _clear_write_free_recovery(adapter, recovery_created) -> bool:

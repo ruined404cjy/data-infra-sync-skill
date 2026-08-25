@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 import subprocess
@@ -16,7 +17,7 @@ from data_infra_sync.cli import _exit_code
 from data_infra_sync.executor import _domain_fingerprint, execute_sync
 from data_infra_sync.git import Git, GitError, RepoFacts
 from data_infra_sync.planner import PlanFacts, RepositoryPlanFacts, SubmoduleSpec, snapshot_for
-from data_infra_sync.state import ManagedPatchRecoveryCleanupError
+from data_infra_sync.state import ManagedPatchRecoveryCleanupError, StateStore
 from tests.git_fixture import CompositeFixture
 
 
@@ -463,6 +464,46 @@ class StackedPatchHarness(RealCompositeHarness):
                 _single_line_patch("stack.txt", "B", "C"),
             ),
         )
+
+    def _push_target(self, conflicting_target, target_contains_patches):
+        """推送保持 A 基线或已内置整组补丁的目标 pin。"""
+        sub_updater = self.fixture.root / "sub updater"
+        self.fixture._run(
+            self.fixture.root,
+            ("clone", str(self.fixture.submodule_remote), str(sub_updater)),
+        )
+        self.fixture._configure_user(sub_updater)
+        if target_contains_patches:
+            self.fixture.commit_file(
+                sub_updater, "stack.txt", "C\n", "include stacked patch content"
+            )
+        else:
+            self.fixture.commit_file(
+                sub_updater, "target.txt", "target only\n", "advance target"
+            )
+        self.fixture._run(sub_updater, ("push", "origin", "main"))
+        target_pin = self.fixture.rev_parse(sub_updater, "HEAD")
+        return self._push_parent_target(target_pin), target_pin
+
+    def recovery_adapter(self, state_dir):
+        """构造会在事实采集时校验持久化恢复日志的新 Adapter。"""
+        adapter = None
+
+        def collect(runtime_git, *, fresh):
+            facts = self.collect_plan_facts(runtime_git, fresh=fresh)
+            adapter._managed_patch_recovery_matches(
+                runtime_git, facts, self.patches, self.patches
+            )
+            return facts
+
+        adapter = DataInfraAdapter(
+            self.fixture.parent,
+            collect,
+            lambda commit: self.patches,
+            StateStore(state_dir),
+            "a" * 64,
+        )
+        return adapter
 
 
 class SymlinkEscapeHarness(RealCompositeHarness):
@@ -1285,6 +1326,81 @@ class RealGitExecutorTest(unittest.TestCase):
                         ),
                         "C\n",
                     )
+
+    def test_stacked_patches_accept_target_with_integrated_ordered_group(self):
+        """依赖补丁的目标完整内置态应按有序组识别。"""
+        with tempfile.TemporaryDirectory(
+            prefix="executor real stacked integrated "
+        ) as directory:
+            harness = StackedPatchHarness(
+                Path(directory), target_contains_patches=True
+            )
+
+            result = execute_sync(harness.git, harness.adapter, None, True)
+
+            self.assertEqual((result.state, result.changed), ("updated", True))
+            self.assertEqual(
+                harness.fixture.rev_parse(harness.fixture.submodule, "HEAD"),
+                harness.target_pin,
+            )
+            self.assertEqual(
+                harness.git.run(
+                    harness.fixture.submodule,
+                    ("status", "--porcelain=v1", "-z", "--untracked-files=all"),
+                ).stdout,
+                "",
+            )
+            self.assertEqual(
+                (harness.fixture.submodule / "stack.txt").read_text(
+                    encoding="utf-8"
+                ),
+                "C\n",
+            )
+
+    def test_stacked_final_replay_crash_resumes_with_new_adapter(self):
+        """最后一项 replay 写入后的旧阶段日志必须可跨 Adapter 收敛。"""
+        with tempfile.TemporaryDirectory(
+            prefix="executor real stacked recovery "
+        ) as directory:
+            harness = StackedPatchHarness(Path(directory))
+            state_dir = harness.fixture.root / "recovery-state"
+            adapter = harness.recovery_adapter(state_dir)
+            original_advance = adapter.advance_managed_patch_recovery
+            failed = [False]
+
+            def fail_after_final_replay(stage):
+                if stage == "postcondition" and not failed[0]:
+                    failed[0] = True
+                    raise OSError("injected crash before postcondition stage")
+                original_advance(stage)
+
+            adapter.advance_managed_patch_recovery = fail_after_final_replay
+
+            partial = execute_sync(harness.git, adapter, None, True)
+            recovery_path = state_dir / "managed-patch-recovery.json"
+            persisted = json.loads(recovery_path.read_text(encoding="utf-8"))
+            recovery_git = Git()
+            recovered = execute_sync(
+                recovery_git,
+                harness.recovery_adapter(state_dir),
+                None,
+                True,
+            )
+
+            self.assertEqual((partial.state, partial.changed), ("partial", True))
+            self.assertEqual(
+                partial.reason_codes, ("managed_patch_recovery_write_failed",)
+            )
+            self.assertEqual(persisted["stage"], "replay")
+            self.assertEqual(partial.next_actions[0].kind, "resume_sync")
+            self.assertEqual(recovered.state, "updated")
+            self.assertEqual(
+                (harness.fixture.submodule / "stack.txt").read_text(
+                    encoding="utf-8"
+                ),
+                "C\n",
+            )
+            self.assertFalse(recovery_path.exists())
 
     def test_first_reverse_content_change_then_error_is_partial(self):
         with tempfile.TemporaryDirectory(prefix="executor real fingerprint ") as directory:

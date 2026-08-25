@@ -6,7 +6,7 @@ import os
 import re
 import tempfile
 from contextlib import contextmanager
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Iterator, Mapping, Tuple
 
 
@@ -22,6 +22,32 @@ _SENSITIVE_KEY = re.compile(_SENSITIVE_WORDS, re.IGNORECASE)
 _SENSITIVE_ENV_NAME = re.compile(_SENSITIVE_WORDS, re.IGNORECASE)
 _REDACTED = "[REDACTED]"
 _MANAGED_PATCH_RECOVERY = "managed-patch-recovery.json"
+MANAGED_PATCH_RECOVERY_FORMAT = "managed-patch-recovery-v1"
+MANAGED_PATCH_RECOVERY_STAGES = (
+    "reversing",
+    "parent_update",
+    "submodule_update",
+    "replay",
+    "postcondition",
+)
+_RECOVERY_FIELDS = frozenset(
+    {
+        "format",
+        "workspace",
+        "target_remote",
+        "target_branch",
+        "source_parent",
+        "target_parent",
+        "target_gitlinks",
+        "patches",
+        "stage",
+    }
+)
+_RECOVERY_PATCH_FIELDS = frozenset(
+    {"name", "content_hash", "target_submodule", "apply_path"}
+)
+_OBJECT_ID = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _TOP_LEVEL_PROTOCOL_FIELDS = frozenset(
     {
         "schema_version",
@@ -49,6 +75,14 @@ class ManagedPatchRecoveryCleanupError(RuntimeError):
         super().__init__("managed patch recovery cleanup failed")
         self.facts = facts
         self.possible_domain_writes = possible_domain_writes
+
+
+class ManagedPatchRecoveryValidationError(RuntimeError):
+    """携带有效恢复记录暂时无法核验时已读取的实际 facts。"""
+
+    def __init__(self, facts):
+        super().__init__("managed patch recovery validation failed")
+        self.facts = facts
 
 
 class StateStore:
@@ -85,7 +119,10 @@ class StateStore:
 
     def write_managed_patch_recovery(self, data: Mapping[str, Any]) -> None:
         """原子替换受控补丁恢复日志。"""
-        self._write_json(_MANAGED_PATCH_RECOVERY, data, sync_directory=True)
+        document = serialize_managed_patch_recovery_document(data)
+        self._write_json_document(
+            _MANAGED_PATCH_RECOVERY, document, sync_directory=True
+        )
 
     def clear_managed_patch_recovery(self) -> None:
         """删除受控补丁恢复日志并持久化目录项。"""
@@ -111,6 +148,14 @@ class StateStore:
         self, name: str, data: Any, *, sync_directory: bool = False
     ) -> None:
         """以临时文件和 replace 原子写入一份脱敏 JSON。"""
+        self._write_json_document(
+            name, _redact(data), sync_directory=sync_directory
+        )
+
+    def _write_json_document(
+        self, name: str, document: Any, *, sync_directory: bool = False
+    ) -> None:
+        """原子写入已经完成协议变换的 JSON 文档。"""
         self._ensure_state_dir()
         temporary_name = None
         try:
@@ -122,7 +167,7 @@ class StateStore:
                 delete=False,
             ) as temporary:
                 temporary_name = temporary.name
-                json.dump(_redact(data), temporary, ensure_ascii=False, sort_keys=True)
+                json.dump(document, temporary, ensure_ascii=False, sort_keys=True)
                 temporary.write("\n")
                 temporary.flush()
                 os.fsync(temporary.fileno())
@@ -145,6 +190,112 @@ class StateStore:
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
+
+
+def serialize_managed_patch_recovery_document(data: Mapping[str, Any]) -> dict:
+    """验证并复制恢复协议文档，不执行审计文本脱敏。"""
+    if not isinstance(data, Mapping) or set(data) != _RECOVERY_FIELDS:
+        raise ValueError("invalid managed patch recovery fields")
+    scalar_fields = (
+        "format",
+        "workspace",
+        "target_remote",
+        "target_branch",
+        "source_parent",
+        "target_parent",
+        "stage",
+    )
+    if any(not isinstance(data[field], str) for field in scalar_fields):
+        raise ValueError("invalid managed patch recovery scalar")
+    if (
+        data["format"] != MANAGED_PATCH_RECOVERY_FORMAT
+        or _SHA256.fullmatch(data["workspace"]) is None
+        or _OBJECT_ID.fullmatch(data["source_parent"]) is None
+        or _OBJECT_ID.fullmatch(data["target_parent"]) is None
+        or data["stage"] not in MANAGED_PATCH_RECOVERY_STAGES
+        or not _valid_recovery_identity(data["target_remote"])
+        or not _valid_recovery_identity(data["target_branch"])
+    ):
+        raise ValueError("invalid managed patch recovery identity")
+
+    gitlinks = data["target_gitlinks"]
+    if not isinstance(gitlinks, Mapping) or not gitlinks:
+        raise ValueError("invalid managed patch recovery gitlinks")
+    canonical_gitlinks = {}
+    for path, pin in gitlinks.items():
+        if (
+            not _valid_recovery_path(path, allow_dot=False)
+            or not isinstance(pin, str)
+            or _OBJECT_ID.fullmatch(pin) is None
+        ):
+            raise ValueError("invalid managed patch recovery gitlink")
+        canonical_gitlinks[path] = pin
+
+    patches = data["patches"]
+    if not isinstance(patches, list) or not patches:
+        raise ValueError("invalid managed patch recovery patches")
+    canonical_patches = []
+    names = set()
+    for patch in patches:
+        if not isinstance(patch, Mapping) or set(patch) != _RECOVERY_PATCH_FIELDS:
+            raise ValueError("invalid managed patch recovery patch fields")
+        if any(not isinstance(value, str) for value in patch.values()):
+            raise ValueError("invalid managed patch recovery patch scalar")
+        if (
+            not _valid_recovery_identity(patch["name"])
+            or patch["name"] in names
+            or _SHA256.fullmatch(patch["content_hash"]) is None
+            or not _valid_recovery_path(
+                patch["target_submodule"], allow_dot=False
+            )
+            or patch["target_submodule"] not in canonical_gitlinks
+            or not _valid_recovery_path(patch["apply_path"], allow_dot=True)
+        ):
+            raise ValueError("invalid managed patch recovery patch")
+        names.add(patch["name"])
+        canonical_patches.append(
+            {field: patch[field] for field in _RECOVERY_PATCH_FIELDS}
+        )
+
+    return {
+        "format": data["format"],
+        "workspace": data["workspace"],
+        "target_remote": data["target_remote"],
+        "target_branch": data["target_branch"],
+        "source_parent": data["source_parent"],
+        "target_parent": data["target_parent"],
+        "target_gitlinks": canonical_gitlinks,
+        "patches": canonical_patches,
+        "stage": data["stage"],
+    }
+
+
+def valid_managed_patch_recovery_document(data: Any) -> bool:
+    """返回文档是否完整符合恢复协议。"""
+    try:
+        serialize_managed_patch_recovery_document(data)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def _valid_recovery_identity(value: str) -> bool:
+    """拒绝空值和可扩展为额外文本记录的控制字符。"""
+    return bool(value) and not any(character in value for character in "\r\n\0")
+
+
+def _valid_recovery_path(value: Any, *, allow_dot: bool) -> bool:
+    """只接受规范 POSIX 逻辑相对路径。"""
+    if not isinstance(value, str) or not value or "\\" in value:
+        return False
+    if value == ".":
+        return allow_dot
+    path = PurePosixPath(value)
+    return (
+        not path.is_absolute()
+        and str(path) == value
+        and all(part not in ("", ".", "..") for part in path.parts)
+    )
 
 
 def _redact(value: Any, path: Tuple[object, ...] = ()) -> Any:

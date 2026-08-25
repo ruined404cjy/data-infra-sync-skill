@@ -15,7 +15,14 @@ from urllib.parse import urljoin, urlsplit, urlunsplit
 
 from data_infra_sync.git import GitError, RepoFacts, git_environment
 from data_infra_sync.planner import PlanFacts, RepositoryPlanFacts, SubmoduleSpec
-from data_infra_sync.state import ManagedPatchRecoveryCleanupError, StateStore
+from data_infra_sync.state import (
+    MANAGED_PATCH_RECOVERY_FORMAT,
+    MANAGED_PATCH_RECOVERY_STAGES,
+    ManagedPatchRecoveryCleanupError,
+    ManagedPatchRecoveryValidationError,
+    StateStore,
+    valid_managed_patch_recovery_document,
+)
 
 
 _ARTIFACT_GROUPS = (
@@ -85,31 +92,6 @@ _CRITICAL_INSTALL_PATHS = (
 
 _DELTA_PATCH_PATH = "build/patches/iceberg-delta-cmake-pie-filter.patch"
 _DELTA_SUBMODULE = "plugins/iceberg_delta"
-_RECOVERY_FORMAT = "managed-patch-recovery-v1"
-_RECOVERY_STAGES = (
-    "reversing",
-    "parent_update",
-    "submodule_update",
-    "replay",
-    "postcondition",
-)
-_RECOVERY_FIELDS = frozenset(
-    {
-        "format",
-        "workspace",
-        "target_remote",
-        "target_branch",
-        "source_parent",
-        "target_parent",
-        "target_gitlinks",
-        "patches",
-        "stage",
-    }
-)
-_RECOVERY_PATCH_FIELDS = frozenset(
-    {"name", "content_hash", "target_submodule", "apply_path"}
-)
-_OBJECT_ID = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 
 
 class DataInfraInstallAdapter:
@@ -279,6 +261,44 @@ class DataInfraAdapter:
             return "invalid"
         return self._patch_state_at(git, repository, patch)
 
+    def managed_patch_states(self, git, patches, target_pins=None):
+        """按仓库有序组返回每项补丁的逻辑 applied 或 absent 状态。"""
+        states = [None] * len(patches)
+        by_repository = {}
+        for index, patch in enumerate(patches):
+            by_repository.setdefault(patch.target_submodule, []).append(
+                (index, patch)
+            )
+        for path, indexed in by_repository.items():
+            repository = _safe_directory(self.root, path)
+            if repository is None:
+                for index, _ in indexed:
+                    states[index] = "invalid"
+                continue
+            group = tuple(patch for _, patch in indexed)
+            baseline = 0
+            target_pin = None if target_pins is None else target_pins.get(path)
+            if target_pin is not None:
+                head = git.run(repository, ("rev-parse", "HEAD")).stdout.strip()
+                if head == target_pin:
+                    baseline = self._target_patch_progress(
+                        git, path, target_pin, group
+                    )
+                    if baseline is None:
+                        for index, _ in indexed:
+                            states[index] = "invalid"
+                        continue
+            progress = self._current_patch_progress(
+                git, path, group, baseline=baseline
+            )
+            for group_index, (index, _) in enumerate(indexed):
+                states[index] = (
+                    "invalid"
+                    if progress is None
+                    else "applied" if group_index < progress else "absent"
+                )
+        return tuple(states)
+
     def preflight_managed_patches(
         self, git, facts, current_patches, target_patches
     ) -> bool:
@@ -317,7 +337,7 @@ class DataInfraAdapter:
         if self._active_recovery is not None:
             return False
         document = {
-            "format": _RECOVERY_FORMAT,
+            "format": MANAGED_PATCH_RECOVERY_FORMAT,
             "workspace": self._workspace_identity,
             "target_remote": facts.target_remote,
             "target_branch": facts.target_branch,
@@ -341,7 +361,9 @@ class DataInfraAdapter:
         if self._active_recovery is None:
             return
         current = self._active_recovery["stage"]
-        if _RECOVERY_STAGES.index(stage) <= _RECOVERY_STAGES.index(current):
+        if MANAGED_PATCH_RECOVERY_STAGES.index(
+            stage
+        ) <= MANAGED_PATCH_RECOVERY_STAGES.index(current):
             return
         document = dict(self._active_recovery)
         document["stage"] = stage
@@ -374,9 +396,9 @@ class DataInfraAdapter:
                 repository is None
                 or repository.facts.head != target_pins.get(path)
                 or repository.facts.worktree != "clean"
-                or self._target_patch_mode(
+                or self._target_patch_progress(
                     git, path, target_pins[path], tuple(items)
-                ) != "integrated"
+                ) != len(items)
             ):
                 return False
         return True
@@ -395,9 +417,15 @@ class DataInfraAdapter:
         if document is None:
             self._active_recovery = None
             return False
-        valid = self._valid_managed_patch_recovery(
-            git, facts, current_patches, target_patches, document
-        )
+        if not _valid_recovery_document_shape(document):
+            self._discard_invalid_recovery(facts, document)
+            return False
+        try:
+            valid = self._valid_managed_patch_recovery(
+                git, facts, current_patches, target_patches, document
+            )
+        except (GitError, OSError, RuntimeError, ValueError, TypeError) as error:
+            raise ManagedPatchRecoveryValidationError(facts) from error
         if not valid:
             self._discard_invalid_recovery(facts, document)
             return False
@@ -424,10 +452,10 @@ class DataInfraAdapter:
         """确认工作树是声明顺序的一个精确补丁前缀且没有其他改动。"""
         return self._current_patch_progress(git, path, patches) is not None
 
-    def _current_patch_progress(self, git, path, patches):
-        """返回工作树已应用的有序补丁前缀长度；不精确时返回 None。"""
+    def _current_patch_progress(self, git, path, patches, *, baseline=0):
+        """返回基于提交内置前缀的工作树有序补丁进度。"""
         repository = _safe_directory(self.root, path)
-        if repository is None:
+        if repository is None or not 0 <= baseline <= len(patches):
             return None
         if any(
             _safe_directory(repository, patch.apply_path) is None
@@ -439,7 +467,7 @@ class DataInfraAdapter:
         ).stdout.strip()
         with tempfile.TemporaryDirectory(prefix="data-infra-sync-current-") as directory:
             matches = []
-            for progress in range(len(patches) + 1):
+            for progress in range(baseline, len(patches) + 1):
                 name = "worktree" if progress == 0 else "worktree-{}".format(progress)
                 worktree = Path(directory) / name
                 shutil.copytree(
@@ -453,7 +481,7 @@ class DataInfraAdapter:
                     "--work-tree={}".format(worktree),
                 )
                 try:
-                    for patch in reversed(patches[:progress]):
+                    for patch in reversed(patches[baseline:progress]):
                         self._apply_patch_at(
                             git,
                             worktree,
@@ -461,7 +489,7 @@ class DataInfraAdapter:
                             reverse=True,
                             git_options=git_options,
                         )
-                except (GitError, OSError, RuntimeError, ValueError):
+                except GitError:
                     continue
                 status = git.run(
                     worktree,
@@ -551,102 +579,65 @@ class DataInfraAdapter:
             if repository is None or repository.facts.operation is not None:
                 return False
             target_pin = target_gitlinks[path]
-            progress = self._current_patch_progress(git, path, tuple(patches))
+            baseline = 0
+            if repository.facts.head == target_pin:
+                baseline = self._target_patch_progress(
+                    git, path, target_pin, tuple(patches)
+                )
+                if baseline is None:
+                    return False
+            progress = self._current_patch_progress(
+                git, path, tuple(patches), baseline=baseline
+            )
             if progress is None:
                 return False
-            if stage in ("parent_update", "submodule_update") and progress != 0:
+            if stage == "parent_update" and progress != 0:
                 return False
-            if stage == "postcondition" and not self._patch_group_complete(
-                git, path, target_pin, tuple(patches), progress
-            ):
+            if stage == "submodule_update" and progress != baseline:
+                return False
+            if stage == "postcondition" and progress != len(patches):
                 return False
         return True
 
-    def _patch_group_complete(self, git, path, target_pin, patches, progress):
-        """确认 replay 已完成，或 exact target 已等价内置整组补丁。"""
-        return progress == len(patches) or (
-            progress == 0
-            and self._target_patch_mode(git, path, target_pin, patches)
-            == "integrated"
-        )
-
     def _target_accepts_patches(self, git, path, target_pin, patches) -> bool:
-        """在独立目标副本中按声明顺序验证补丁可保留或补齐。"""
-        repository = _safe_directory(self.root, path)
-        if repository is None:
-            return False
-        with tempfile.TemporaryDirectory(prefix="data-infra-sync-target-") as directory:
-            worktree = Path(directory) / "target"
-            worktree.mkdir()
-            git.run(worktree, ("init", "--quiet"))
-            git.run(
-                worktree,
-                (
-                    "fetch",
-                    "--no-tags",
-                    "--no-recurse-submodules",
-                    "--refmap=",
-                    "--",
-                    str(repository),
-                    target_pin,
-                ),
-            )
-            git.run(worktree, ("checkout", "--detach", "FETCH_HEAD"))
-            for patch in patches:
-                if _safe_directory(worktree, patch.apply_path) is None:
-                    return False
-                state = self._patch_state_at(git, worktree, patch)
-                if state == "absent":
-                    self._apply_patch_at(git, worktree, patch, reverse=False)
-                elif state != "applied":
-                    return False
-            return True
+        """确认目标提交内置了声明补丁的唯一有序前缀。"""
+        return self._target_patch_progress(git, path, target_pin, patches) is not None
 
-    def _target_patch_mode(self, git, path, target_pin, patches):
-        """返回目标补丁序列的 absent、integrated 或 None。"""
+    def _target_patch_progress(self, git, path, target_pin, patches):
+        """返回目标提交已内置的唯一有序补丁前缀长度。"""
         repository = _safe_directory(self.root, path)
         if repository is None:
             return None
-        if self._target_sequence_accepts(
-            git, repository, target_pin, patches, reverse=False
-        ):
-            return "absent"
-        if self._target_sequence_accepts(
-            git, repository, target_pin, patches, reverse=True
-        ):
-            return "integrated"
-        return None
-
-    def _target_sequence_accepts(
-        self, git, repository, target_pin, patches, *, reverse
-    ) -> bool:
-        """在独立临时仓库中按正序应用或逆序移除完整补丁序列。"""
         with tempfile.TemporaryDirectory(prefix="data-infra-sync-target-") as directory:
-            worktree = Path(directory) / "target"
-            worktree.mkdir()
-            git.run(worktree, ("init", "--quiet"))
-            git.run(
-                worktree,
-                (
-                    "fetch",
-                    "--no-tags",
-                    "--no-recurse-submodules",
-                    "--refmap=",
-                    "--",
-                    str(repository),
-                    target_pin,
-                ),
-            )
-            git.run(worktree, ("checkout", "--detach", "FETCH_HEAD"))
-            sequence = reversed(patches) if reverse else patches
-            try:
-                for patch in sequence:
-                    if _safe_directory(worktree, patch.apply_path) is None:
-                        return False
-                    self._apply_patch_at(git, worktree, patch, reverse=reverse)
-            except (GitError, OSError, RuntimeError, ValueError):
-                return False
-            return True
+            matches = []
+            for progress in range(len(patches) + 1):
+                worktree = Path(directory) / "target-{}".format(progress)
+                worktree.mkdir()
+                git.run(worktree, ("init", "--quiet"))
+                git.run(
+                    worktree,
+                    (
+                        "fetch",
+                        "--no-tags",
+                        "--no-recurse-submodules",
+                        "--refmap=",
+                        "--",
+                        str(repository),
+                        target_pin,
+                    ),
+                )
+                git.run(worktree, ("checkout", "--detach", "FETCH_HEAD"))
+                try:
+                    for patch in reversed(patches[:progress]):
+                        self._apply_patch_at(git, worktree, patch, reverse=True)
+                    for patch in patches:
+                        self._apply_patch_at(git, worktree, patch, reverse=False)
+                except GitError:
+                    continue
+                matches.append(progress)
+            if len(matches) == 1:
+                return matches[0]
+            return None
 
     def _patch_state_at(
         self, git, repository, patch, *, git_options=()
@@ -1396,49 +1387,7 @@ def _managed_patch_document(patch):
 
 def _valid_recovery_document_shape(document):
     """严格验证恢复日志的版本、字段集合与规范哈希/OID。"""
-    if not isinstance(document, dict) or set(document) != _RECOVERY_FIELDS:
-        return False
-    scalar_fields = (
-        "format",
-        "workspace",
-        "target_remote",
-        "target_branch",
-        "source_parent",
-        "target_parent",
-        "stage",
-    )
-    if any(not isinstance(document[field], str) for field in scalar_fields):
-        return False
-    if (
-        document["format"] != _RECOVERY_FORMAT
-        or re.fullmatch(r"[0-9a-f]{64}", document["workspace"]) is None
-        or _OBJECT_ID.fullmatch(document["source_parent"]) is None
-        or _OBJECT_ID.fullmatch(document["target_parent"]) is None
-        or document["stage"] not in _RECOVERY_STAGES
-        or not document["target_remote"]
-        or not document["target_branch"]
-    ):
-        return False
-    gitlinks = document["target_gitlinks"]
-    if not isinstance(gitlinks, dict) or any(
-        not isinstance(path, str)
-        or not isinstance(pin, str)
-        or _OBJECT_ID.fullmatch(pin) is None
-        for path, pin in gitlinks.items()
-    ):
-        return False
-    patches = document["patches"]
-    if not isinstance(patches, list) or not patches:
-        return False
-    for patch in patches:
-        if (
-            not isinstance(patch, dict)
-            or set(patch) != _RECOVERY_PATCH_FIELDS
-            or any(not isinstance(value, str) for value in patch.values())
-            or re.fullmatch(r"[0-9a-f]{64}", patch["content_hash"]) is None
-        ):
-            return False
-    return True
+    return valid_managed_patch_recovery_document(document)
 
 
 def _safe_relative_path(value):

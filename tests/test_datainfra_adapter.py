@@ -19,6 +19,7 @@ from data_infra_sync.config import WorkspaceConfig, load_config, write_config
 from data_infra_sync.executor import execute_sync
 from data_infra_sync.git import Git, GitError
 from data_infra_sync.planner import plan_sync, snapshot_for
+from data_infra_sync.state import ManagedPatchRecoveryValidationError
 from tests.git_fixture import CompositeFixture
 
 
@@ -768,7 +769,11 @@ class DataInfraAdapterManagedPatchTest(unittest.TestCase):
             config = config_for(fixture)
             git = Git()
             adapter = DataInfraAdapter.for_workspace(config, git)
-            adapter.patch_state = lambda runtime_git, patch: "invalid"
+            adapter.managed_patch_states = (
+                lambda runtime_git, patches, target_pins=None: tuple(
+                    "invalid" for _ in patches
+                )
+            )
             before = self._domain_snapshot(fixture)
 
             result = execute_sync(git, adapter, None, True)
@@ -886,13 +891,34 @@ class DataInfraAdapterManagedPatchTest(unittest.TestCase):
                 )
                 self.assertFalse(recovery_path.exists())
 
-    def test_reverse_then_parent_failure_resume_action_converges_in_new_process(self):
-        """防止 clean/absent partial 的恢复 Action 在新 CLI 进程被阻塞。"""
+    def test_environment_config_partial_action_converges_in_new_process(self):
+        """防止环境配置被审计脱敏改写后使跨进程恢复 Action 阻塞。"""
         with tempfile.TemporaryDirectory(prefix="managed patch process ") as temp_dir:
             fixture, patch_content = self._delta_fixture(Path(temp_dir))
+            fixture._run(
+                fixture.parent,
+                ("remote", "add", "published", str(fixture.parent_remote)),
+            )
+            fixture._run(fixture.parent, ("switch", "-c", "stable"))
             target_parent, _ = self._advance_parent_only(fixture)
+            fixture._run(
+                fixture.root / "publisher",
+                ("push", "origin", "main:stable"),
+            )
             self._apply_patch(fixture, patch_content)
-            environment, config = self._default_cli_environment(fixture)
+            environment = dict(os.environ)
+            environment.update(
+                {
+                    "DATA_INFRA_SYNC_ROOT": str(fixture.parent),
+                    "DATA_INFRA_SYNC_TARGET_REMOTE": "published",
+                    "DATA_INFRA_SYNC_TARGET_BRANCH": "stable",
+                    "XDG_CONFIG_HOME": str(fixture.root / "config-home"),
+                    "XDG_STATE_HOME": str(fixture.root / "state-home"),
+                    "SERVICE_TOKEN": "unrelated-recovery-secret",
+                }
+            )
+            config = load_config({}, environment, None)
+            write_config(config)
 
             class FailParentMergeOnce:
                 def __init__(self):
@@ -963,8 +989,13 @@ class DataInfraAdapterManagedPatchTest(unittest.TestCase):
             self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
             self.assertIn("state: updated", resumed.stdout)
             self.assertIsNotNone(recovery_document)
+            self.assertEqual(recovery_document["target_remote"], "published")
+            self.assertEqual(recovery_document["target_branch"], "stable")
             self.assertEqual(recovery_document["stage"], "parent_update")
-            self.assertNotIn(str(fixture.parent), json.dumps(recovery_document))
+            serialized_recovery = json.dumps(recovery_document)
+            self.assertNotIn(str(fixture.parent), serialized_recovery)
+            self.assertNotIn("unrelated-recovery-secret", serialized_recovery)
+            self.assertNotIn("content", recovery_document["patches"][0])
             self.assertFalse(any(config.state_dir.glob("*.tmp")))
             self.assertEqual(fixture.rev_parse(fixture.parent, "HEAD"), target_parent)
             self.assertEqual(
@@ -1083,17 +1114,110 @@ class DataInfraAdapterManagedPatchTest(unittest.TestCase):
             git = Git()
             adapter = DataInfraAdapter.for_workspace(config, git)
 
-            def fail_progress(runtime_git, path, patches):
+            def fail_progress(runtime_git, path, patches, *, baseline=0):
                 raise GitError(("git", "status"), "injected read failure", 1)
 
             adapter._current_patch_progress = fail_progress
 
-            with self.assertRaises(GitError):
+            with self.assertRaises(ManagedPatchRecoveryValidationError):
                 adapter.collect_plan_facts(git, fresh=True)
 
             self.assertEqual(
                 json.loads(recovery_path.read_text(encoding="utf-8")), document
             )
+
+    def test_partial_recovery_validation_failure_returns_cli_resume_action(self):
+        """防止真实 partial 的暂时验证失败被公开 CLI 误报为写前失败。"""
+        with tempfile.TemporaryDirectory(prefix="managed patch cli read failure ") as temp_dir:
+            fixture, patch_content = self._delta_fixture(Path(temp_dir))
+            target_parent, _ = self._advance_parent_only(fixture)
+            self._apply_patch(fixture, patch_content)
+            environment, config = self._default_cli_environment(fixture)
+
+            class FailParentMergeOnce:
+                def __init__(self):
+                    self.delegate = Git()
+                    self.failed = False
+
+                def __getattr__(self, name):
+                    return getattr(self.delegate, name)
+
+                def run(self, repo, args, *, check=True):
+                    if args[:2] == ("merge", "--ff-only") and not self.failed:
+                        self.failed = True
+                        raise GitError(
+                            ("git",) + tuple(args), "injected parent failure", 1
+                        )
+                    return self.delegate.run(repo, args, check=check)
+
+            class FailRecoveryReadOnce:
+                def __init__(self):
+                    self.delegate = Git()
+                    self.failed = False
+
+                def __getattr__(self, name):
+                    return getattr(self.delegate, name)
+
+                def run(self, repo, args, *, check=True):
+                    if (
+                        tuple(args) == ("rev-parse", "--absolute-git-dir")
+                        and not self.failed
+                    ):
+                        self.failed = True
+                        raise GitError(
+                            ("git",) + tuple(args), "injected recovery read", 1
+                        )
+                    return self.delegate.run(repo, args, check=check)
+
+            first_output = io.StringIO()
+            with mock.patch.dict(os.environ, environment, clear=False), mock.patch.object(
+                cli, "Git", return_value=FailParentMergeOnce()
+            ), contextlib.redirect_stdout(first_output):
+                first_code = cli.main(
+                    ("sync", "apply", "--non-interactive", "--format", "json")
+                )
+            first = json.loads(first_output.getvalue())
+            recovery_path = config.state_dir / "managed-patch-recovery.json"
+            recovery_bytes = recovery_path.read_bytes()
+
+            second_output = io.StringIO()
+            with mock.patch.dict(os.environ, environment, clear=False), mock.patch.object(
+                cli, "Git", return_value=FailRecoveryReadOnce()
+            ), contextlib.redirect_stdout(second_output):
+                second_code = cli.main(
+                    ("sync", "apply", "--non-interactive", "--format", "json")
+                )
+            second = json.loads(second_output.getvalue())
+
+            actual = {item["path"]: item for item in second["repositories"]}
+            self.assertEqual((first_code, first["state"]), (4, "partial"))
+            self.assertEqual(
+                (second_code, second["state"], second["changed"]),
+                (4, "partial", True),
+            )
+            self.assertEqual(second["reason_codes"], ["git_precondition_failed"])
+            self.assertEqual(actual["."]["head"], fixture.target_parent)
+            self.assertEqual(
+                actual["plugins/iceberg_delta"]["head"],
+                fixture.rev_parse(fixture.submodule, "HEAD"),
+            )
+            self.assertEqual(recovery_path.read_bytes(), recovery_bytes)
+            self.assertEqual(second["next_actions"][0]["kind"], "resume_sync")
+
+            resumed_output = io.StringIO()
+            resumed_argv = tuple(second["next_actions"][0]["argv"][1:]) + (
+                "--format",
+                "json",
+            )
+            with mock.patch.dict(
+                os.environ, environment, clear=False
+            ), contextlib.redirect_stdout(resumed_output):
+                resumed_code = cli.main(resumed_argv)
+            resumed = json.loads(resumed_output.getvalue())
+
+            self.assertEqual((resumed_code, resumed["state"]), (0, "updated"))
+            self.assertEqual(fixture.rev_parse(fixture.parent, "HEAD"), target_parent)
+            self.assertFalse(recovery_path.exists())
 
     def test_parent_update_stage_rejects_target_submodule_head(self):
         """防止父仓写入阶段接受只能由后续子仓更新产生的现场。"""
