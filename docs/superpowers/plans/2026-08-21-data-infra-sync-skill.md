@@ -1,5 +1,7 @@
 # DataInfra Sync Skill Implementation Plan
 
+状态：已由 `docs/superpowers/plans/2026-08-26-data-infra-sync-skill-convergence.md` 接续。本文保留初始实现任务和开发记录；后续实现以接续计划及当前设计文档为准。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 构建可供人类和不同 coding agent 安全维护 DataInfra 本地组合仓、管理开发分支并核验安装身份的标准 Skill 与确定性 CLI。
