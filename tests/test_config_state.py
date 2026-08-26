@@ -44,6 +44,22 @@ class WorkspaceConfigTest(unittest.TestCase):
             with self.subTest(values=values), self.assertRaises(ValueError):
                 load_config(values, {}, None)
 
+    def test_load_config_checks_git_branch_format_before_segment_format(self):
+        """防止分段规则在 Git 分支语义校验前提前拒绝输入。"""
+        completed = subprocess.CompletedProcess((), 0)
+        with patch(
+            "data_infra_sync.config.subprocess.run", return_value=completed
+        ) as run:
+            with self.assertRaisesRegex(ValueError, "unsupported target branch"):
+                load_config({"target_branch": "feature/token=value"}, {}, None)
+
+        run.assert_called_once_with(
+            ["git", "check-ref-format", "--branch", "feature/token=value"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+
     def test_write_config_round_trips_all_canonical_values(self):
         """防止 init 写出的配置无法由公开读取入口恢复。"""
         with tempfile.TemporaryDirectory() as temp_dir:

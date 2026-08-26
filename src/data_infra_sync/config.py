@@ -133,8 +133,6 @@ def _validate_target_selection(remote: str, branch: str) -> None:
     """验证同步目标的 remote 名称与 Git 分支名称。"""
     if _REMOTE_NAME.fullmatch(remote) is None:
         raise ValueError("unsupported target remote")
-    if any(_BRANCH_SEGMENT.fullmatch(part) is None for part in branch.split("/")):
-        raise ValueError("unsupported target branch")
     completed = subprocess.run(
         ["git", "check-ref-format", "--branch", branch],
         stdout=subprocess.PIPE,
@@ -142,6 +140,8 @@ def _validate_target_selection(remote: str, branch: str) -> None:
         check=False,
     )
     if completed.returncode != 0:
+        raise ValueError("unsupported target branch")
+    if any(_BRANCH_SEGMENT.fullmatch(part) is None for part in branch.split("/")):
         raise ValueError("unsupported target branch")
 
 
