@@ -2,6 +2,7 @@
 
 import hashlib
 import os
+import re
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -12,6 +13,8 @@ from typing import Mapping, Optional
 _CONFIG_DIRECTORY = "data-infra-sync-skill"
 _DEFAULT_REMOTE = "origin"
 _DEFAULT_BRANCH = "main"
+_REMOTE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_BRANCH_SEGMENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _GIT_KEYS = {
     "root": "data-infra-sync.root",
     "target_remote": "data-infra-sync.targetremote",
@@ -115,6 +118,7 @@ def load_config(
         else _default_state_dir(environ, root)
     )
 
+    _validate_target_selection(target_remote, target_branch)
     return WorkspaceConfig(root, target_remote, target_branch, config_path, state_dir)
 
 
@@ -123,6 +127,22 @@ def _first_value(cli: Mapping[str, str], environ: Mapping[str, str], name: str) 
     if name in cli:
         return cli[name]
     return environ.get(_ENV_KEYS[name])
+
+
+def _validate_target_selection(remote: str, branch: str) -> None:
+    """验证同步目标的 remote 名称与 Git 分支名称。"""
+    if _REMOTE_NAME.fullmatch(remote) is None:
+        raise ValueError("unsupported target remote")
+    if any(_BRANCH_SEGMENT.fullmatch(part) is None for part in branch.split("/")):
+        raise ValueError("unsupported target branch")
+    completed = subprocess.run(
+        ["git", "check-ref-format", "--branch", branch],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise ValueError("unsupported target branch")
 
 
 def _resolve_config_path(path: Optional[Path], environ: Mapping[str, str], root: Path) -> Path:

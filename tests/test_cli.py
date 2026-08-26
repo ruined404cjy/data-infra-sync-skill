@@ -383,6 +383,29 @@ class RoutingTests(unittest.TestCase):
 
 
 class ConfigurationTests(unittest.TestCase):
+    def test_invalid_target_remote_is_failed_without_persisting_credential(self):
+        """防止无效远端的凭据出现在公开错误结果或审计目录。"""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            credential = "https://user:secret@example.invalid/repo"
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with patch.dict(
+                os.environ, {"XDG_STATE_HOME": str(root)}, clear=False
+            ), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                code = cli.main(["--target-remote", credential, "inspect", "--format", "json"])
+
+            document = json.loads(stdout.getvalue())
+            persisted = "\n".join(
+                path.read_text(encoding="utf-8")
+                for path in root.rglob("*")
+                if path.is_file()
+            )
+            self.assertEqual((code, document["state"]), (3, "failed"))
+            self.assertNotIn(credential, stdout.getvalue())
+            self.assertNotIn(credential, stderr.getvalue())
+            self.assertNotIn(credential, persisted)
+
     def test_missing_config_is_audited_unconfigured_without_absolute_argv(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

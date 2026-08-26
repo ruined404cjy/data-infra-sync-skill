@@ -17,6 +17,33 @@ from data_infra_sync.state import StateStore
 
 
 class WorkspaceConfigTest(unittest.TestCase):
+    def test_load_config_accepts_supported_target_names(self):
+        """防止目标名称约束拒绝 Git 支持的常用远端或分支名。"""
+        cases = (
+            {"target_remote": "origin", "target_branch": "main"},
+            {"target_remote": "upstream-2", "target_branch": "release/1.0"},
+        )
+
+        for values in cases:
+            with self.subTest(values=values):
+                config = load_config(values, {}, None)
+
+                self.assertEqual(config.target_remote, values["target_remote"])
+                self.assertEqual(config.target_branch, values["target_branch"])
+
+    def test_load_config_rejects_unsupported_target_names(self):
+        """防止 URL、路径和凭据文本成为目标身份。"""
+        invalid = (
+            {"target_remote": "https://user:secret@example.invalid/repo"},
+            {"target_remote": "team/origin"},
+            {"target_branch": "feature/token=value"},
+            {"target_branch": "feature/@secret"},
+            {"target_branch": "-leading-dash"},
+        )
+        for values in invalid:
+            with self.subTest(values=values), self.assertRaises(ValueError):
+                load_config(values, {}, None)
+
     def test_write_config_round_trips_all_canonical_values(self):
         """防止 init 写出的配置无法由公开读取入口恢复。"""
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -239,6 +266,32 @@ class WorkspaceConfigTest(unittest.TestCase):
 
 
 class StateStoreTest(unittest.TestCase):
+    def test_dynamic_gitlink_key_does_not_redact_oid(self):
+        """防止路径名中的 key 误触发字段名脱敏。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            store = StateStore(root)
+            oid = "a" * 40
+            result = Result(
+                "inspect",
+                "up_to_date",
+                (),
+                {"parent_commit": "b" * 40, "gitlinks": {"modules/monkey": oid}},
+                (),
+                False,
+                (),
+                None,
+                False,
+            )
+
+            store.write_latest(result)
+            store.append_event(result)
+
+            latest = json.loads((root / "latest.json").read_text(encoding="utf-8"))
+            event = json.loads((root / "events.jsonl").read_text(encoding="utf-8"))
+            self.assertEqual(latest["target"]["gitlinks"]["modules/monkey"], oid)
+            self.assertEqual(event["target"]["gitlinks"]["modules/monkey"], oid)
+
     def test_managed_patch_recovery_is_independent_atomic_and_clearable(self):
         """防止恢复资格依赖 latest.json 或留下半写状态。"""
         with tempfile.TemporaryDirectory() as temp_dir:

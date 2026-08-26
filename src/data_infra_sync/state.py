@@ -19,7 +19,7 @@ _URL_TOKEN = re.compile(r"([?&](?:" + _SENSITIVE_WORDS + r")=)[^&#\s]*", re.IGNO
 _SENSITIVE_ASSIGNMENT = re.compile(
     r"(\b(?:" + _SENSITIVE_WORDS + r")\s*[:=]\s*)[^,\s&#]*", re.IGNORECASE
 )
-_SENSITIVE_KEY = re.compile(_SENSITIVE_WORDS, re.IGNORECASE)
+_SENSITIVE_KEY = re.compile(r"^(?:" + _SENSITIVE_WORDS + r")$", re.IGNORECASE)
 _SENSITIVE_ENV_NAME = re.compile(_SENSITIVE_WORDS, re.IGNORECASE)
 _REDACTED = "[REDACTED]"
 _MANAGED_PATCH_RECOVERY = "managed-patch-recovery.json"

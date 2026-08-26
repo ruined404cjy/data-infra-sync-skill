@@ -891,13 +891,13 @@ class DataInfraAdapterManagedPatchTest(unittest.TestCase):
                 )
                 self.assertFalse(recovery_path.exists())
 
-    def test_credential_shaped_config_uses_hashed_recovery_identity(self):
-        """防止可用 Git identity 携带凭据文本进入恢复文件。"""
+    def test_valid_config_uses_hashed_recovery_identity(self):
+        """防止恢复文件写入未哈希的目标身份、路径或环境值。"""
         with tempfile.TemporaryDirectory(prefix="managed patch process ") as temp_dir:
             fixture, patch_content = self._delta_fixture(Path(temp_dir))
             secret_value = "round" + "-two-private-value"
-            target_remote = "pass" + "word=" + secret_value
-            target_branch = "tok" + "en=" + secret_value
+            target_remote = "release-upstream"
+            target_branch = "release-1.0"
             fixture._run(
                 fixture.parent,
                 ("remote", "add", target_remote, str(fixture.parent_remote)),
