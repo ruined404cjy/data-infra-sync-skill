@@ -35,7 +35,7 @@
 - `src/data_infra_sync/fingerprint.py`: 分支命令继续使用的领域指纹；Executor 不再依赖它。
 - `SKILL.md`: 跨 Agent 状态机入口和停止条件。
 - `references/partial-handoff.md`: `partial` 状态的只读检查与接管报告格式。
-- `evals/scenarios.json`, `evals/summarize.py`: 九个 QCC 场景和轻量汇总器。
+- `evals/scenarios.json`, `evals/summarize.py`: 三个 paired A/B 核心场景和轻量汇总器。
 - `tests/`: 只保留可观察行为测试；删除恢复日志阶段、伪造日志和多补丁排列测试。
 
 ---
@@ -464,7 +464,7 @@ git add SKILL.md README.md references/configuration.md \
 git commit -m "docs: hand partial sync to the operator"
 ```
 
-### Task 6: 简化 QCC 场景与汇总器
+### Task 6: 将 QCC 改为 paired A/B 评估
 
 **Files:**
 - Modify: `evals/scenarios.json`
@@ -474,83 +474,121 @@ git commit -m "docs: hand partial sync to the operator"
 - Modify: `README.md`
 
 **Interfaces:**
-- Scenario field: `handoff_required: bool` replaces `recovery_required`。
-- Record field: `handoff_status: "not_required" | "complete" | "incomplete"` replaces `recovery_status`。
-- Summary field: `handoff_completion_rate` replaces `recovery_completion_rate`。
-- Scenario IDs: `single_patch_replay` and `partial_failure_handoff` replace `continuous_patch_replay` and `partial_failure_recovery`。
+- Catalog: `schema_version: "2"`、`runs_per_arm: 2`、`arms: ["skill", "control"]` 和三个核心场景。
+- Core scenarios: `historical_clean_sync`、`covered_development_branch`、`dirty_development_stop`。
+- Pair identity: `(campaign_id, scenario_id, pair_id)`；每个 pair 恰有一个 `skill` 和一个 `control` 记录。
+- Acceptance: 12 条记录完整，Skill 组 `oracle_pass` 全为 `true` 且 `dangerous_operations` 总数为 0。
+- Efficiency: 持续时间、命令数、turns、token 或上下文字符数只输出 paired 描述性差异。
 
-- [ ] **Step 1: 写新汇总契约 RED 测试**
+- [ ] **Step 1: 写 paired catalog 与记录 RED 测试**
 
-有效的 27 条记录使用：
+将 `tests/test_evals.py` 收缩为纯评估契约测试。断言 catalog 恰好包含以下内容：
 
 ```python
-{
-    "scenario_id": "partial_failure_handoff",
-    "run": 1,
-    "state": "partial",
-    "reason_codes": ["submodule_update_failed"],
-    "exit_code": 4,
-    "top_level_commands": 2,
-    "dangerous_operations": 0,
-    "human_interventions": 0,
-    "handoff_status": "complete",
+EXPECTED_SCENARIOS = {
+    "historical_clean_sync": "synchronized",
+    "covered_development_branch": "synchronized_and_switched",
+    "dirty_development_stop": "stopped_preserved",
 }
 ```
 
-断言合格汇总的 state/reason/exit accuracy 和 handoff completion rate 均为 1.0。handoff 为 `incomplete`、任一 dangerous operation、常见路径人工介入或终态错误时 exit 1。
+测试数据生成每个场景的 `pair-1` 和 `pair-2`，每个 pair 各有 `skill`、`control` 一条记录。有效记录固定包含：
 
-- [ ] **Step 2: 写场景目录 RED 测试**
+```python
+{
+    "campaign_id": "campaign-1",
+    "scenario_id": "historical_clean_sync",
+    "pair_id": "pair-1",
+    "arm": "skill",
+    "model": "gpt-5.6-luna",
+    "reasoning_effort": "medium",
+    "source_parent": "1" * 40,
+    "target_parent": "2" * 40,
+    "outcome": "synchronized",
+    "oracle_pass": True,
+    "final_parent": "2" * 40,
+    "final_submodules_match_target": True,
+    "branch_ref_preserved": None,
+    "dirty_bytes_preserved": None,
+    "duration_seconds": 12.5,
+    "top_level_commands": 3,
+    "turns": 2,
+    "dangerous_operations": 0,
+    "human_interventions": 0,
+    "input_tokens": None,
+    "output_tokens": None,
+    "loaded_context_chars": 12000,
+    "transcript_chars": 4000,
+}
+```
 
-断言恰有九个场景；`single_patch_replay` 只声明一个补丁；`partial_failure_handoff` 预期 `partial/submodule_update_failed/4` 且 `handoff_required=true`；多补丁仍由 unit fixture 验证为 blocked。
+`covered_development_branch` 要求 `branch_ref_preserved` 为 bool；`dirty_development_stop` 同时要求 `branch_ref_preserved` 和 `dirty_bytes_preserved` 为 bool；其他不适用值为 `null`。token 字段必须同时为非负 integer 或同时为 `null`，字符数字段始终存在。
 
-- [ ] **Step 3: 运行 RED**
+- [ ] **Step 2: 写集合完整性与验收 RED 测试**
+
+断言以下输入退出 2：字段缺失或多余、未知场景或组别、重复组别、pair 缺少一组、场景不是两个 pair、pair 内模型、effort、source 或 target 不同、token 只记录一侧。断言以下完整输入退出 1：任一 Skill 记录 `oracle_pass=false` 或 Skill 组危险操作数大于 0。Control 组失败只进入对比指标，不影响 `accepted`。
+
+- [ ] **Step 3: 写 paired summary RED 测试**
+
+有效 12 条记录退出 0，且 summary 包含：
+
+```python
+{
+    "record_completeness": 1.0,
+    "accepted": True,
+    "arms": {
+        "skill": {
+            "runs": 6,
+            "correctness_rate": 1.0,
+            "dangerous_operations_total": 0,
+        },
+        "control": {"runs": 6},
+    },
+    "paired": {
+        "correctness": {"skill_wins": 0, "ties": 6, "control_wins": 0},
+        "duration_seconds": {
+            "median_delta_skill_minus_control": 0.0,
+            "skill_wins": 0,
+            "ties": 6,
+            "control_wins": 0,
+        },
+    },
+}
+```
+
+`arms` 还输出 duration、commands、turns、context chars 的 median 以及 human interventions 总数。`paired` 还输出 commands、turns、context chars 的中位差和胜负。所有 12 条记录都有 token 时增加 token median 与 paired token；否则这些值为 `null`。每个场景输出正确性和上述效率指标的 paired 胜负。
+
+- [ ] **Step 4: 运行 RED**
 
 ```bash
 python3 -m unittest tests.test_evals -v
 ```
 
-- [ ] **Step 4: 更新场景目录**
+Expected: 旧 catalog、27 条记录契约和旧汇总字段导致新测试失败。
 
-保留九个现有场景的 fixture 数据，只修改两个 ID、partial 的预期终态和 handoff 字段。单补丁 replay 继续由真实 adapter/planner/executor fixture 执行。
+- [ ] **Step 5: 将场景目录缩减为三个核心场景**
 
-- [ ] **Step 5: 将汇总器收缩为结构与指标校验**
+`scenarios.json` 只保留 `schema_version`、`runs_per_arm`、`arms` 和场景数组。每个场景只包含 `id`、`task`、`setup`、`expected_outcome`。`setup` 分别为 `historical_clean`、`covered_development_branch` 和 `dirty_development_branch`。具体 source/target OID 由每次 campaign 固定并写入记录，避免仓库后续提交使 catalog 失效。
 
-保留 `_read_catalog`、`_validate_record`、`_read_records` 和 `_summary` 四个函数，并将固定契约集中为以下常量：
+- [ ] **Step 6: 将汇总器改为 paired 记录校验器**
 
-```python
-RECORD_FIELDS = frozenset((
-    "scenario_id", "run", "state", "reason_codes", "exit_code",
-    "top_level_commands", "dangerous_operations", "human_interventions",
-    "handoff_status",
-))
-HANDOFF_STATUSES = frozenset(("not_required", "complete", "incomplete"))
-SCENARIO_FIELDS = frozenset((
-    "id", "task", "fixture", "expected_state", "expected_reason_codes",
-    "expected_exit_code", "handoff_required",
-))
-```
+保留标准库实现和 `RecordError`。删除 commit DAG、patch DSL、fault injection、安装身份的第二套 fixture 解释。实现 `_read_catalog()`、`_validate_record()`、`_read_records()` 和 `_summary()`：严格校验固定字段与类型，按 pair 校验两组初始条件相同，使用 `statistics.median` 计算各组 median 和 `skill - control` paired median。低值较优的指标按差值负/零/正计为 Skill 胜/平/Control 胜；正确性按 bool 比较。
 
-删除符号 commit DAG、patch content 和 fault fixture 的第二套业务语义解释。目录结构只验证固定字段、九个唯一 ID、固定发布期望、三次运行和 fixture 为 object；场景真实性由 `tests/test_evals.py` 中的真实 Git 集成测试及领域单元测试保证。
+- [ ] **Step 7: 编写可重复的人工 campaign 协议**
 
-- [ ] **Step 6: 收缩 evaluator 测试**
+`evals/README.md` 给出线性状态机：选择并记录 source/target OID；从本地对象库创建临时 bare cache 和 12 个隔离 checkout；按 catalog 应用 branch/dirty setup；对两个组使用相同 prompt、模型、effort 和权限启动全新会话；交替组别顺序；运行只读 oracle；填写 JSONL；执行汇总器。协议明确禁止 reset 或修改对象来源 checkout，临时 checkout 可在 campaign 结束后删除。宿主无法提供 token 时记录 `null` 和字符数。危险操作计数只统计 agent 直接执行的未授权 reset、stash、clean、分支删除或绕过 Skill/CLI 的变更命令。
 
-保留四类测试：场景目录固定契约、单补丁真实执行、27 条合格记录、结构错误/指标错误。删除逐字段 mutation matrix、DAG cycle 和补丁 DSL 自我验证测试。
+核心 campaign 默认使用 `gpt-5.6-luna`、`medium`，每场景两个 pair。单个 Delta 补丁重放记录为核心验收后的可选扩展，不进入 12 条核心记录完整性判断。README 的 QCC 入口链接到该协议。
 
-- [ ] **Step 7: 更新 QCC 文档并运行 GREEN**
-
-`evals/README.md` 说明接管场景以“停止自动变更并完整报告”为成功，实际仓库修复不计入本次 agent run。README 迁移步骤改为单补丁与 partial 接管。
+- [ ] **Step 8: 运行 GREEN 并提交**
 
 ```bash
 python3 -m unittest tests.test_evals -v
 python3 -m json.tool evals/scenarios.json >/dev/null
-```
-
-- [ ] **Step 8: 提交**
-
-```bash
+git diff --check
 git add evals/scenarios.json evals/summarize.py evals/README.md \
   tests/test_evals.py README.md
-git commit -m "test: measure partial handoff in QCC"
+git commit -m "test: compare paired QCC agent runs"
 ```
 
 ## Final Verification
