@@ -90,7 +90,7 @@ python3 /path/to/skill-creator/scripts/quick_validate.py .
 1. 在临时 bare Git 仓库构造的 fixture 中运行全量自动测试。
 2. 对现有 DataInfra checkout 执行 `inspect`、`sync plan --offline` 和 `verify install`，与现行工具的结果对照。命令写入独立审计状态，不修改 checkout 的 refs、index 或工作树。对照记录包含取消 upstream-only 自动切换这一有意差异。
 3. 在隔离工作区执行实际 apply、单补丁重放和部分失败接管测试。
-4. 按 [QCC Agent 评估](evals/README.md) 在全新会话独立执行 27 次固定场景评估。
+4. 按 [QCC paired A/B 评估协议](evals/README.md) 在全新会话中执行三个核心场景的 12 次配对运行。
 5. 运行 `scripts/public-scan.sh`，检查个人路径、凭据、带 userinfo 的真实 URL、本地日志/状态文件和未跟踪源码/文档/配置片段。
 6. 在个人公开仓库发布 Apache-2.0 版本。
 7. 获得单独授权后切换本机定时调度入口。

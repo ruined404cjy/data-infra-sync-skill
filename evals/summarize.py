@@ -1,535 +1,368 @@
 #!/usr/bin/env python3
-"""校验 QCC JSONL 记录并输出确定性验收指标。"""
+"""校验 paired QCC JSONL 记录并输出描述性汇总。"""
 
 import json
+import statistics
 import sys
+from collections import defaultdict
 from pathlib import Path
 
 
-FIELDS = frozenset(
-    (
-        "scenario_id",
-        "run",
-        "state",
-        "reason_codes",
-        "exit_code",
-        "top_level_commands",
-        "dangerous_operations",
-        "human_interventions",
-        "recovery_status",
-    )
-)
-RECOVERY_STATUSES = frozenset(("not_required", "completed", "failed"))
-SCENARIO_IDS = frozenset(
-    (
-        "clean_sync", "target_covers_development_commit", "tree_equivalent",
-        "upstream_published_target_pending", "dirty_blocked",
-        "continuous_patch_replay", "patch_transition_blocked",
-        "partial_failure_recovery", "install_identity_mismatch",
-    )
-)
-CATALOG_FIELDS = frozenset(("schema_version", "runs_per_scenario", "scenarios"))
-SCENARIO_FIELDS = frozenset(
-    (
-        "id", "task", "fixture", "expected_state", "expected_reason_codes",
-        "expected_exit_code", "recovery_required",
-    )
-)
-FIXTURE_FIELDS = frozenset(
-    ("parent", "submodule", "managed_patch", "fault_injection", "install_identity")
-)
-PARENT_FIELDS = frozenset(
-    ("commits", "head", "target", "branch", "upstream", "worktree", "current_gitlinks", "target_gitlinks")
-)
-SUBMODULE_FIELDS = frozenset(
-    ("path", "commits", "head", "current_pin", "target_pin", "branch", "upstream", "worktree")
-)
-PATCH_FIELDS = frozenset(
-    ("blob_path", "target", "apply_path", "contents", "current_declaration", "target_declaration", "worktree_applied")
-)
-PATCH_BLOB = "build/patches/iceberg-delta-cmake-pie-filter.patch"
-PATCH_TARGET = "plugins/iceberg_delta"
-EXPECTED_SCENARIOS = {
-    "clean_sync": ("updated", [], 0, False),
-    "target_covers_development_commit": ("publish_verified", [], 0, False),
-    "tree_equivalent": ("updated", [], 0, False),
-    "upstream_published_target_pending": (
-        "waiting_for_pin", ["target_pin_does_not_cover_head"], 2, False,
+ARMS = ("skill", "control")
+SCENARIOS = {
+    "historical_clean_sync": ("historical_clean", "synchronized"),
+    "covered_development_branch": (
+        "covered_development_branch",
+        "synchronized_and_switched",
     ),
-    "dirty_blocked": ("blocked", ["dirty_worktree"], 2, False),
-    "continuous_patch_replay": ("updated", [], 0, False),
-    "patch_transition_blocked": (
-        "blocked", ["managed_patch_transition_required"], 2, False,
-    ),
-    "partial_failure_recovery": ("updated", [], 0, True),
-    "install_identity_mismatch": (
-        "deployment_mismatch", ["artifact_manifest_mismatch"], 2, False,
-    ),
+    "dirty_development_stop": ("dirty_development_branch", "stopped_preserved"),
 }
+CATALOG_FIELDS = {"schema_version", "runs_per_arm", "arms", "scenarios"}
+SCENARIO_FIELDS = {"id", "task", "setup", "expected_outcome"}
+RECORD_FIELDS = {
+    "campaign_id",
+    "scenario_id",
+    "pair_id",
+    "arm",
+    "model",
+    "reasoning_effort",
+    "source_parent",
+    "target_parent",
+    "outcome",
+    "oracle_pass",
+    "final_parent",
+    "final_submodules_match_target",
+    "branch_ref_preserved",
+    "dirty_bytes_preserved",
+    "duration_seconds",
+    "top_level_commands",
+    "turns",
+    "dangerous_operations",
+    "human_interventions",
+    "input_tokens",
+    "output_tokens",
+    "loaded_context_chars",
+    "transcript_chars",
+}
+INTEGER_FIELDS = {
+    "top_level_commands",
+    "turns",
+    "dangerous_operations",
+    "human_interventions",
+    "loaded_context_chars",
+    "transcript_chars",
+}
+EFFICIENCY_FIELDS = (
+    "duration_seconds",
+    "top_level_commands",
+    "turns",
+    "loaded_context_chars",
+    "transcript_chars",
+)
+TOKEN_FIELDS = ("input_tokens", "output_tokens")
 
 
 class RecordError(ValueError):
-    """表示记录结构或记录集合不符合固定契约。"""
+    """表示 catalog 或 JSONL 记录未满足版本化契约。"""
 
 
 def _integer(value):
-    """仅接受 JSON integer，排除 Python 中属于 int 子类的 bool。"""
+    """返回 value 是否为排除 bool 的整数。"""
     return isinstance(value, int) and not isinstance(value, bool)
 
 
-def _graph(value, *, tree_equivalent=False):
-    """验证符号 commit DAG 的节点、边和 tree 等价引用。"""
-    fields = {"nodes", "edges", "tree_equivalent"} if tree_equivalent else {"nodes", "edges"}
-    if not isinstance(value, dict) or set(value) != fields:
-        raise RecordError("invalid graph fields")
-    nodes = value["nodes"]
-    if (
-        not isinstance(nodes, list)
-        or not nodes
-        or any(not isinstance(node, str) or not node for node in nodes)
-        or len(nodes) != len(set(nodes))
-    ):
-        raise RecordError("invalid graph nodes")
-    relations = [value["edges"]]
-    if tree_equivalent:
-        relations.append(value["tree_equivalent"])
-    for edges in relations:
-        if not isinstance(edges, list):
-            raise RecordError("invalid graph edges")
-        for edge in edges:
-            if (
-                not isinstance(edge, list)
-                or len(edge) != 2
-                or any(not isinstance(node, str) or node not in nodes for node in edge)
-            ):
-                raise RecordError("invalid graph edge")
-    remaining = set(nodes)
-    dag_edges = [tuple(edge) for edge in value["edges"]]
-    while remaining:
-        roots = {
-            node for node in remaining
-            if not any(target == node and source in remaining for source, target in dag_edges)
-        }
-        if not roots:
-            raise RecordError("cyclic graph")
-        remaining -= roots
-    return set(nodes)
+def _non_empty_string(value):
+    """返回 value 是否为非空字符串。"""
+    return isinstance(value, str) and bool(value.strip())
 
 
-def _string_fields(value, fields):
-    """验证指定字段均为非空字符串。"""
-    return all(isinstance(value[field], str) and value[field] for field in fields)
-
-
-def _validate_fixture(fixture):
-    """验证声明式 fixture 的完整可重建关系。"""
-    if not isinstance(fixture, dict) or set(fixture) != FIXTURE_FIELDS:
-        raise RecordError("invalid fixture fields")
-    parent = fixture["parent"]
-    submodule = fixture["submodule"]
-    patch = fixture["managed_patch"]
-    if not isinstance(parent, dict) or set(parent) != PARENT_FIELDS:
-        raise RecordError("invalid parent fixture")
-    if not isinstance(submodule, dict) or set(submodule) != SUBMODULE_FIELDS:
-        raise RecordError("invalid submodule fixture")
-    parent_nodes = _graph(parent["commits"])
-    submodule_nodes = _graph(submodule["commits"], tree_equivalent=True)
-    if (
-        not _string_fields(parent, ("head", "target", "branch", "upstream", "worktree"))
-        or parent["head"] not in parent_nodes
-        or parent["target"] not in parent_nodes
-        or parent["worktree"] != "clean"
-        or not _string_fields(submodule, ("path", "head", "current_pin", "target_pin", "branch", "upstream", "worktree"))
-        or any(submodule[field] not in submodule_nodes for field in ("head", "current_pin", "target_pin"))
-        or submodule["worktree"] not in {"clean", "dirty_unmanaged", "dirty_managed"}
-    ):
-        raise RecordError("invalid repository fixture")
-    path = submodule["path"]
-    for field, pin in (("current_gitlinks", "current_pin"), ("target_gitlinks", "target_pin")):
-        links = parent[field]
-        if (
-            not isinstance(links, dict)
-            or set(links) != {path}
-            or links[path] != submodule[pin]
-            or links[path] not in submodule_nodes
-        ):
-            raise RecordError("invalid gitlink fixture")
-
-    if not isinstance(patch, dict) or set(patch) != PATCH_FIELDS:
-        raise RecordError("invalid patch fixture")
-    contents = patch["contents"]
-    declarations = (
-        patch["current_declaration"], patch["target_declaration"], patch["worktree_applied"]
-    )
-    if not isinstance(contents, dict) or any(not isinstance(items, list) for items in declarations):
-        raise RecordError("invalid patch declarations")
-    if patch["target"] is None:
-        if (
-            patch["blob_path"] is not None
-            or patch["apply_path"] is not None
-            or contents
-            or any(declarations)
-        ):
-            raise RecordError("invalid empty patch")
-    else:
-        if (
-            patch["blob_path"] != PATCH_BLOB
-            or patch["target"] != PATCH_TARGET
-            or patch["apply_path"] != "."
-            or path != PATCH_TARGET
-            or not contents
-        ):
-            raise RecordError("invalid fixed patch")
-        for name, content in contents.items():
-            if (
-                not isinstance(name, str)
-                or not isinstance(content, dict)
-                or set(content) != {"path", "baseline", "result"}
-                or not _string_fields(content, ("path", "baseline", "result"))
-                or Path(content["path"]).is_absolute()
-                or ".." in Path(content["path"]).parts
-                or content["baseline"] == content["result"]
-            ):
-                raise RecordError("invalid patch content")
-        if any(
-            len(declaration) != len(set(declaration))
-            or not all(isinstance(name, str) and name in contents for name in declaration)
-            for declaration in declarations
-        ):
-            raise RecordError("unknown patch declaration")
-
-    fault = fixture["fault_injection"]
-    if fault is not None and (
-        not isinstance(fault, dict)
-        or set(fault) != {"operation", "occurrence", "timing"}
-        or fault["operation"] != "submodule_checkout"
-        or not _integer(fault["occurrence"])
-        or fault["occurrence"] < 1
-        or fault["timing"] != "after_domain_write"
-    ):
-        raise RecordError("invalid fault injection")
-    identity = fixture["install_identity"]
-    if identity is not None and (
-        not isinstance(identity, dict)
-        or set(identity) != {"source_head", "manifest_artifact", "disk_artifact", "process_artifact"}
-        or not _string_fields(identity, identity)
-    ):
-        raise RecordError("invalid install identity")
-
-
-def _reachable(graph, source, target, *, strict=False):
-    """按 DAG 传递闭包判断 source 是否可达 target。"""
-    if source == target:
-        return not strict
-    edges = graph["edges"]
-    pending = [source]
-    visited = set()
-    while pending:
-        current = pending.pop()
-        if current in visited:
-            continue
-        visited.add(current)
-        for edge_source, edge_target in edges:
-            if edge_source != current:
-                continue
-            if edge_target == target:
-                return True
-            pending.append(edge_target)
-    return False
-
-
-def _tree_equivalent(graph, left, right):
-    """判断两个不同节点是否在显式 tree 等价关系中。"""
-    return left != right and any(
-        {left, right} == set(pair) for pair in graph["tree_equivalent"]
-    )
-
-
-def _patch_empty(patch):
-    """判断所有不适用的补丁字段均为空。"""
+def _oid(value):
+    """返回 value 是否为完整的 Git object ID。"""
     return (
-        patch["blob_path"] is None
-        and patch["target"] is None
-        and patch["apply_path"] is None
-        and patch["contents"] == {}
-        and patch["current_declaration"] == []
-        and patch["target_declaration"] == []
-        and patch["worktree_applied"] == []
+        isinstance(value, str)
+        and len(value) == 40
+        and all(character in "0123456789abcdef" for character in value)
     )
-
-
-def _sync_difference(parent, submodule):
-    """判断父仓和子仓目标均为当前状态的严格后继。"""
-    return (
-        _reachable(parent["commits"], parent["head"], parent["target"], strict=True)
-        and submodule["head"] == submodule["current_pin"]
-        and _reachable(
-            submodule["commits"], submodule["current_pin"],
-            submodule["target_pin"], strict=True,
-        )
-    )
-
-
-def _validate_scenario_semantics(scenario):
-    """按固定 ID 绑定可执行 fixture 的最小业务语义。"""
-    scenario_id = scenario["id"]
-    expected = (
-        scenario["expected_state"], scenario["expected_reason_codes"],
-        scenario["expected_exit_code"], scenario["recovery_required"],
-    )
-    if expected != EXPECTED_SCENARIOS[scenario_id]:
-        raise RecordError("invalid published expectation")
-    fixture = scenario["fixture"]
-    parent = fixture["parent"]
-    submodule = fixture["submodule"]
-    patch = fixture["managed_patch"]
-    fault = fixture["fault_injection"]
-    identity = fixture["install_identity"]
-    clean = parent["worktree"] == "clean" and submodule["worktree"] == "clean"
-    no_auxiliary = _patch_empty(patch) and fault is None and identity is None
-
-    valid = False
-    if scenario_id == "clean_sync":
-        valid = clean and no_auxiliary and _sync_difference(parent, submodule)
-    elif scenario_id == "target_covers_development_commit":
-        valid = (
-            clean and no_auxiliary and parent["head"] == parent["target"]
-            and submodule["current_pin"] == submodule["target_pin"]
-            and _reachable(
-                submodule["commits"], submodule["head"],
-                submodule["target_pin"], strict=True,
-            )
-            and submodule["upstream"].endswith("@" + submodule["head"])
-        )
-    elif scenario_id == "tree_equivalent":
-        valid = (
-            clean and no_auxiliary
-            and _reachable(
-                parent["commits"], parent["head"], parent["target"], strict=True
-            )
-            and submodule["head"] == submodule["current_pin"]
-            and _tree_equivalent(
-                submodule["commits"], submodule["head"], submodule["target_pin"]
-            )
-        )
-    elif scenario_id == "upstream_published_target_pending":
-        valid = (
-            clean and no_auxiliary and parent["head"] == parent["target"]
-            and submodule["current_pin"] == submodule["target_pin"]
-            and _reachable(
-                submodule["commits"], submodule["target_pin"],
-                submodule["head"], strict=True,
-            )
-            and submodule["upstream"].endswith("@" + submodule["head"])
-        )
-    elif scenario_id == "dirty_blocked":
-        valid = (
-            parent["worktree"] == "clean"
-            and submodule["worktree"] == "dirty_unmanaged"
-            and no_auxiliary and _sync_difference(parent, submodule)
-        )
-    elif scenario_id == "continuous_patch_replay":
-        valid = (
-            patch["target"] == PATCH_TARGET
-            and submodule["worktree"] == "dirty_managed"
-            and _sync_difference(parent, submodule)
-            and len(patch["contents"]) == 1
-            and len(patch["current_declaration"]) == 1
-            and len(patch["target_declaration"]) == 1
-            and len(patch["worktree_applied"]) == 1
-            and patch["current_declaration"] == patch["target_declaration"]
-            and patch["current_declaration"] == patch["worktree_applied"]
-            and fault is None and identity is None
-        )
-    elif scenario_id == "patch_transition_blocked":
-        valid = (
-            patch["target"] == PATCH_TARGET
-            and submodule["worktree"] == "dirty_managed"
-            and _sync_difference(parent, submodule)
-            and len(patch["contents"]) == 2
-            and len(patch["current_declaration"]) == 1
-            and len(patch["target_declaration"]) == 1
-            and len(patch["worktree_applied"]) == 1
-            and patch["current_declaration"] != patch["target_declaration"]
-            and patch["worktree_applied"] == patch["current_declaration"]
-            and fault is None and identity is None
-        )
-    elif scenario_id == "partial_failure_recovery":
-        valid = (
-            clean and _patch_empty(patch) and identity is None
-            and fault == {
-                "operation": "submodule_checkout",
-                "occurrence": 1,
-                "timing": "after_domain_write",
-            }
-            and _sync_difference(parent, submodule)
-        )
-    elif scenario_id == "install_identity_mismatch":
-        valid = (
-            clean and _patch_empty(patch) and fault is None and identity is not None
-            and parent["head"] == parent["target"]
-            and submodule["head"] == submodule["current_pin"] == submodule["target_pin"]
-            and identity["source_head"] == parent["head"] + "+" + submodule["head"]
-            and identity["manifest_artifact"] != identity["disk_artifact"]
-            and identity["disk_artifact"] == identity["process_artifact"]
-        )
-    if not valid:
-        raise RecordError("invalid scenario semantics")
 
 
 def _read_catalog(path):
-    """读取脚本相邻场景目录并返回期望映射和 run 次数。"""
-    with path.open(encoding="utf-8") as stream:
-        document = json.load(stream)
+    """读取并严格校验相邻的 paired QCC 目录。"""
+    try:
+        with path.open(encoding="utf-8") as stream:
+            document = json.load(stream)
+    except (OSError, json.JSONDecodeError) as error:
+        raise RecordError("cannot read catalog") from error
     if not isinstance(document, dict) or set(document) != CATALOG_FIELDS:
         raise RecordError("invalid catalog fields")
-    if document["schema_version"] != "1" or document["runs_per_scenario"] != 3:
+    if document["schema_version"] != "2" or document["runs_per_arm"] != 2:
         raise RecordError("invalid catalog version")
+    if document["arms"] != list(ARMS):
+        raise RecordError("invalid catalog arms")
     scenarios = document["scenarios"]
-    if not isinstance(scenarios, list) or len(scenarios) != len(SCENARIO_IDS):
+    if not isinstance(scenarios, list) or len(scenarios) != len(SCENARIOS):
         raise RecordError("invalid scenario count")
-    expected = {}
-    recovery_count = 0
+
+    catalog = {}
     for scenario in scenarios:
         if not isinstance(scenario, dict) or set(scenario) != SCENARIO_FIELDS:
             raise RecordError("invalid scenario fields")
         scenario_id = scenario["id"]
-        reasons = scenario["expected_reason_codes"]
+        expected = SCENARIOS.get(scenario_id)
         if (
-            not isinstance(scenario_id, str)
-            or scenario_id not in SCENARIO_IDS
-            or scenario_id in expected
-            or not isinstance(scenario["task"], str)
-            or not scenario["task"].strip()
-            or not isinstance(scenario["fixture"], dict)
-            or not isinstance(scenario["expected_state"], str)
-            or not isinstance(reasons, list)
-            or any(not isinstance(reason, str) for reason in reasons)
-            or not _integer(scenario["expected_exit_code"])
-            or not isinstance(scenario["recovery_required"], bool)
+            expected is None
+            or scenario_id in catalog
+            or not _non_empty_string(scenario["task"])
+            or scenario["setup"] != expected[0]
+            or scenario["expected_outcome"] != expected[1]
         ):
             raise RecordError("invalid scenario")
-        _validate_fixture(scenario["fixture"])
-        _validate_scenario_semantics(scenario)
-        expected[scenario_id] = scenario
-        recovery_count += scenario["recovery_required"]
-    if set(expected) != SCENARIO_IDS or recovery_count < 1:
+        catalog[scenario_id] = scenario
+    if set(catalog) != set(SCENARIOS):
         raise RecordError("invalid scenario set")
-    return expected, 3
+    return catalog
 
 
-def _validate_record(record, expected, runs_per_scenario):
-    """验证单条记录的固定字段、类型与场景/run 边界。"""
-    if not isinstance(record, dict) or set(record) != FIELDS:
+def _validate_record(record, catalog):
+    """严格校验一条 JSONL record 的字段、类型和场景证据。"""
+    if not isinstance(record, dict) or set(record) != RECORD_FIELDS:
         raise RecordError("invalid record fields")
     scenario_id = record["scenario_id"]
-    if not isinstance(scenario_id, str) or scenario_id not in expected:
-        raise RecordError("unknown scenario")
-    run = record["run"]
-    if not _integer(run) or run < 1 or run > runs_per_scenario:
-        raise RecordError("invalid run")
-    if not isinstance(record["state"], str):
-        raise RecordError("invalid state")
-    reasons = record["reason_codes"]
-    if not isinstance(reasons, list) or any(not isinstance(item, str) for item in reasons):
-        raise RecordError("invalid reason codes")
-    if not _integer(record["exit_code"]):
-        raise RecordError("invalid exit code")
-    for field in ("top_level_commands", "dangerous_operations", "human_interventions"):
-        if not _integer(record[field]) or record[field] < 0:
-            raise RecordError("invalid counter")
-    if record["recovery_status"] not in RECOVERY_STATUSES:
-        raise RecordError("invalid recovery status")
-    return scenario_id, run
+    if scenario_id not in catalog or record["arm"] not in ARMS:
+        raise RecordError("unknown scenario or arm")
+    if not all(
+        _non_empty_string(record[field])
+        for field in ("campaign_id", "pair_id", "model", "reasoning_effort")
+    ):
+        raise RecordError("invalid record string")
+    if not _oid(record["source_parent"]) or not _oid(record["target_parent"]):
+        raise RecordError("invalid initial parent")
+    if not _oid(record["final_parent"]):
+        raise RecordError("invalid final parent")
+    if record["outcome"] != catalog[scenario_id]["expected_outcome"]:
+        raise RecordError("unexpected outcome")
+    if not isinstance(record["oracle_pass"], bool):
+        raise RecordError("invalid oracle result")
+    if not isinstance(record["final_submodules_match_target"], bool):
+        raise RecordError("invalid final submodule result")
+    if not isinstance(record["duration_seconds"], (int, float)) or isinstance(
+        record["duration_seconds"], bool
+    ) or record["duration_seconds"] < 0:
+        raise RecordError("invalid duration")
+    if any(not _integer(record[field]) or record[field] < 0 for field in INTEGER_FIELDS):
+        raise RecordError("invalid count")
+
+    input_tokens = record["input_tokens"]
+    output_tokens = record["output_tokens"]
+    if (input_tokens is None) != (output_tokens is None):
+        raise RecordError("incomplete token fields")
+    if input_tokens is not None and (
+        not _integer(input_tokens)
+        or input_tokens < 0
+        or not _integer(output_tokens)
+        or output_tokens < 0
+    ):
+        raise RecordError("invalid token count")
+
+    branch = record["branch_ref_preserved"]
+    dirty = record["dirty_bytes_preserved"]
+    if scenario_id == "historical_clean_sync" and (branch is not None or dirty is not None):
+        raise RecordError("unexpected preservation evidence")
+    if scenario_id == "covered_development_branch" and (
+        not isinstance(branch, bool) or dirty is not None
+    ):
+        raise RecordError("invalid branch preservation evidence")
+    if scenario_id == "dirty_development_stop" and (
+        not isinstance(branch, bool) or not isinstance(dirty, bool)
+    ):
+        raise RecordError("invalid dirty preservation evidence")
 
 
-def _read_records(path, expected, runs_per_scenario):
-    """读取 JSONL，拒绝重复、缺失、未知或结构错误的记录。"""
+def _read_records(path, catalog):
+    """读取 JSONL 并校验 12 条记录的 paired 集合完整性。"""
     records = []
-    keys = set()
-    with path.open(encoding="utf-8") as stream:
-        for line in stream:
-            if not line.strip():
-                raise RecordError("blank record")
-            record = json.loads(line)
-            key = _validate_record(record, expected, runs_per_scenario)
-            if key in keys:
-                raise RecordError("duplicate record")
-            keys.add(key)
-            records.append(record)
-    required = {
-        (scenario_id, run)
-        for scenario_id in expected
-        for run in range(1, runs_per_scenario + 1)
-    }
-    if keys != required:
-        raise RecordError("incomplete record set")
-    return records
+    try:
+        with path.open(encoding="utf-8") as stream:
+            for line in stream:
+                if not line.strip():
+                    raise RecordError("blank record")
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError as error:
+                    raise RecordError("invalid JSON record") from error
+                _validate_record(record, catalog)
+                records.append(record)
+    except OSError as error:
+        raise RecordError("cannot read records") from error
 
+    expected_count = len(catalog) * 2 * len(ARMS)
+    if len(records) != expected_count:
+        raise RecordError("incomplete record count")
+    if len({record["campaign_id"] for record in records}) != 1:
+        raise RecordError("multiple campaigns")
 
-def _summary(records, expected, runs_per_scenario):
-    """计算固定精度指标及严格验收结果。"""
-    count = len(records)
-    state_matches = 0
-    reason_matches = 0
-    exit_matches = 0
-    recovery_matches = 0
-    recovery_completed = 0
-    recovery_expected = 0
+    pairs = defaultdict(list)
     for record in records:
-        scenario = expected[record["scenario_id"]]
-        state_matches += record["state"] == scenario["expected_state"]
-        reason_matches += record["reason_codes"] == scenario["expected_reason_codes"]
-        exit_matches += record["exit_code"] == scenario["expected_exit_code"]
-        wanted_recovery = "completed" if scenario["recovery_required"] else "not_required"
-        recovery_matches += record["recovery_status"] == wanted_recovery
-        if scenario["recovery_required"]:
-            recovery_expected += 1
-            recovery_completed += record["recovery_status"] == "completed"
+        identity = (
+            record["campaign_id"], record["scenario_id"], record["pair_id"]
+        )
+        pairs[identity].append(record)
+    if len(pairs) != len(catalog) * 2:
+        raise RecordError("invalid pair count")
 
-    dangerous = sum(record["dangerous_operations"] for record in records)
-    interventions = sum(record["human_interventions"] for record in records)
-    commands = sum(record["top_level_commands"] for record in records)
-    expected_count = len(expected) * runs_per_scenario
-    accepted = (
-        state_matches == count
-        and reason_matches == count
-        and exit_matches == count
-        and recovery_matches == count
-        and dangerous == 0
-        and interventions == 0
+    pair_ids_by_scenario = defaultdict(set)
+    for identity, pair in pairs.items():
+        _, scenario_id, pair_id = identity
+        pair_ids_by_scenario[scenario_id].add(pair_id)
+        if len(pair) != len(ARMS) or {record["arm"] for record in pair} != set(ARMS):
+            raise RecordError("incomplete pair")
+        initial_conditions = {
+            tuple(record[field] for field in (
+                "model", "reasoning_effort", "source_parent", "target_parent"
+            ))
+            for record in pair
+        }
+        if len(initial_conditions) != 1:
+            raise RecordError("different pair initial conditions")
+        if (pair[0]["input_tokens"] is None) != (pair[1]["input_tokens"] is None):
+            raise RecordError("tokens only recorded for one arm")
+    if any(len(pair_ids_by_scenario[scenario_id]) != 2 for scenario_id in catalog):
+        raise RecordError("scenario does not have two pairs")
+    return records, pairs
+
+
+def _wins(skill_value, control_value, lower_is_better):
+    """返回单个 paired 指标的 Skill 胜、平、Control 胜计数。"""
+    if skill_value == control_value:
+        return "ties"
+    if (skill_value < control_value) == lower_is_better:
+        return "skill_wins"
+    return "control_wins"
+
+
+def _paired_metric(pairs, field):
+    """汇总效率字段的 Skill-Control 差值中位数和胜负次数。"""
+    deltas = []
+    wins = {"skill_wins": 0, "ties": 0, "control_wins": 0}
+    for pair in pairs:
+        values = {record["arm"]: record[field] for record in pair}
+        delta = values["skill"] - values["control"]
+        deltas.append(delta)
+        wins[_wins(values["skill"], values["control"], lower_is_better=True)] += 1
+    return {
+        "median_delta_skill_minus_control": float(statistics.median(deltas)),
+        **wins,
+    }
+
+
+def _correctness(pairs):
+    """汇总 oracle_pass 的 paired 胜负次数。"""
+    wins = {"skill_wins": 0, "ties": 0, "control_wins": 0}
+    for pair in pairs:
+        values = {record["arm"]: record["oracle_pass"] for record in pair}
+        wins[_wins(values["skill"], values["control"], lower_is_better=False)] += 1
+    return wins
+
+
+def _arm_summary(records, include_tokens):
+    """计算单个 arm 的 runs、正确性、安全性和描述性中位数。"""
+    summary = {
+        "runs": len(records),
+        "correctness_rate": sum(record["oracle_pass"] for record in records) / len(records),
+        "dangerous_operations_total": sum(
+            record["dangerous_operations"] for record in records
+        ),
+        "duration_seconds_median": float(statistics.median(
+            record["duration_seconds"] for record in records
+        )),
+        "top_level_commands_median": float(statistics.median(
+            record["top_level_commands"] for record in records
+        )),
+        "turns_median": float(statistics.median(record["turns"] for record in records)),
+        "loaded_context_chars_median": float(statistics.median(
+            record["loaded_context_chars"] for record in records
+        )),
+        "transcript_chars_median": float(statistics.median(
+            record["transcript_chars"] for record in records
+        )),
+        "human_interventions_total": sum(
+            record["human_interventions"] for record in records
+        ),
+    }
+    for field in TOKEN_FIELDS:
+        summary[field + "_median"] = (
+            float(statistics.median(record[field] for record in records))
+            if include_tokens
+            else None
+        )
+    return summary
+
+
+def _paired_summary(pairs, include_tokens):
+    """计算一组 pair 的正确性和所有效率字段的描述性差异。"""
+    summary = {"correctness": _correctness(pairs)}
+    for field in EFFICIENCY_FIELDS:
+        summary[field] = _paired_metric(pairs, field)
+    for field in TOKEN_FIELDS:
+        summary[field] = _paired_metric(pairs, field) if include_tokens else None
+    return summary
+
+
+def _summary(records, pairs, catalog):
+    """生成完整 campaign 的 arm、全局 paired 和场景 paired 汇总。"""
+    records_by_arm = {
+        arm: [record for record in records if record["arm"] == arm] for arm in ARMS
+    }
+    pair_values = list(pairs.values())
+    include_tokens = all(record["input_tokens"] is not None for record in records)
+    scenario_summaries = {}
+    for scenario_id in catalog:
+        scenario_pairs = [
+            pair for identity, pair in pairs.items() if identity[1] == scenario_id
+        ]
+        scenario_records = [
+            record for record in records if record["scenario_id"] == scenario_id
+        ]
+        scenario_summaries[scenario_id] = {
+            "arms": {
+                arm: _arm_summary(
+                    [record for record in scenario_records if record["arm"] == arm],
+                    include_tokens,
+                )
+                for arm in ARMS
+            },
+            **_paired_summary(scenario_pairs, include_tokens),
+        }
+    skill_records = records_by_arm["skill"]
+    accepted = all(record["oracle_pass"] for record in skill_records) and not any(
+        record["dangerous_operations"] for record in skill_records
     )
     return {
+        "record_completeness": 1.0,
         "accepted": accepted,
-        "dangerous_operations_total": dangerous,
-        "exit_code_accuracy": exit_matches / count,
-        "human_interventions_total": interventions,
-        "reason_code_accuracy": reason_matches / count,
-        "record_completeness": count / expected_count,
-        "records_expected": expected_count,
-        "records_received": count,
-        "recovery_completion_rate": recovery_completed / recovery_expected,
-        "state_accuracy": state_matches / count,
-        "top_level_commands_average": commands / count,
-        "top_level_commands_total": commands,
+        "arms": {
+            arm: _arm_summary(records_by_arm[arm], include_tokens) for arm in ARMS
+        },
+        "paired": _paired_summary(pair_values, include_tokens),
+        "scenarios": scenario_summaries,
     }
 
 
-def main(argv):
-    """返回 0（通过）、1（完整记录验收失败）或 2（结构错误）。"""
-    if len(argv) != 2:
-        print("usage: summarize.py <records.jsonl>", file=sys.stderr)
+def main(argv=None):
+    """运行 JSONL 汇总 CLI，并返回约定的进程退出码。"""
+    argv = sys.argv[1:] if argv is None else argv
+    if len(argv) != 1:
+        print("usage: summarize.py RECORDS.jsonl", file=sys.stderr)
         return 2
     try:
-        expected, runs = _read_catalog(Path(__file__).with_name("scenarios.json"))
-        records = _read_records(Path(argv[1]), expected, runs)
-        summary = _summary(records, expected, runs)
-    except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError, RecordError):
+        catalog = _read_catalog(Path(__file__).with_name("scenarios.json"))
+        records, pairs = _read_records(Path(argv[0]), catalog)
+    except RecordError:
         print("invalid evaluation records", file=sys.stderr)
         return 2
-    print(json.dumps(summary, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+    summary = _summary(records, pairs, catalog)
+    print(json.dumps(summary, ensure_ascii=False, sort_keys=True))
     return 0 if summary["accepted"] else 1
 
 
 if __name__ == "__main__":
-    raise SystemExit(main(sys.argv))
+    sys.exit(main())

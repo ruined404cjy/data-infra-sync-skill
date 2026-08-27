@@ -1,87 +1,25 @@
 {
-  "schema_version": "1",
-  "runs_per_scenario": 3,
+  "schema_version": "2",
+  "runs_per_arm": 2,
+  "arms": ["skill", "control"],
   "scenarios": [
     {
-      "id": "clean_sync", "task": "将现有 DataInfra checkout 安全同步到已发布目标，并报告最终 Result。",
-      "fixture": {
-        "parent": {"commits": {"nodes": ["P0", "P1"], "edges": [["P0", "P1"]]}, "head": "P0", "target": "P1", "branch": "main", "upstream": "origin/main", "worktree": "clean", "current_gitlinks": {"modules/component": "S0"}, "target_gitlinks": {"modules/component": "S1"}},
-        "submodule": {"path": "modules/component", "commits": {"nodes": ["S0", "S1"], "edges": [["S0", "S1"]], "tree_equivalent": []}, "head": "S0", "current_pin": "S0", "target_pin": "S1", "branch": "main", "upstream": "origin/main", "worktree": "clean"},
-        "managed_patch": {"blob_path": null, "target": null, "apply_path": null, "contents": {}, "current_declaration": [], "target_declaration": [], "worktree_applied": []}, "fault_injection": null, "install_identity": null
-      },
-      "expected_state": "updated", "expected_reason_codes": [], "expected_exit_code": 0, "recovery_required": false
+      "id": "historical_clean_sync",
+      "task": "将历史 clean DataInfra checkout 安全同步到固定目标，并报告只读 oracle 结果。",
+      "setup": "historical_clean",
+      "expected_outcome": "synchronized"
     },
     {
-      "id": "target_covers_development_commit", "task": "检查指定开发分支提交是否已发布且已被目标组合覆盖，并报告最终 Result。",
-      "fixture": {
-        "parent": {"commits": {"nodes": ["P1"], "edges": []}, "head": "P1", "target": "P1", "branch": "main", "upstream": "origin/main", "worktree": "clean", "current_gitlinks": {"modules/component": "S1"}, "target_gitlinks": {"modules/component": "S1"}},
-        "submodule": {"path": "modules/component", "commits": {"nodes": ["S0", "D1", "S1"], "edges": [["S0", "D1"], ["D1", "S1"]], "tree_equivalent": []}, "head": "D1", "current_pin": "S1", "target_pin": "S1", "branch": "feature/qcc", "upstream": "origin/feature/qcc@D1", "worktree": "clean"},
-        "managed_patch": {"blob_path": null, "target": null, "apply_path": null, "contents": {}, "current_declaration": [], "target_declaration": [], "worktree_applied": []}, "fault_injection": null, "install_identity": null
-      },
-      "expected_state": "publish_verified", "expected_reason_codes": [], "expected_exit_code": 0, "recovery_required": false
+      "id": "covered_development_branch",
+      "task": "确认已被目标覆盖的开发分支并安全切换 checkout，随后报告只读 oracle 结果。",
+      "setup": "covered_development_branch",
+      "expected_outcome": "synchronized_and_switched"
     },
     {
-      "id": "tree_equivalent", "task": "将包含 tree 等价子仓提交的现有 DataInfra checkout 安全同步到已发布目标，并报告最终 Result。",
-      "fixture": {
-        "parent": {"commits": {"nodes": ["P0", "P1"], "edges": [["P0", "P1"]]}, "head": "P0", "target": "P1", "branch": "main", "upstream": "origin/main", "worktree": "clean", "current_gitlinks": {"modules/component": "SDEV"}, "target_gitlinks": {"modules/component": "S1"}},
-        "submodule": {"path": "modules/component", "commits": {"nodes": ["S0", "SDEV", "S1"], "edges": [["S0", "SDEV"], ["S0", "S1"]], "tree_equivalent": [["SDEV", "S1"]]}, "head": "SDEV", "current_pin": "SDEV", "target_pin": "S1", "branch": "feature/tree", "upstream": "origin/feature/tree", "worktree": "clean"},
-        "managed_patch": {"blob_path": null, "target": null, "apply_path": null, "contents": {}, "current_declaration": [], "target_declaration": [], "worktree_applied": []}, "fault_injection": null, "install_identity": null
-      },
-      "expected_state": "updated", "expected_reason_codes": [], "expected_exit_code": 0, "recovery_required": false
-    },
-    {
-      "id": "upstream_published_target_pending", "task": "检查已推送开发提交的发布覆盖状态，并报告最终 Result。",
-      "fixture": {
-        "parent": {"commits": {"nodes": ["P0"], "edges": []}, "head": "P0", "target": "P0", "branch": "main", "upstream": "origin/main", "worktree": "clean", "current_gitlinks": {"modules/component": "S0"}, "target_gitlinks": {"modules/component": "S0"}},
-        "submodule": {"path": "modules/component", "commits": {"nodes": ["S0", "D1"], "edges": [["S0", "D1"]], "tree_equivalent": []}, "head": "D1", "current_pin": "S0", "target_pin": "S0", "branch": "feature/published", "upstream": "origin/feature/published@D1", "worktree": "clean"},
-        "managed_patch": {"blob_path": null, "target": null, "apply_path": null, "contents": {}, "current_declaration": [], "target_declaration": [], "worktree_applied": []}, "fault_injection": null, "install_identity": null
-      },
-      "expected_state": "waiting_for_pin", "expected_reason_codes": ["target_pin_does_not_cover_head"], "expected_exit_code": 2, "recovery_required": false
-    },
-    {
-      "id": "dirty_blocked", "task": "检查存在本地未提交修改的 DataInfra checkout 是否可同步，并报告最终 Result。",
-      "fixture": {
-        "parent": {"commits": {"nodes": ["P0", "P1"], "edges": [["P0", "P1"]]}, "head": "P0", "target": "P1", "branch": "main", "upstream": "origin/main", "worktree": "clean", "current_gitlinks": {"modules/component": "S0"}, "target_gitlinks": {"modules/component": "S1"}},
-        "submodule": {"path": "modules/component", "commits": {"nodes": ["S0", "S1"], "edges": [["S0", "S1"]], "tree_equivalent": []}, "head": "S0", "current_pin": "S0", "target_pin": "S1", "branch": "main", "upstream": "origin/main", "worktree": "dirty_unmanaged"},
-        "managed_patch": {"blob_path": null, "target": null, "apply_path": null, "contents": {}, "current_declaration": [], "target_declaration": [], "worktree_applied": []}, "fault_injection": null, "install_identity": null
-      },
-      "expected_state": "blocked", "expected_reason_codes": ["dirty_worktree"], "expected_exit_code": 2, "recovery_required": false
-    },
-    {
-      "id": "continuous_patch_replay", "task": "将带有连续受控构建补丁的 DataInfra checkout 安全同步到已发布目标，并报告最终 Result。",
-      "fixture": {
-        "parent": {"commits": {"nodes": ["P0", "P1"], "edges": [["P0", "P1"]]}, "head": "P0", "target": "P1", "branch": "main", "upstream": "origin/main", "worktree": "clean", "current_gitlinks": {"plugins/iceberg_delta": "S0"}, "target_gitlinks": {"plugins/iceberg_delta": "S1"}},
-        "submodule": {"path": "plugins/iceberg_delta", "commits": {"nodes": ["S0", "S1"], "edges": [["S0", "S1"]], "tree_equivalent": []}, "head": "S0", "current_pin": "S0", "target_pin": "S1", "branch": "main", "upstream": "origin/main", "worktree": "dirty_managed"},
-        "managed_patch": {"blob_path": "build/patches/iceberg-delta-cmake-pie-filter.patch", "target": "plugins/iceberg_delta", "apply_path": ".", "contents": {"patch_v1": {"path": "README.md", "baseline": "initial submodule\n", "result": "patched submodule v1\n"}}, "current_declaration": ["patch_v1"], "target_declaration": ["patch_v1"], "worktree_applied": ["patch_v1"]}, "fault_injection": null, "install_identity": null
-      },
-      "expected_state": "updated", "expected_reason_codes": [], "expected_exit_code": 0, "recovery_required": false
-    },
-    {
-      "id": "patch_transition_blocked", "task": "检查受控构建补丁声明发生迁移的 DataInfra checkout 是否可同步，并报告最终 Result。",
-      "fixture": {
-        "parent": {"commits": {"nodes": ["P0", "P1"], "edges": [["P0", "P1"]]}, "head": "P0", "target": "P1", "branch": "main", "upstream": "origin/main", "worktree": "clean", "current_gitlinks": {"plugins/iceberg_delta": "S0"}, "target_gitlinks": {"plugins/iceberg_delta": "S1"}},
-        "submodule": {"path": "plugins/iceberg_delta", "commits": {"nodes": ["S0", "S1"], "edges": [["S0", "S1"]], "tree_equivalent": []}, "head": "S0", "current_pin": "S0", "target_pin": "S1", "branch": "main", "upstream": "origin/main", "worktree": "dirty_managed"},
-        "managed_patch": {"blob_path": "build/patches/iceberg-delta-cmake-pie-filter.patch", "target": "plugins/iceberg_delta", "apply_path": ".", "contents": {"patch_v1": {"path": "README.md", "baseline": "initial submodule\n", "result": "patched submodule v1\n"}, "patch_v2": {"path": "README.md", "baseline": "initial submodule\n", "result": "patched submodule v2\n"}}, "current_declaration": ["patch_v1"], "target_declaration": ["patch_v2"], "worktree_applied": ["patch_v1"]}, "fault_injection": null, "install_identity": null
-      },
-      "expected_state": "blocked", "expected_reason_codes": ["managed_patch_transition_required"], "expected_exit_code": 2, "recovery_required": false
-    },
-    {
-      "id": "partial_failure_recovery", "task": "同步注入部分失败的 DataInfra checkout，按照 Result 完成恢复并继续到最终状态。",
-      "fixture": {
-        "parent": {"commits": {"nodes": ["P0", "P1"], "edges": [["P0", "P1"]]}, "head": "P0", "target": "P1", "branch": "main", "upstream": "origin/main", "worktree": "clean", "current_gitlinks": {"modules/component": "S0"}, "target_gitlinks": {"modules/component": "S1"}},
-        "submodule": {"path": "modules/component", "commits": {"nodes": ["S0", "S1"], "edges": [["S0", "S1"]], "tree_equivalent": []}, "head": "S0", "current_pin": "S0", "target_pin": "S1", "branch": "main", "upstream": "origin/main", "worktree": "clean"},
-        "managed_patch": {"blob_path": null, "target": null, "apply_path": null, "contents": {}, "current_declaration": [], "target_declaration": [], "worktree_applied": []}, "fault_injection": {"operation": "submodule_checkout", "occurrence": 1, "timing": "after_domain_write"}, "install_identity": null
-      },
-      "expected_state": "updated", "expected_reason_codes": [], "expected_exit_code": 0, "recovery_required": true
-    },
-    {
-      "id": "install_identity_mismatch", "task": "核验现有 DataInfra checkout 的安装身份，并报告最终 Result。",
-      "fixture": {
-        "parent": {"commits": {"nodes": ["P1"], "edges": []}, "head": "P1", "target": "P1", "branch": "main", "upstream": "origin/main", "worktree": "clean", "current_gitlinks": {"modules/component": "S1"}, "target_gitlinks": {"modules/component": "S1"}},
-        "submodule": {"path": "modules/component", "commits": {"nodes": ["S1"], "edges": [], "tree_equivalent": []}, "head": "S1", "current_pin": "S1", "target_pin": "S1", "branch": "main", "upstream": "origin/main", "worktree": "clean"},
-        "managed_patch": {"blob_path": null, "target": null, "apply_path": null, "contents": {}, "current_declaration": [], "target_declaration": [], "worktree_applied": []}, "fault_injection": null, "install_identity": {"source_head": "P1+S1", "manifest_artifact": "artifact_v1", "disk_artifact": "artifact_v2", "process_artifact": "artifact_v2"}
-      },
-      "expected_state": "deployment_mismatch", "expected_reason_codes": ["artifact_manifest_mismatch"], "expected_exit_code": 2, "recovery_required": false
+      "id": "dirty_development_stop",
+      "task": "检测开发分支上的未提交修改，停止操作并保留分支引用和工作树字节。",
+      "setup": "dirty_development_branch",
+      "expected_outcome": "stopped_preserved"
     }
   ]
 }
