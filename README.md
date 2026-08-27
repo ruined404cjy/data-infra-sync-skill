@@ -52,9 +52,7 @@ data-infra-sync --format json inspect
 data-infra-sync --format json sync plan
 ```
 
-`update_ready` 时将 Result 的 `next_actions[].argv` 作为参数数组直接执行。snapshot apply 与 `--non-interactive` 严格二选一。源码到达 `updated` 或 `up_to_date` 后，按 [DataInfra 构建与安装核验](references/datainfra-build-and-verify.md) 完成部署检查。
-
-连续受控补丁同步使用状态目录中的独立恢复日志。`partial` 后原样执行 Result 的 `resume_sync` argv；普通 inspect 或 plan 可以覆盖最近审计结果，不影响恢复资格。恢复日志由 CLI 在 workspace lock 内原子维护，调用方不编辑或删除。fresh clean/absent、失配或陈旧日志继续返回 `managed_patch_transition_required`。
+`update_ready` 时将 Result 的 `next_actions[].argv` 作为参数数组直接执行。snapshot apply 与 `--non-interactive` 严格二选一。`partial` 时停止自动变更，按 [部分失败接管](references/partial-handoff.md) 保存 Result、读取现场并报告。源码到达 `updated` 或 `up_to_date` 后，按 [DataInfra 构建与安装核验](references/datainfra-build-and-verify.md) 完成部署检查。
 
 配置键与优先级见 [配置参考](references/configuration.md)。明确的无人值守任务见 [调度示例](references/scheduler-examples.md)。
 
@@ -91,7 +89,7 @@ python3 /path/to/skill-creator/scripts/quick_validate.py .
 
 1. 在临时 bare Git 仓库构造的 fixture 中运行全量自动测试。
 2. 对现有 DataInfra checkout 执行 `inspect`、`sync plan --offline` 和 `verify install`，与现行工具的结果对照。命令写入独立审计状态，不修改 checkout 的 refs、index 或工作树。对照记录包含取消 upstream-only 自动切换这一有意差异。
-3. 在隔离工作区执行实际 apply、连续受控补丁重放和部分失败恢复测试。
+3. 在隔离工作区执行实际 apply、单补丁重放和部分失败接管测试。
 4. 按 [QCC Agent 评估](evals/README.md) 在全新会话独立执行 27 次固定场景评估。
 5. 运行 `scripts/public-scan.sh`，检查个人路径、凭据、带 userinfo 的真实 URL、本地日志/状态文件和未跟踪源码/文档/配置片段。
 6. 在个人公开仓库发布 Apache-2.0 版本。

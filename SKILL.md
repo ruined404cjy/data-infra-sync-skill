@@ -24,11 +24,11 @@ description: Use when an existing DataInfra composite checkout needs local versi
 | `waiting_for_pin` | 停止并保留现场，等待公共 pin 更新。 |
 | `blocked` | 停止并保留现场，报告 `reason_codes`。 |
 | `failed` | 停止，报告失败及退出码。 |
-| `partial` | 保留实际现场；仅执行 Result 提供的恢复 argv，随后重新 plan。缺少恢复动作时停止并报告。 |
+| `partial` | 停止自动变更，保存完整 Result，读取 [partial-handoff.md](references/partial-handoff.md) 并报告实际现场。 |
 
 dirty 工作树、活动 Git transition、submodule 布局 transition 或受控补丁 transition 均保持现场。此流程不执行 stash、reset、commit、push、merge、rebase、分支删除或手工 submodule checkout。用户另行明确授权这些操作时，结束本流程后单独处理。
 
-连续受控补丁的 `resume_sync` 使用状态目录中的独立恢复日志，并可跨 CLI 进程执行。普通 inspect 或 plan 不清除有效日志。Agent 原样执行 Result 的恢复 argv，不读取、编辑或删除 `managed-patch-recovery.json`。`managed_patch_recovery_write_failed` 或 `managed_patch_recovery_cleanup_failed` 按 Result 的 state、退出码和恢复 Action 处理。
+`partial` 的唯一后续流程是接管参考，其中未定义安全变更 Action；不构造变更命令。
 
 `branch publish-check` 返回 `publish_required` 时停止并报告发布需求。返回 `waiting_for_pin` 时等待 pin 更新，再重试 publish-check；返回 `publish_verified` 后重新执行 `sync plan`。源码完成状态仅为 `updated` 或 `up_to_date`。
 
@@ -43,6 +43,6 @@ dirty 工作树、活动 Git transition、submodule 布局 transition 或受控�
 - `0`：结合 state 判断检查或操作完成。
 - `2`：需要等待或处理的安全停点，包括 unconfigured、waiting、blocked、publish/build/deployment 状态。
 - `3`：领域写入前的配置、网络、Git、I/O 或内部失败。
-- `4`：领域写入后的 `partial`；按恢复 argv 收敛。
+- `4`：领域写入后的 `partial`；进入接管流程。
 
 明确配置无人值守同步时读取 [scheduler-examples.md](references/scheduler-examples.md)。

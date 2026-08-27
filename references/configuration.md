@@ -45,10 +45,9 @@ data-infra-sync --format json init \
 | `latest.json` | 最近一次结构化命令结果，原子替换。 |
 | `events.jsonl` | 脱敏审计事件，追加写入。 |
 | `manifest.json` | 已记录的安装身份。 |
-| `managed-patch-recovery.json` | 连续受控补丁同步的跨进程恢复日志。 |
 | `state.lock` | 同一 workspace 的 CLI 进程锁。 |
 
-恢复日志在首次补丁 reverse 前创建，成功后清理。它绑定工作区标识哈希、目标 remote/branch、源和目标父仓、目标 gitlink、有序补丁声明及同步阶段；不包含时间戳、补丁字节、凭据或绝对 checkout 路径。普通 `inspect`、`sync plan` 和审计写入不删除有效日志。日志由 CLI 在 workspace lock 内维护；调用方只执行 Result 的恢复 Action，不编辑或删除该文件。
+`latest.json` 和 `events.jsonl` 记录 CLI 的结构化结果与审计事件；接管 `partial` 时保存该次完整 Result 和退出码，并读取 [部分失败接管](partial-handoff.md)。
 
 ## 通用选项
 
