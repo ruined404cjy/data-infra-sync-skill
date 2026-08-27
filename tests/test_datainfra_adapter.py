@@ -1,9 +1,4 @@
-import contextlib
-import hashlib
-import io
-import json
 import os
-import subprocess
 import sys
 import tempfile
 import unittest
@@ -23,7 +18,6 @@ from data_infra_sync.config import WorkspaceConfig, load_config, write_config
 from data_infra_sync.executor import execute_sync
 from data_infra_sync.git import Git, GitError
 from data_infra_sync.planner import plan_sync, snapshot_for
-from data_infra_sync.state import ManagedPatchRecoveryValidationError
 from tests.git_fixture import CompositeFixture
 
 
@@ -764,169 +758,13 @@ class DataInfraAdapterLayoutTest(unittest.TestCase):
 
 
 class DataInfraAdapterManagedPatchTest(unittest.TestCase):
-    def test_recovery_created_before_reverse_is_cleared_on_write_free_transition(self):
-        """防止日志已创建但领域未写入时误报 partial 或遗留恢复资格。"""
-        with tempfile.TemporaryDirectory(prefix="managed patch write free ") as temp_dir:
+    def test_parent_merge_failure_hands_off_partial_without_resume(self):
+        """父仓 merge 失败后交接现场，后续同步保持阻塞。"""
+        with tempfile.TemporaryDirectory(prefix="managed patch partial handoff ") as temp_dir:
             fixture, patch_content = self._delta_fixture(Path(temp_dir))
             self._advance_parent_only(fixture)
             self._apply_patch(fixture, patch_content)
             config = config_for(fixture)
-            git = Git()
-            adapter = DataInfraAdapter.for_workspace(config, git)
-            adapter.managed_patch_states = (
-                lambda runtime_git, patches, target_pins=None: tuple(
-                    "invalid" for _ in patches
-                )
-            )
-            before = self._domain_snapshot(fixture)
-
-            result = execute_sync(git, adapter, None, True)
-
-            self.assertEqual((result.state, result.changed), ("blocked", False))
-            self.assertEqual(
-                result.reason_codes, ("managed_patch_transition_required",)
-            )
-            self.assertEqual(cli._exit_code(result), 2)
-            self.assertEqual(self._domain_snapshot(fixture), before)
-            self.assertFalse(
-                (config.state_dir / "managed-patch-recovery.json").exists()
-            )
-
-    def test_success_cleanup_failure_is_partial_and_retry_clears_recovery(self):
-        """防止成功写入后的恢复日志清理失败被报告为 updated。"""
-        with tempfile.TemporaryDirectory(prefix="managed patch cleanup ") as temp_dir:
-            fixture, patch_content = self._delta_fixture(Path(temp_dir))
-            target_parent, _ = self._advance_parent_only(fixture)
-            self._apply_patch(fixture, patch_content)
-            config = config_for(fixture)
-            git = Git()
-            adapter = DataInfraAdapter.for_workspace(config, git)
-            original_clear = adapter.clear_managed_patch_recovery
-            failed = [False]
-
-            def clear_once():
-                if not failed[0]:
-                    failed[0] = True
-                    raise OSError("injected recovery cleanup failure")
-                original_clear()
-
-            adapter.clear_managed_patch_recovery = clear_once
-
-            partial = execute_sync(git, adapter, None, True)
-            recovery_git = Git()
-            recovered = execute_sync(
-                recovery_git,
-                DataInfraAdapter.for_workspace(config, recovery_git),
-                None,
-                True,
-            )
-
-            self.assertEqual((partial.state, partial.changed), ("partial", True))
-            self.assertEqual(
-                partial.reason_codes, ("managed_patch_recovery_cleanup_failed",)
-            )
-            self.assertEqual(cli._exit_code(partial), 4)
-            self.assertEqual(
-                partial.next_actions[0].argv,
-                ("data-infra-sync", "sync", "apply", "--non-interactive"),
-            )
-            self.assertEqual(recovered.state, "updated")
-            self.assertEqual(fixture.rev_parse(fixture.parent, "HEAD"), target_parent)
-            self.assertFalse(
-                (config.state_dir / "managed-patch-recovery.json").exists()
-            )
-
-    def test_recovery_stage_write_failures_keep_prior_crash_state_resumable(self):
-        """防止阶段推进失败留下无法由 Action 恢复的父仓、gitlink 或 replay 状态。"""
-        cases = (
-            ("parent_update", "reversing"),
-            ("submodule_update", "parent_update"),
-            ("replay", "submodule_update"),
-            ("postcondition", "replay"),
-        )
-        for failing_stage, persisted_stage in cases:
-            with self.subTest(stage=failing_stage), tempfile.TemporaryDirectory(
-                prefix="managed patch stage "
-            ) as temp_dir:
-                fixture, patch_content = self._delta_fixture(Path(temp_dir))
-                target_parent, target_pin = self._advance_target_without_patch(fixture)
-                self._apply_patch(fixture, patch_content)
-                config = config_for(fixture)
-                git = Git()
-                adapter = DataInfraAdapter.for_workspace(config, git)
-                original_advance = adapter.advance_managed_patch_recovery
-                failed = [False]
-
-                def advance(stage):
-                    if stage == failing_stage and not failed[0]:
-                        failed[0] = True
-                        raise OSError("injected recovery stage failure")
-                    original_advance(stage)
-
-                adapter.advance_managed_patch_recovery = advance
-
-                partial = execute_sync(git, adapter, None, True)
-                recovery_path = config.state_dir / "managed-patch-recovery.json"
-                persisted = json.loads(recovery_path.read_text(encoding="utf-8"))
-                recovery_git = Git()
-                recovered = execute_sync(
-                    recovery_git,
-                    DataInfraAdapter.for_workspace(config, recovery_git),
-                    None,
-                    True,
-                )
-
-                self.assertEqual((partial.state, partial.changed), ("partial", True))
-                self.assertEqual(
-                    partial.reason_codes, ("managed_patch_recovery_write_failed",)
-                )
-                self.assertEqual(persisted["stage"], persisted_stage)
-                self.assertEqual(partial.next_actions[0].kind, "resume_sync")
-                self.assertEqual(recovered.state, "updated")
-                self.assertEqual(
-                    fixture.rev_parse(fixture.parent, "HEAD"), target_parent
-                )
-                self.assertEqual(
-                    fixture.rev_parse(fixture.submodule, "HEAD"), target_pin
-                )
-                self.assertEqual(
-                    (fixture.submodule / "README.md").read_text(encoding="utf-8"),
-                    "patched submodule\n",
-                )
-                self.assertFalse(recovery_path.exists())
-
-    def test_valid_config_uses_hashed_recovery_identity(self):
-        """防止恢复文件写入未哈希的目标身份、路径或环境值。"""
-        with tempfile.TemporaryDirectory(prefix="managed patch process ") as temp_dir:
-            fixture, patch_content = self._delta_fixture(Path(temp_dir))
-            secret_value = "round" + "-two-private-value"
-            target_remote = "release-upstream"
-            target_branch = "release-1.0"
-            fixture._run(
-                fixture.parent,
-                ("remote", "add", target_remote, str(fixture.parent_remote)),
-            )
-            fixture._run(fixture.parent, ("switch", "-c", target_branch))
-            target_parent, _ = self._advance_parent_only(fixture)
-            fixture._run(
-                fixture.root / "publisher",
-                ("push", "origin", "main:" + target_branch),
-            )
-            self._apply_patch(fixture, patch_content)
-            environment = dict(os.environ)
-            environment.update(
-                {
-                    "DATA_INFRA_SYNC_ROOT": str(fixture.parent),
-                    "DATA_INFRA_SYNC_TARGET_REMOTE": target_remote,
-                    "DATA_INFRA_SYNC_TARGET_BRANCH": target_branch,
-                    "XDG_CONFIG_HOME": str(fixture.root / "config-home"),
-                    "XDG_STATE_HOME": str(fixture.root / "state-home"),
-                    "SERVICE_TOKEN": "unrelated-recovery-secret",
-                }
-            )
-            config = load_config({}, environment, None)
-            write_config(config)
-
             class FailParentMergeOnce:
                 def __init__(self):
                     self.delegate = Git()
@@ -938,88 +776,30 @@ class DataInfraAdapterManagedPatchTest(unittest.TestCase):
                 def run(self, repo, args, *, check=True):
                     if args[:2] == ("merge", "--ff-only") and not self.failed:
                         self.failed = True
-                        raise GitError(
-                            ("git",) + tuple(args), "injected parent failure", 1
-                        )
+                        raise GitError(("git",) + tuple(args), "injected parent failure", 1)
                     return self.delegate.run(repo, args, check=check)
 
-            first_output = io.StringIO()
-            with mock.patch.dict(os.environ, environment, clear=False), mock.patch.object(
-                cli, "Git", return_value=FailParentMergeOnce()
-            ), contextlib.redirect_stdout(first_output):
-                first_code = cli.main(
-                    ("sync", "apply", "--non-interactive", "--format", "json")
-                )
-            first = json.loads(first_output.getvalue())
-            recovery_path = config.state_dir / "managed-patch-recovery.json"
-            recovery_document = (
-                json.loads(recovery_path.read_text(encoding="utf-8"))
-                if recovery_path.exists()
-                else None
-            )
-            recovery_bytes = recovery_path.read_bytes()
+            git = FailParentMergeOnce()
+            result = execute_sync(git, DataInfraAdapter.for_workspace(config, git), None, True)
 
-            bin_dir = fixture.root / "bin"
-            bin_dir.mkdir()
-            os.symlink(
-                Path(__file__).resolve().parents[1] / "scripts/data-infra-sync",
-                bin_dir / "data-infra-sync",
-            )
-            process_environment = dict(environment)
-            process_environment["PATH"] = str(bin_dir) + os.pathsep + os.environ["PATH"]
-
-            # 先覆盖 latest.json，证明恢复不依赖上一条审计结果偶然保留。
-            inspected = subprocess.run(
-                ("data-infra-sync", "inspect", "--format", "json"),
-                cwd=str(fixture.root),
-                env=process_environment,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                shell=False,
-            )
-            resumed = subprocess.run(
-                first["next_actions"][0]["argv"],
-                cwd=str(fixture.root),
-                env=process_environment,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                shell=False,
+            self.assertEqual((result.state, cli._exit_code(result)), ("partial", 4))
+            self.assertEqual(result.reason_codes, ("parent_update_failed",))
+            self.assertEqual(result.next_actions, ())
+            self.assertFalse(
+                (config.state_dir / ("managed-patch-" + "recovery.json")).exists()
             )
 
-            self.assertEqual(
-                (first_code, first["state"], first["changed"]),
-                (4, "partial", True),
-            )
-            self.assertEqual(first["reason_codes"], ["parent_update_failed"])
-            self.assertEqual(inspected.returncode, 0, inspected.stderr)
-            self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
-            self.assertIn("state: updated", resumed.stdout)
-            self.assertIsNotNone(recovery_document)
-            self.assertEqual(
-                recovery_document["target_remote"],
-                hashlib.sha256(target_remote.encode("utf-8")).hexdigest(),
+            next_git = Git()
+            blocked = execute_sync(
+                next_git,
+                DataInfraAdapter.for_workspace(config, next_git),
+                None,
+                True,
             )
             self.assertEqual(
-                recovery_document["target_branch"],
-                hashlib.sha256(target_branch.encode("utf-8")).hexdigest(),
+                (blocked.state, blocked.reason_codes),
+                ("blocked", ("managed_patch_transition_required",)),
             )
-            self.assertEqual(recovery_document["stage"], "parent_update")
-            serialized_recovery = json.dumps(recovery_document)
-            self.assertNotIn(target_remote.encode("utf-8"), recovery_bytes)
-            self.assertNotIn(target_branch.encode("utf-8"), recovery_bytes)
-            self.assertNotIn(secret_value.encode("utf-8"), recovery_bytes)
-            self.assertNotIn(str(fixture.parent), serialized_recovery)
-            self.assertNotIn("unrelated-recovery-secret", serialized_recovery)
-            self.assertNotIn("content", recovery_document["patches"][0])
-            self.assertFalse(any(config.state_dir.glob("*.tmp")))
-            self.assertEqual(fixture.rev_parse(fixture.parent, "HEAD"), target_parent)
-            self.assertEqual(
-                (fixture.submodule / "README.md").read_text(encoding="utf-8"),
-                "patched submodule\n",
-            )
-            self.assertFalse(recovery_path.exists())
 
     def test_target_exact_pin_with_equivalent_patch_content_finishes_clean(self):
         """防止目标已等价包含补丁时后置 clean 状态被误报为 partial。"""
@@ -1047,258 +827,6 @@ class DataInfraAdapterManagedPatchTest(unittest.TestCase):
                 (fixture.submodule / "README.md").read_text(encoding="utf-8"),
                 "patched submodule\n",
             )
-
-    def test_fresh_clean_and_untrusted_recovery_evidence_block_without_writes(self):
-        """防止伪造、陈旧或阶段不匹配证据放行 fresh clean/absent。"""
-        cases = (
-            "absent",
-            "malformed",
-            "forged",
-            "stale",
-            "workspace-mismatch",
-            "target-mismatch",
-            "gitlink-mismatch",
-            "patch-mismatch",
-            "stage-mismatch",
-        )
-        for case in cases:
-            with self.subTest(case=case), tempfile.TemporaryDirectory(
-                prefix="managed patch evidence "
-            ) as temp_dir:
-                fixture, patch_content = self._delta_fixture(Path(temp_dir))
-                target_parent, target_pin = self._advance_parent_only(fixture)
-                config = config_for(fixture)
-                recovery_path = config.state_dir / "managed-patch-recovery.json"
-                if case != "absent":
-                    recovery_path.parent.mkdir(parents=True)
-                    if case == "malformed":
-                        recovery_path.write_text("{", encoding="utf-8")
-                    else:
-                        document = self._recovery_document(
-                            fixture, patch_content, target_parent, target_pin
-                        )
-                        if case == "forged":
-                            document = {"format": "managed-patch-recovery-v1"}
-                        elif case == "stale":
-                            document["source_parent"] = "0" * 40
-                        elif case == "workspace-mismatch":
-                            document["workspace"] = "f" * 64
-                        elif case == "target-mismatch":
-                            document["target_parent"] = "f" * 40
-                        elif case == "gitlink-mismatch":
-                            document["target_gitlinks"]["plugins/iceberg_delta"] = (
-                                "f" * 40
-                            )
-                        elif case == "patch-mismatch":
-                            document["patches"][0]["content_hash"] = "f" * 64
-                        else:
-                            document["stage"] = "replay"
-                        recovery_path.write_text(
-                            json.dumps(document), encoding="utf-8"
-                        )
-                before = self._domain_snapshot(fixture)
-                git = Git()
-
-                result = execute_sync(
-                    git,
-                    DataInfraAdapter.for_workspace(config, git),
-                    None,
-                    True,
-                )
-
-                self.assertEqual((result.state, result.changed), ("blocked", False))
-                self.assertEqual(
-                    result.reason_codes, ("managed_patch_transition_required",)
-                )
-                self.assertEqual(cli._exit_code(result), 2)
-                self.assertEqual(self._domain_snapshot(fixture), before)
-                self.assertFalse(recovery_path.exists())
-
-    def test_recovery_validation_read_failure_preserves_evidence(self):
-        """防止暂时无法验证现场时删除可能有效的跨进程恢复证据。"""
-        with tempfile.TemporaryDirectory(prefix="managed patch read failure ") as temp_dir:
-            fixture, patch_content = self._delta_fixture(Path(temp_dir))
-            target_parent, target_pin = self._advance_parent_only(fixture)
-            self._apply_patch(fixture, patch_content)
-            config = config_for(fixture)
-            recovery_path = config.state_dir / "managed-patch-recovery.json"
-            recovery_path.parent.mkdir(parents=True)
-            document = self._recovery_document(
-                fixture, patch_content, target_parent, target_pin
-            )
-            document["stage"] = "reversing"
-            recovery_path.write_text(json.dumps(document), encoding="utf-8")
-            git = Git()
-            adapter = DataInfraAdapter.for_workspace(config, git)
-
-            def fail_progress(runtime_git, path, patches, *, baseline=0):
-                raise GitError(("git", "status"), "injected read failure", 1)
-
-            adapter._current_patch_progress = fail_progress
-
-            with self.assertRaises(ManagedPatchRecoveryValidationError):
-                adapter.collect_plan_facts(git, fresh=True)
-
-            self.assertEqual(
-                json.loads(recovery_path.read_text(encoding="utf-8")), document
-            )
-
-    def test_partial_recovery_validation_failure_returns_cli_resume_action(self):
-        """防止真实 partial 的暂时验证失败被公开 CLI 误报为写前失败。"""
-        with tempfile.TemporaryDirectory(prefix="managed patch cli read failure ") as temp_dir:
-            fixture, patch_content = self._delta_fixture(Path(temp_dir))
-            target_parent, _ = self._advance_parent_only(fixture)
-            self._apply_patch(fixture, patch_content)
-            environment, config = self._default_cli_environment(fixture)
-
-            class FailParentMergeOnce:
-                def __init__(self):
-                    self.delegate = Git()
-                    self.failed = False
-
-                def __getattr__(self, name):
-                    return getattr(self.delegate, name)
-
-                def run(self, repo, args, *, check=True):
-                    if args[:2] == ("merge", "--ff-only") and not self.failed:
-                        self.failed = True
-                        raise GitError(
-                            ("git",) + tuple(args), "injected parent failure", 1
-                        )
-                    return self.delegate.run(repo, args, check=check)
-
-            class FailRecoveryReadOnce:
-                def __init__(self):
-                    self.delegate = Git()
-                    self.failed = False
-
-                def __getattr__(self, name):
-                    return getattr(self.delegate, name)
-
-                def run(self, repo, args, *, check=True):
-                    if (
-                        tuple(args) == ("rev-parse", "--absolute-git-dir")
-                        and not self.failed
-                    ):
-                        self.failed = True
-                        raise GitError(
-                            ("git",) + tuple(args), "injected recovery read", 1
-                        )
-                    return self.delegate.run(repo, args, check=check)
-
-            first_output = io.StringIO()
-            with mock.patch.dict(os.environ, environment, clear=False), mock.patch.object(
-                cli, "Git", return_value=FailParentMergeOnce()
-            ), contextlib.redirect_stdout(first_output):
-                first_code = cli.main(
-                    ("sync", "apply", "--non-interactive", "--format", "json")
-                )
-            first = json.loads(first_output.getvalue())
-            recovery_path = config.state_dir / "managed-patch-recovery.json"
-            recovery_bytes = recovery_path.read_bytes()
-
-            second_output = io.StringIO()
-            with mock.patch.dict(os.environ, environment, clear=False), mock.patch.object(
-                cli, "Git", return_value=FailRecoveryReadOnce()
-            ), contextlib.redirect_stdout(second_output):
-                second_code = cli.main(
-                    ("sync", "apply", "--non-interactive", "--format", "json")
-                )
-            second = json.loads(second_output.getvalue())
-
-            actual = {item["path"]: item for item in second["repositories"]}
-            self.assertEqual((first_code, first["state"]), (4, "partial"))
-            self.assertEqual(
-                (second_code, second["state"], second["changed"]),
-                (4, "partial", True),
-            )
-            self.assertEqual(second["reason_codes"], ["git_precondition_failed"])
-            self.assertEqual(actual["."]["head"], fixture.target_parent)
-            self.assertEqual(
-                actual["plugins/iceberg_delta"]["head"],
-                fixture.rev_parse(fixture.submodule, "HEAD"),
-            )
-            self.assertEqual(recovery_path.read_bytes(), recovery_bytes)
-            self.assertEqual(second["next_actions"][0]["kind"], "resume_sync")
-
-            resumed_output = io.StringIO()
-            resumed_argv = tuple(second["next_actions"][0]["argv"][1:]) + (
-                "--format",
-                "json",
-            )
-            with mock.patch.dict(
-                os.environ, environment, clear=False
-            ), contextlib.redirect_stdout(resumed_output):
-                resumed_code = cli.main(resumed_argv)
-            resumed = json.loads(resumed_output.getvalue())
-
-            self.assertEqual((resumed_code, resumed["state"]), (0, "updated"))
-            self.assertEqual(fixture.rev_parse(fixture.parent, "HEAD"), target_parent)
-            self.assertFalse(recovery_path.exists())
-
-    def test_parent_update_stage_rejects_target_submodule_head(self):
-        """防止父仓写入阶段接受只能由后续子仓更新产生的现场。"""
-        with tempfile.TemporaryDirectory(prefix="managed patch stage mismatch ") as temp_dir:
-            fixture, patch_content = self._delta_fixture(Path(temp_dir))
-            target_parent, target_pin = self._advance_target_without_patch(fixture)
-            fixture._run(fixture.submodule, ("fetch", "origin", "main"))
-            fixture._run(fixture.submodule, ("checkout", "--detach", target_pin))
-            config = config_for(fixture)
-            recovery_path = config.state_dir / "managed-patch-recovery.json"
-            recovery_path.parent.mkdir(parents=True)
-            document = self._recovery_document(
-                fixture, patch_content, target_parent, target_pin
-            )
-            recovery_path.write_text(json.dumps(document), encoding="utf-8")
-            before = self._domain_snapshot(fixture)
-            git = Git()
-
-            result = execute_sync(
-                git,
-                DataInfraAdapter.for_workspace(config, git),
-                None,
-                True,
-            )
-
-            self.assertEqual((result.state, result.changed), ("blocked", False))
-            self.assertEqual(
-                result.reason_codes, ("managed_patch_transition_required",)
-            )
-            self.assertEqual(self._domain_snapshot(fixture), before)
-            self.assertFalse(recovery_path.exists())
-
-    def test_mismatched_recovery_cleanup_failure_preserves_possible_partial(self):
-        """防止无法清理结构完整证据时把可能的既有领域写入误报为 failed。"""
-        with tempfile.TemporaryDirectory(prefix="managed patch stale cleanup ") as temp_dir:
-            fixture, patch_content = self._delta_fixture(Path(temp_dir))
-            target_parent, target_pin = self._advance_parent_only(fixture)
-            config = config_for(fixture)
-            recovery_path = config.state_dir / "managed-patch-recovery.json"
-            recovery_path.parent.mkdir(parents=True)
-            document = self._recovery_document(
-                fixture, patch_content, target_parent, target_pin
-            )
-            document["workspace"] = "f" * 64
-            recovery_path.write_text(json.dumps(document), encoding="utf-8")
-            git = Git()
-            adapter = DataInfraAdapter.for_workspace(config, git)
-
-            def fail_cleanup():
-                raise OSError("injected stale recovery cleanup failure")
-
-            adapter._recovery_store.clear_managed_patch_recovery = fail_cleanup
-            before = self._domain_snapshot(fixture)
-
-            result = execute_sync(git, adapter, None, True)
-
-            self.assertEqual((result.state, result.changed), ("partial", True))
-            self.assertEqual(
-                result.reason_codes, ("managed_patch_recovery_cleanup_failed",)
-            )
-            self.assertEqual(cli._exit_code(result), 4)
-            self.assertEqual(result.next_actions[0].kind, "resume_sync")
-            self.assertEqual(self._domain_snapshot(fixture), before)
-            self.assertTrue(recovery_path.exists())
 
     def test_patch_target_outside_repository_union_sets_global_transition(self):
         """防止目标声明 Delta 补丁但缺少 Delta submodule 时生成同步 action。"""
@@ -1656,38 +1184,6 @@ class DataInfraAdapterManagedPatchTest(unittest.TestCase):
             for path in sorted(root.rglob("*"))
             if path.is_file() and ".git" not in path.relative_to(root).parts
         )
-
-    @staticmethod
-    def _recovery_document(
-        fixture, patch_content, target_parent, target_pin
-    ):
-        return {
-            "format": "managed-patch-recovery-v1",
-            "workspace": hashlib.sha256(
-                str(fixture.parent.resolve()).encode("utf-8")
-            ).hexdigest(),
-            "target_remote": (
-                "181fdd46fc4a7246b9f4f1eba3129ba5"
-                "d724011af5f10223b3589955d1df108a"
-            ),
-            "target_branch": (
-                "0d6e4079e36703ebd37c00722f5891d2"
-                "8b0e2811dc114b129215123adcce3605"
-            ),
-            "source_parent": fixture.rev_parse(fixture.parent, "HEAD"),
-            "target_parent": target_parent,
-            "target_gitlinks": {"plugins/iceberg_delta": target_pin},
-            "patches": [
-                {
-                    "name": "iceberg-delta-cmake-pie-filter",
-                    "content_hash": hashlib.sha256(patch_content).hexdigest(),
-                    "target_submodule": "plugins/iceberg_delta",
-                    "apply_path": ".",
-                }
-            ],
-            "stage": "parent_update",
-        }
-
 
 if __name__ == "__main__":
     unittest.main()

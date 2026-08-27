@@ -1,16 +1,10 @@
 """组合仓同步计划的复检、受控写入与部分状态报告。"""
 
-from pathlib import Path
 from typing import Optional
 
-from data_infra_sync.fingerprint import repository_fingerprint
 from data_infra_sync.git import GitError
-from data_infra_sync.model import Action, Result
+from data_infra_sync.model import Result
 from data_infra_sync.planner import plan_sync
-from data_infra_sync.state import (
-    ManagedPatchRecoveryCleanupError,
-    ManagedPatchRecoveryValidationError,
-)
 
 
 _EXPECTED_OPERATION_ERRORS = (GitError, OSError, RuntimeError, ValueError)
@@ -28,20 +22,6 @@ def execute_sync(
 
     try:
         facts = adapter.collect_plan_facts(git, fresh=True)
-    except ManagedPatchRecoveryValidationError as error:
-        actual_plan = plan_sync(error.facts)
-        return _partial(
-            _actual_from_plan(actual_plan),
-            "git_precondition_failed",
-        )
-    except ManagedPatchRecoveryCleanupError as error:
-        actual_plan = plan_sync(error.facts)
-        if error.possible_domain_writes:
-            return _partial(
-                _actual_from_plan(actual_plan),
-                "managed_patch_recovery_cleanup_failed",
-            )
-        return _failed(actual_plan, "managed_patch_recovery_cleanup_failed")
     except _EXPECTED_OPERATION_ERRORS:
         return _failed(None, "git_precondition_failed")
 
@@ -58,254 +38,98 @@ def execute_sync(
     try:
         current_patches = adapter.managed_patches(facts.current_parent)
         target_patches = adapter.managed_patches(facts.target_parent)
-    except _EXPECTED_OPERATION_ERRORS:
-        return _failed(plan, "git_precondition_failed")
-    if not _single_patch_declarations(current_patches, target_patches):
-        return _from_plan(
-            plan, "blocked", ("managed_patch_transition_required",)
-        )
-    try:
         preflight_ok = adapter.preflight_managed_patches(
             git, facts, current_patches, target_patches
         )
     except _EXPECTED_OPERATION_ERRORS:
         return _failed(plan, "git_precondition_failed")
-    if not preflight_ok:
+    if not _single_patch_declarations(current_patches, target_patches) or not preflight_ok:
         return _from_plan(
             plan, "blocked", ("managed_patch_transition_required",)
         )
+
     if plan.state == "up_to_date":
         try:
-            states = _managed_patch_states(
-                adapter,
-                git,
-                target_patches,
-                {item.path: item.pin for item in facts.target_submodules},
-            )
-            all_applied = all(state == "applied" for state in states)
+            if all(
+                adapter.patch_state(git, patch) == "applied"
+                for patch in target_patches
+            ):
+                return _from_plan(plan, "updated", (), changed=False)
         except _EXPECTED_OPERATION_ERRORS:
             return _failed(plan, "git_precondition_failed")
-        if all_applied:
-            if _has_managed_patch_recovery(adapter):
-                try:
-                    _advance_managed_patch_recovery(adapter, "postcondition")
-                except _EXPECTED_OPERATION_ERRORS:
-                    return _partial(
-                        _actual_from_plan(plan),
-                        "managed_patch_recovery_write_failed",
-                    )
-                try:
-                    _clear_managed_patch_recovery(adapter)
-                except _EXPECTED_OPERATION_ERRORS:
-                    return _partial(
-                        _actual_from_plan(plan),
-                        "managed_patch_recovery_cleanup_failed",
-                    )
-            return _from_plan(plan, "updated", (), changed=False)
 
-    writes_started = False
-    write_attempted = False
+    mutation_attempted = False
     failure_reason = "sync_write_failed"
-    before_fingerprint = _domain_fingerprint(git, adapter, facts)
     try:
-        recovery_created = _begin_managed_patch_recovery(
-            adapter, facts, current_patches, target_patches
-        )
-    except _EXPECTED_OPERATION_ERRORS:
-        return _failed(plan, "managed_patch_recovery_write_failed")
-    recovery_active = recovery_created is not None
-    try:
-        # partial 重入时父仓已到目标；此时补丁已暂停，无需再次 reverse。
         if facts.current_parent != facts.target_parent:
-            states = _managed_patch_states(adapter, git, current_patches)
-            for patch, state in reversed(tuple(zip(current_patches, states))):
+            for patch in current_patches:
                 failure_reason = "managed_patch_reverse_failed"
+                state = adapter.patch_state(git, patch)
                 if state == "applied":
-                    write_attempted = True
+                    mutation_attempted = True
                     adapter.reverse_patch(git, patch)
-                    writes_started = True
                 elif state != "absent":
                     raise _PatchTransitionError()
 
-            failure_reason = "managed_patch_recovery_write_failed"
-            if recovery_active:
-                _advance_managed_patch_recovery(adapter, "parent_update")
             failure_reason = "parent_update_failed"
-            write_attempted = True
+            mutation_attempted = True
             git.run(
                 facts.parent.path,
                 ("merge", "--ff-only", facts.target_parent),
             )
-            writes_started = True
 
-        failure_reason = "managed_patch_recovery_write_failed"
-        if recovery_active:
-            _advance_managed_patch_recovery(adapter, "submodule_update")
         repositories = {item.path: item for item in facts.repositories}
         for target in sorted(facts.target_submodules, key=lambda item: item.path):
             repository = repositories[target.path]
             if repository.facts.head == target.pin:
                 continue
             failure_reason = "submodule_update_failed"
-            write_attempted = True
+            mutation_attempted = True
             if repository.facts.worktree == "missing":
                 git.run(
                     facts.parent.path,
-                    ("submodule", "update", "--init", "--checkout", "--", target.path),
+                    (
+                        "submodule", "update", "--init", "--checkout", "--",
+                        target.path,
+                    ),
                 )
             else:
                 git.run(
                     adapter.root / target.path,
                     ("checkout", "--detach", target.pin),
                 )
-            writes_started = True
 
-        failure_reason = "managed_patch_recovery_write_failed"
-        if recovery_active:
-            _advance_managed_patch_recovery(adapter, "replay")
-        target_pins = {item.path: item.pin for item in facts.target_submodules}
-        states = _managed_patch_states(adapter, git, target_patches, target_pins)
-        for patch, state in zip(target_patches, states):
+        for patch in target_patches:
             failure_reason = "managed_patch_apply_failed"
+            state = adapter.patch_state(git, patch)
             if state == "absent":
-                write_attempted = True
+                mutation_attempted = True
                 adapter.apply_patch(git, patch)
-                writes_started = True
             elif state != "applied":
                 raise _PatchTransitionError()
 
-        failure_reason = "managed_patch_recovery_write_failed"
-        if recovery_active:
-            _advance_managed_patch_recovery(adapter, "postcondition")
         failure_reason = "postcondition_failed"
-        post_facts = adapter.collect_plan_facts(git, fresh=False)
-        post_plan = plan_sync(post_facts)
+        post_plan = plan_sync(adapter.collect_plan_facts(git, fresh=False))
         if post_plan.state != "up_to_date":
             return _partial(_actual_from_plan(post_plan), failure_reason)
-        if recovery_active:
-            try:
-                _clear_managed_patch_recovery(adapter)
-            except _EXPECTED_OPERATION_ERRORS:
-                return _partial(
-                    _actual_from_plan(post_plan),
-                    "managed_patch_recovery_cleanup_failed",
-                )
         return _from_plan(post_plan, "updated", (), changed=True)
-    except ManagedPatchRecoveryValidationError as error:
-        return _partial(
-            _actual_from_plan(plan_sync(error.facts)),
-            "git_precondition_failed",
-        )
-    except ManagedPatchRecoveryCleanupError as error:
-        return _recovery_cleanup_result(
-            error, writes_started, recovery_created
-        )
     except _PatchTransitionError:
-        if not writes_started:
-            if recovery_created is False:
-                try:
-                    actual = _read_actual_state(git, adapter, facts, plan)
-                except ManagedPatchRecoveryCleanupError as error:
-                    return _recovery_cleanup_result(error, False, False)
-                return _partial(actual, "managed_patch_transition_required")
-            cleanup_error = _clear_write_free_recovery(
-                adapter, recovery_created
-            )
-            if cleanup_error:
-                return _failed(plan, "managed_patch_recovery_cleanup_failed")
+        if not mutation_attempted:
             return _from_plan(
                 plan, "blocked", ("managed_patch_transition_required",)
             )
-        try:
-            actual = _read_actual_state(git, adapter, facts, plan)
-        except ManagedPatchRecoveryCleanupError as error:
-            return _recovery_cleanup_result(error, True, recovery_created)
-        return _partial(actual, "managed_patch_transition_required")
-    except _EXPECTED_OPERATION_ERRORS:
-        try:
-            actual = _read_actual_state(git, adapter, facts, plan)
-        except ManagedPatchRecoveryCleanupError as error:
-            return _recovery_cleanup_result(
-                error, writes_started, recovery_created
-            )
-        after_fingerprint = _domain_fingerprint(git, adapter, facts)
-        proven_unchanged = (
-            before_fingerprint is not None
-            and after_fingerprint is not None
-            and before_fingerprint == after_fingerprint
+        return _partial(
+            _read_actual_state(git, adapter, facts, plan),
+            "managed_patch_transition_required",
         )
-        if not writes_started and (not write_attempted or proven_unchanged):
-            if recovery_created is False:
-                return _partial(actual, failure_reason)
-            if _clear_write_free_recovery(adapter, recovery_created):
-                return _failed(plan, "managed_patch_recovery_cleanup_failed")
-            return _failed(plan, failure_reason)
-        return _partial(actual, failure_reason)
-
+    except _EXPECTED_OPERATION_ERRORS:
+        actual = _read_actual_state(git, adapter, facts, plan)
+        if mutation_attempted:
+            return _partial(actual, failure_reason)
+        return _failed(plan, failure_reason)
 
 class _PatchTransitionError(RuntimeError):
     """表示执行期间补丁状态偏离已完成的写前预检。"""
-
-
-def _begin_managed_patch_recovery(adapter, facts, current, target):
-    """调用可选 Adapter 恢复日志入口，None 表示该 Adapter 不持久化。"""
-    begin = getattr(adapter, "begin_managed_patch_recovery", None)
-    if begin is None:
-        return None
-    return begin(facts, current, target)
-
-
-def _advance_managed_patch_recovery(adapter, stage) -> None:
-    """推进可选 Adapter 恢复日志阶段。"""
-    advance = getattr(adapter, "advance_managed_patch_recovery", None)
-    if advance is not None:
-        advance(stage)
-
-
-def _clear_managed_patch_recovery(adapter) -> None:
-    """清理可选 Adapter 恢复日志。"""
-    clear = getattr(adapter, "clear_managed_patch_recovery", None)
-    if clear is not None:
-        clear()
-
-
-def _has_managed_patch_recovery(adapter) -> bool:
-    """判断 Adapter 本次采集是否加载了有效恢复日志。"""
-    check = getattr(adapter, "has_managed_patch_recovery", None)
-    return bool(check is not None and check())
-
-
-def _managed_patch_states(adapter, git, patches, target_pins=None):
-    """读取有序补丁组进度；旧 Adapter 保持逐项状态接口。"""
-    read = getattr(adapter, "managed_patch_states", None)
-    if read is not None:
-        return tuple(read(git, patches, target_pins))
-    return tuple(adapter.patch_state(git, patch) for patch in patches)
-
-
-def _clear_write_free_recovery(adapter, recovery_created) -> bool:
-    """清理本次新建且尚未伴随领域写入的日志，返回是否清理失败。"""
-    if recovery_created is not True:
-        return False
-    try:
-        _clear_managed_patch_recovery(adapter)
-    except _EXPECTED_OPERATION_ERRORS:
-        return True
-    return False
-
-
-def _recovery_cleanup_result(error, writes_started, recovery_created):
-    """按已知领域写入边界返回恢复日志清理失败结果。"""
-    actual_plan = plan_sync(error.facts)
-    possible_writes = writes_started or recovery_created is False
-    if recovery_created is None:
-        possible_writes = writes_started or error.possible_domain_writes
-    if possible_writes:
-        return _partial(
-            _actual_from_plan(actual_plan),
-            "managed_patch_recovery_cleanup_failed",
-        )
-    return _failed(actual_plan, "managed_patch_recovery_cleanup_failed")
 
 
 def _single_patch_declarations(current, target) -> bool:
@@ -334,8 +158,6 @@ def _read_actual_state(git, adapter, facts, before_plan):
         actual_plan = plan_sync(actual_facts)
         actual = _actual_from_plan(actual_plan)
         return actual
-    except ManagedPatchRecoveryCleanupError:
-        raise
     except _EXPECTED_OPERATION_ERRORS:
         return _read_repositories_individually(git, adapter, facts, before_plan)
 
@@ -438,25 +260,6 @@ def _observed_repository(git, path, logical_path, previous, observed, head):
     )
 
 
-def _domain_fingerprint(git, adapter, facts):
-    """精确读取本地 refs、index 和相关工作树内容；任一失败返回 None。"""
-    try:
-        injected = getattr(git, "domain_fingerprint", None)
-        if injected is not None:
-            return injected(adapter, facts)
-        repositories = [(".", facts.parent.path)]
-        repositories.extend(
-            (item.path, adapter.root / item.path)
-            for item in sorted(facts.repositories, key=lambda item: item.path)
-        )
-        return tuple(
-            (logical_path, repository_fingerprint(git, Path(path)))
-            for logical_path, path in repositories
-        )
-    except _EXPECTED_OPERATION_ERRORS:
-        return None
-
-
 def _actual_from_plan(plan):
     """将已成功收集的实际计划转换为 partial 输入。"""
     return {
@@ -472,17 +275,10 @@ def _actual_from_plan(plan):
 
 
 def _partial(actual, reason):
-    """返回包含实际完成项、未完成项和直接恢复 argv 的 partial 结果。"""
+    """返回包含实际完成项与未完成项的停止结果。"""
     reasons = (reason,)
     if actual["read_failed"]:
         reasons += ("actual_state_read_failed",)
-    action = Action(
-        "resume_sync",
-        ("data-infra-sync", "sync", "apply", "--non-interactive"),
-        True,
-        False,
-        ("fresh_fetch", "full_recheck"),
-    )
     return Result(
         "sync apply",
         "partial",
@@ -490,7 +286,7 @@ def _partial(actual, reason):
         actual["target"],
         actual["repositories"],
         True,
-        (action,),
+        (),
         actual["snapshot"],
         actual["stale_target"],
     )

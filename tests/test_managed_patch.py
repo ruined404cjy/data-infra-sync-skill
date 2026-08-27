@@ -153,9 +153,7 @@ class ManagedPatchDeclarationTest(unittest.TestCase):
                 "data_infra_sync.adapters.datainfra.tempfile.TemporaryDirectory",
                 return_value=PersistentDirectory(inspection),
             ):
-                exact = adapter._current_worktree_is_exact(
-                    Git(), "modules/component", (patch,)
-                )
+                exact = adapter._current_worktree_is_exact(Git(), patch)
 
             copied_link = inspection / "worktree/unrelated-link"
             self.assertTrue(exact)

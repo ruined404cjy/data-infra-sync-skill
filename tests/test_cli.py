@@ -236,7 +236,7 @@ class RoutingTests(unittest.TestCase):
         document = json.loads(output.getvalue())
         self.assertEqual((code, document["state"], document["changed"]), (4, "partial", True))
         self.assertEqual(document["reason_codes"][0], "postcondition_failed")
-        self.assertEqual(document["next_actions"][0]["kind"], "resume_sync")
+        self.assertEqual(document["next_actions"], [])
 
     def test_verify_install_receives_config_store_and_record(self):
         with patch.object(cli, "verify_install", return_value=result(command="verify install")) as verify:
@@ -332,7 +332,7 @@ class RoutingTests(unittest.TestCase):
             "branch": "main", "upstream": None, "ahead": None, "behind": None,
             "worktree": "clean", "relation": "equal", "reason_codes": [],
         }
-        action = Action("resume_sync", ("data-infra-sync", "sync", "apply", "--non-interactive"), True, False, ())
+        action = Action("branch_resume", ("data-infra-sync", "branch", "resume", "--repo", ".", "--name", "work"), False, False, ())
         target = {"parent_commit": OID, "remote": "origin", "branch": "main", "gitlinks": {}}
         cases = (
             (("sync", "apply", "--non-interactive"), result(command="sync apply", state="partial", changed=True, target=target, repositories=(repository,), next_actions=(action,))),
@@ -355,7 +355,7 @@ class RoutingTests(unittest.TestCase):
                     self.assertIn("audit_write_failed", document["reason_codes"])
 
     def test_render_failure_preserves_domain_write_exit_and_best_effort_audit(self):
-        action = Action("resume_sync", ("data-infra-sync", "sync", "apply", "--non-interactive"), True, False, ())
+        action = Action("branch_resume", ("data-infra-sync", "branch", "resume", "--repo", ".", "--name", "work"), False, False, ())
         written = result(command="sync apply", state="updated", changed=True, target={"parent_commit": OID, "remote": "origin", "branch": "main", "gitlinks": {}}, next_actions=(action,))
         with patch.object(cli, "_dispatch", return_value=written), patch.object(cli, "_render", side_effect=OSError("closed")):
             code, output, _ = self.run_main(("sync", "apply", "--non-interactive", "--format", "json"))

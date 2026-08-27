@@ -1,7 +1,6 @@
 """DataInfra 项目的同步事实与受控补丁声明边界。"""
 
 import hashlib
-import json
 import os
 import posixpath
 import re
@@ -15,15 +14,6 @@ from urllib.parse import urljoin, urlsplit, urlunsplit
 
 from data_infra_sync.git import GitError, RepoFacts, git_environment
 from data_infra_sync.planner import PlanFacts, RepositoryPlanFacts, SubmoduleSpec
-from data_infra_sync.state import (
-    MANAGED_PATCH_RECOVERY_FORMAT,
-    MANAGED_PATCH_RECOVERY_STAGES,
-    ManagedPatchRecoveryCleanupError,
-    ManagedPatchRecoveryValidationError,
-    StateStore,
-    managed_patch_recovery_identity,
-    valid_managed_patch_recovery_document,
-)
 
 
 _ARTIFACT_GROUPS = (
@@ -204,15 +194,10 @@ class DataInfraAdapter:
         root: Path,
         facts_collector: Callable[..., object],
         patch_loader: Callable[[str], Tuple[ManagedPatch, ...]],
-        recovery_store=None,
-        workspace_identity=None,
     ):
         self.root = root.resolve(strict=False)
         self._facts_collector = facts_collector
         self._patch_loader = patch_loader
-        self._recovery_store = recovery_store
-        self._workspace_identity = workspace_identity
-        self._active_recovery = None
 
     @classmethod
     def for_workspace(cls, config, git, process_reader=None):
@@ -229,14 +214,7 @@ class DataInfraAdapter:
                 adapter, config, runtime_git, reader, fresh=fresh
             )
 
-        workspace_identity = hashlib.sha256(str(root).encode("utf-8")).hexdigest()
-        adapter = cls(
-            root,
-            facts_collector,
-            patch_loader,
-            StateStore(Path(config.state_dir)),
-            workspace_identity,
-        )
+        adapter = cls(root, facts_collector, patch_loader)
         return adapter
 
     def collect_plan_facts(self, git, *, fresh: bool):
@@ -262,185 +240,43 @@ class DataInfraAdapter:
             return "invalid"
         return self._patch_state_at(git, repository, patch)
 
-    def managed_patch_states(self, git, patches, target_pins=None):
-        """按仓库有序组返回每项补丁的逻辑 applied 或 absent 状态。"""
-        states = [None] * len(patches)
-        by_repository = {}
-        for index, patch in enumerate(patches):
-            by_repository.setdefault(patch.target_submodule, []).append(
-                (index, patch)
-            )
-        for path, indexed in by_repository.items():
-            repository = _safe_directory(self.root, path)
-            if repository is None:
-                for index, _ in indexed:
-                    states[index] = "invalid"
-                continue
-            group = tuple(patch for _, patch in indexed)
-            baseline = 0
-            target_pin = None if target_pins is None else target_pins.get(path)
-            if target_pin is not None:
-                head = git.run(repository, ("rev-parse", "HEAD")).stdout.strip()
-                if head == target_pin:
-                    baseline = self._target_patch_progress(
-                        git, path, target_pin, group
-                    )
-                    if baseline is None:
-                        for index, _ in indexed:
-                            states[index] = "invalid"
-                        continue
-            progress = self._current_patch_progress(
-                git, path, group, baseline=baseline
-            )
-            for group_index, (index, _) in enumerate(indexed):
-                states[index] = (
-                    "invalid"
-                    if progress is None
-                    else "applied" if group_index < progress else "absent"
-                )
-        return tuple(states)
-
     def preflight_managed_patches(
         self, git, facts, current_patches, target_patches
     ) -> bool:
-        """无领域写入地验证当前 dirty 可清除且目标 pin 可接纳整组补丁。"""
+        """无领域写入地验证唯一受控补丁可安全重放。"""
+        if len(current_patches) > 1 or len(target_patches) > 1:
+            return False
+        if tuple(_managed_patch_key(item) for item in current_patches) != tuple(
+            _managed_patch_key(item) for item in target_patches
+        ):
+            return False
+        if not target_patches:
+            return True
+        patch = target_patches[0]
         target_pins = {item.path: item.pin for item in facts.target_submodules}
-        patches_by_repository = {}
-        for patch in target_patches:
-            if (
-                patch.target_submodule not in target_pins
-                or not _safe_relative_path(patch.target_submodule)
-                or not _safe_relative_path(patch.apply_path)
-            ):
-                return False
-            patches_by_repository.setdefault(patch.target_submodule, []).append(patch)
-
-        current_by_repository = {}
-        for patch in current_patches:
-            current_by_repository.setdefault(patch.target_submodule, []).append(patch)
-
-        for path, patches in patches_by_repository.items():
-            current = tuple(current_by_repository.get(path, ()))
-            if not self._current_worktree_is_exact(git, path, current):
-                return False
-            if not self._target_accepts_patches(
-                git, path, target_pins[path], tuple(patches)
-            ):
-                return False
-        return set(current_by_repository) == set(patches_by_repository)
-
-    def begin_managed_patch_recovery(
-        self, facts, current_patches, target_patches
-    ):
-        """首次 reverse 前创建或复用已验证的原子恢复日志。"""
-        if self._recovery_store is None or not target_patches:
-            return None
-        if self._active_recovery is not None:
+        if (
+            patch.target_submodule not in target_pins
+            or not _safe_relative_path(patch.target_submodule)
+            or not _safe_relative_path(patch.apply_path)
+        ):
             return False
-        document = {
-            "format": MANAGED_PATCH_RECOVERY_FORMAT,
-            "workspace": self._workspace_identity,
-            "target_remote": managed_patch_recovery_identity(facts.target_remote),
-            "target_branch": managed_patch_recovery_identity(facts.target_branch),
-            "source_parent": facts.current_parent,
-            "target_parent": facts.target_parent,
-            "target_gitlinks": {
-                item.path: item.pin
-                for item in sorted(facts.target_submodules, key=lambda item: item.path)
-            },
-            "patches": [
-                _managed_patch_document(item) for item in target_patches
-            ],
-            "stage": "reversing",
-        }
-        self._recovery_store.write_managed_patch_recovery(document)
-        self._active_recovery = document
-        return True
-
-    def advance_managed_patch_recovery(self, stage) -> None:
-        """单调推进恢复阶段；较早阶段的重入请求保持当前记录。"""
-        if self._active_recovery is None:
-            return
-        current = self._active_recovery["stage"]
-        if MANAGED_PATCH_RECOVERY_STAGES.index(
-            stage
-        ) <= MANAGED_PATCH_RECOVERY_STAGES.index(current):
-            return
-        document = dict(self._active_recovery)
-        document["stage"] = stage
-        self._recovery_store.write_managed_patch_recovery(document)
-        self._active_recovery = document
-
-    def clear_managed_patch_recovery(self) -> None:
-        """删除当前 workspace 的受控补丁恢复资格。"""
-        if self._recovery_store is None:
-            return
-        self._recovery_store.clear_managed_patch_recovery()
-        self._active_recovery = None
-
-    def has_managed_patch_recovery(self) -> bool:
-        """返回本次采集是否验证了一份持久化恢复日志。"""
-        return self._active_recovery is not None
-
-    def target_contains_managed_patches(self, git, facts, patches) -> bool:
-        """确认当前 exact target 的 clean 内容已经等价包含整组补丁。"""
-        target_pins = {item.path: item.pin for item in facts.target_submodules}
-        repositories = {item.path: item for item in facts.repositories}
-        by_repository = {}
-        for patch in patches:
-            by_repository.setdefault(patch.target_submodule, []).append(patch)
-        if not by_repository:
+        repository = _safe_directory(self.root, patch.target_submodule)
+        if (
+            repository is None
+            or _safe_directory(repository, patch.apply_path) is None
+        ):
             return False
-        for path, items in by_repository.items():
-            repository = repositories.get(path)
-            if (
-                repository is None
-                or repository.facts.head != target_pins.get(path)
-                or repository.facts.worktree != "clean"
-                or self._target_patch_progress(
-                    git, path, target_pins[path], tuple(items)
-                ) != len(items)
-            ):
-                return False
-        return True
-
-    def _managed_patch_recovery_matches(
-        self, git, facts, current_patches, target_patches
-    ) -> bool:
-        """严格验证恢复日志的声明绑定与阶段允许的实际 Git 状态。"""
-        if self._recovery_store is None:
+        target_state = self._target_patch_state(
+            git, patch, target_pins[patch.target_submodule]
+        )
+        if target_state == "invalid":
             return False
-        try:
-            document = self._recovery_store.read_managed_patch_recovery()
-        except (json.JSONDecodeError, UnicodeError, RecursionError):
-            self._discard_invalid_recovery(facts, None)
-            return False
-        if document is None:
-            self._active_recovery = None
-            return False
-        if not _valid_recovery_document_shape(document):
-            self._discard_invalid_recovery(facts, document)
-            return False
-        try:
-            valid = self._valid_managed_patch_recovery(
-                git, facts, current_patches, target_patches, document
-            )
-        except (GitError, OSError, RuntimeError, ValueError, TypeError) as error:
-            raise ManagedPatchRecoveryValidationError(facts) from error
-        if not valid:
-            self._discard_invalid_recovery(facts, document)
-            return False
-        self._active_recovery = document
-        return True
-
-    def _discard_invalid_recovery(self, facts, document) -> None:
-        """清理失配日志；清理失败时保留可能已写入的事实边界。"""
-        try:
-            self.clear_managed_patch_recovery()
-        except (OSError, RuntimeError, ValueError, TypeError) as error:
-            raise ManagedPatchRecoveryCleanupError(
-                facts, _valid_recovery_document_shape(document)
-            ) from error
+        if facts.current_parent == facts.target_parent:
+            repositories = {item.path: item for item in facts.repositories}
+            repository = repositories.get(patch.target_submodule)
+            if repository is not None and repository.facts.worktree == "clean":
+                return self.patch_state(git, patch) == "applied"
+        return self._current_worktree_is_exact(git, patch)
 
     def _apply_patch(self, git, patch: ManagedPatch, *, reverse: bool) -> None:
         """通过临时补丁文件调用 Git argv 边界。"""
@@ -449,198 +285,60 @@ class DataInfraAdapter:
             raise GitError(("git", "apply"), "unsafe managed patch target", 2)
         self._apply_patch_at(git, repository, patch, reverse=reverse)
 
-    def _current_worktree_is_exact(self, git, path, patches) -> bool:
-        """确认工作树是声明顺序的一个精确补丁前缀且没有其他改动。"""
-        return self._current_patch_progress(git, path, patches) is not None
-
-    def _current_patch_progress(self, git, path, patches, *, baseline=0):
-        """返回基于提交内置前缀的工作树有序补丁进度。"""
-        repository = _safe_directory(self.root, path)
-        if repository is None or not 0 <= baseline <= len(patches):
-            return None
-        if any(
-            _safe_directory(repository, patch.apply_path) is None
-            for patch in patches
+    def _current_worktree_is_exact(self, git, patch: ManagedPatch) -> bool:
+        """确认当前 dirty 仅由唯一受控补丁构成。"""
+        repository = _safe_directory(self.root, patch.target_submodule)
+        if (
+            repository is None
+            or self._patch_state_at(git, repository, patch) != "applied"
         ):
-            return None
+            return False
         git_dir = git.run(
             repository, ("rev-parse", "--absolute-git-dir")
         ).stdout.strip()
         with tempfile.TemporaryDirectory(prefix="data-infra-sync-current-") as directory:
-            matches = []
-            for progress in range(baseline, len(patches) + 1):
-                name = "worktree" if progress == 0 else "worktree-{}".format(progress)
-                worktree = Path(directory) / name
-                shutil.copytree(
-                    repository,
-                    worktree,
-                    symlinks=True,
-                    ignore=shutil.ignore_patterns(".git"),
-                )
-                git_options = (
-                    "--git-dir={}".format(git_dir),
-                    "--work-tree={}".format(worktree),
-                )
-                try:
-                    for patch in reversed(patches[baseline:progress]):
-                        self._apply_patch_at(
-                            git,
-                            worktree,
-                            patch,
-                            reverse=True,
-                            git_options=git_options,
-                        )
-                except GitError:
-                    continue
-                status = git.run(
-                    worktree,
-                    git_options
-                    + ("status", "--porcelain=v1", "-z", "--untracked-files=all"),
-                ).stdout
-                if status == "":
-                    matches.append(progress)
-            if len(matches) == 1:
-                return matches[0]
-            return None
-
-    def _valid_managed_patch_recovery(
-        self, git, facts, current_patches, target_patches, document
-    ) -> bool:
-        """验证日志字段、提交绑定、声明顺序及阶段对应的实际补丁前缀。"""
-        if not _valid_recovery_document_shape(document):
-            return False
-        target_gitlinks = {
-            item.path: item.pin
-            for item in sorted(facts.target_submodules, key=lambda item: item.path)
-        }
-        expected_patches = [_managed_patch_document(item) for item in target_patches]
-        if (
-            document["workspace"] != self._workspace_identity
-            or document["target_remote"]
-            != managed_patch_recovery_identity(facts.target_remote)
-            or document["target_branch"]
-            != managed_patch_recovery_identity(facts.target_branch)
-            or document["target_parent"] != facts.target_parent
-            or document["target_gitlinks"] != target_gitlinks
-            or document["patches"] != expected_patches
-            or facts.current_parent
-            not in (document["source_parent"], document["target_parent"])
-        ):
-            return False
-        source_patches = self.managed_patches(document["source_parent"])
-        if (
-            [_managed_patch_document(item) for item in source_patches]
-            != expected_patches
-            or tuple(_managed_patch_key(item) for item in current_patches)
-            != tuple(_managed_patch_key(item) for item in target_patches)
-            or git.relation(
-                self.root, document["source_parent"], document["target_parent"]
+            worktree = Path(directory) / "worktree"
+            shutil.copytree(
+                repository,
+                worktree,
+                symlinks=True,
+                ignore=shutil.ignore_patterns(".git"),
             )
-            not in ("equal", "contained")
-        ):
-            return False
-
-        source_gitlinks = {
-            item.path: item.pin
-            for item in _submodules_at(git, self.root, document["source_parent"])
-        }
-        repositories = {item.path: item for item in facts.repositories}
-        by_repository = {}
-        for patch in target_patches:
-            by_repository.setdefault(patch.target_submodule, []).append(patch)
-        if set(by_repository).difference(source_gitlinks) or set(
-            by_repository
-        ).difference(target_gitlinks):
-            return False
-
-        stage = document["stage"]
-        parent_is_source = facts.current_parent == document["source_parent"]
-        parent_is_target = facts.current_parent == document["target_parent"]
-        if stage == "reversing" and not parent_is_source:
-            return False
-        if stage in ("submodule_update", "replay", "postcondition") and not parent_is_target:
-            return False
-
-        for path, repository in repositories.items():
-            head = repository.facts.head
-            source_pin = source_gitlinks.get(path)
-            target_pin = target_gitlinks.get(path)
-            if stage == "reversing" and head != source_pin:
-                return False
-            if stage == "parent_update" and head != source_pin:
-                return False
-            if stage == "submodule_update" and head not in (
-                source_pin,
-                target_pin,
-            ):
-                return False
-            if stage in ("replay", "postcondition") and head != target_pin:
-                return False
-
-        for path, patches in by_repository.items():
-            repository = repositories.get(path)
-            if repository is None or repository.facts.operation is not None:
-                return False
-            target_pin = target_gitlinks[path]
-            baseline = 0
-            if repository.facts.head == target_pin:
-                baseline = self._target_patch_progress(
-                    git, path, target_pin, tuple(patches)
-                )
-                if baseline is None:
-                    return False
-            progress = self._current_patch_progress(
-                git, path, tuple(patches), baseline=baseline
+            options = (
+                "--git-dir={}".format(git_dir),
+                "--work-tree={}".format(worktree),
             )
-            if progress is None:
+            try:
+                self._apply_patch_at(
+                    git, worktree, patch, reverse=True, git_options=options
+                )
+            except GitError:
                 return False
-            if stage == "parent_update" and progress != 0:
-                return False
-            if stage == "submodule_update" and progress != baseline:
-                return False
-            if stage == "postcondition" and progress != len(patches):
-                return False
-        return True
+            status = git.run(
+                worktree,
+                options
+                + ("status", "--porcelain=v1", "-z", "--untracked-files=all"),
+            ).stdout
+        return status == ""
 
-    def _target_accepts_patches(self, git, path, target_pin, patches) -> bool:
-        """确认目标提交内置了声明补丁的唯一有序前缀。"""
-        return self._target_patch_progress(git, path, target_pin, patches) is not None
-
-    def _target_patch_progress(self, git, path, target_pin, patches):
-        """返回目标提交已内置的唯一有序补丁前缀长度。"""
-        repository = _safe_directory(self.root, path)
+    def _target_patch_state(self, git, patch: ManagedPatch, target_pin: str) -> str:
+        """在隔离 target checkout 判断唯一受控补丁的状态。"""
+        repository = _safe_directory(self.root, patch.target_submodule)
         if repository is None:
-            return None
+            return "invalid"
         with tempfile.TemporaryDirectory(prefix="data-infra-sync-target-") as directory:
-            matches = []
-            for progress in range(len(patches) + 1):
-                worktree = Path(directory) / "target-{}".format(progress)
-                worktree.mkdir()
-                git.run(worktree, ("init", "--quiet"))
-                git.run(
-                    worktree,
-                    (
-                        "fetch",
-                        "--no-tags",
-                        "--no-recurse-submodules",
-                        "--refmap=",
-                        "--",
-                        str(repository),
-                        target_pin,
-                    ),
-                )
-                git.run(worktree, ("checkout", "--detach", "FETCH_HEAD"))
-                try:
-                    for patch in reversed(patches[:progress]):
-                        self._apply_patch_at(git, worktree, patch, reverse=True)
-                    for patch in patches:
-                        self._apply_patch_at(git, worktree, patch, reverse=False)
-                except GitError:
-                    continue
-                matches.append(progress)
-            if len(matches) == 1:
-                return matches[0]
-            return None
+            worktree = Path(directory) / "target"
+            worktree.mkdir()
+            git.run(worktree, ("init", "--quiet"))
+            git.run(
+                worktree,
+                (
+                    "fetch", "--no-tags", "--no-recurse-submodules", "--refmap=",
+                    "--", str(repository), target_pin,
+                ),
+            )
+            git.run(worktree, ("checkout", "--detach", "FETCH_HEAD"))
+            return self._patch_state_at(git, worktree, patch)
 
     def _patch_state_at(
         self, git, repository, patch, *, git_options=()
@@ -1298,9 +996,6 @@ def _with_managed_patch_states(adapter, git, facts):
         if facts.target_parent is None
         else adapter.managed_patches(facts.target_parent)
     )
-    recovery = adapter._managed_patch_recovery_matches(
-        git, facts, current, target
-    )
     repository_paths = {item.path for item in facts.repositories}
     global_transition = any(
         item.target_submodule not in repository_paths for item in current + target
@@ -1339,13 +1034,12 @@ def _with_managed_patch_states(adapter, git, facts):
         dirty = paths.issubset(repositories) and all(
             repositories[path].facts.worktree == "dirty" for path in paths
         )
-        integrated = (
-            facts.current_parent == facts.target_parent
-            and adapter.target_contains_managed_patches(git, facts, target)
+        integrated = facts.current_parent == facts.target_parent and (
+            adapter.patch_state(git, target[0]) == "applied"
         )
         state = "transition"
         if (
-            (dirty or recovery or integrated)
+            (dirty or integrated)
             and not global_transition
             and adapter.preflight_managed_patches(git, facts, current, target)
         ):
@@ -1394,21 +1088,6 @@ def _managed_patch_key(patch):
         patch.target_submodule,
         patch.apply_path,
     )
-
-
-def _managed_patch_document(patch):
-    """构造不含补丁字节与物理路径的恢复声明。"""
-    return {
-        "name": patch.name,
-        "content_hash": patch.content_hash,
-        "target_submodule": patch.target_submodule,
-        "apply_path": patch.apply_path,
-    }
-
-
-def _valid_recovery_document_shape(document):
-    """严格验证恢复日志的版本、字段集合与规范哈希/OID。"""
-    return valid_managed_patch_recovery_document(document)
 
 
 def _safe_relative_path(value):
