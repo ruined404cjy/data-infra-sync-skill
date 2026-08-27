@@ -1,4 +1,3 @@
-import json
 import os
 import shutil
 import subprocess
@@ -17,7 +16,7 @@ from data_infra_sync.cli import _exit_code
 from data_infra_sync.executor import _domain_fingerprint, execute_sync
 from data_infra_sync.git import Git, GitError, RepoFacts
 from data_infra_sync.planner import PlanFacts, RepositoryPlanFacts, SubmoduleSpec, snapshot_for
-from data_infra_sync.state import ManagedPatchRecoveryCleanupError, StateStore
+from data_infra_sync.state import ManagedPatchRecoveryCleanupError
 from tests.git_fixture import CompositeFixture
 
 
@@ -200,66 +199,8 @@ class ScriptedAdapter:
         git.patch_applied = True
 
 
-class MultiPatchAdapter(ScriptedAdapter):
-    def __init__(self, git, patches):
-        super().__init__(git, patches, patches)
-        self.states = {patch.name: "applied" for patch in patches}
-        self.fail_second_reverse_once = True
-
-    def collect_plan_facts(self, git, *, fresh):
-        git.patch_applied = any(state == "applied" for state in self.states.values())
-        return super().collect_plan_facts(git, fresh=fresh)
-
-    def patch_state(self, git, patch):
-        return self.states[patch.name]
-
-    def reverse_patch(self, git, patch):
-        if self.states[patch.name] != "applied":
-            raise GitError(("git", "apply", "--reverse"), "already reversed", 1)
-        if patch.name == "one" and self.fail_second_reverse_once:
-            self.fail_second_reverse_once = False
-            raise GitError(("git", "apply", "--reverse"), "injected second failure", 1)
-        self.operations.append("reverse:" + patch.name)
-        self.states[patch.name] = "absent"
-
-    def apply_patch(self, git, patch):
-        if self.states[patch.name] != "absent":
-            raise GitError(("git", "apply"), "already applied", 1)
-        self.operations.append("apply:" + patch.name)
-        self.states[patch.name] = "applied"
-
-
 def managed_patch(content=b"patch\n", *, target="modules/component", path="."):
     return ManagedPatch("build", target, path, content)
-
-
-class FailingPatchGit:
-    """仅在真实目标工作树注入指定补丁阶段的一次失败。"""
-
-    def __init__(self, delegate, repository, patch_name, phase):
-        self.delegate = delegate
-        self.repository = repository.resolve()
-        self.patch_name = patch_name.encode("utf-8")
-        self.phase = phase
-        self.failed = False
-
-    def __getattr__(self, name):
-        return getattr(self.delegate, name)
-
-    def run(self, repo, args, *, check=True):
-        is_apply = args and args[0] == "apply" and "--check" not in args
-        is_reverse = "--reverse" in args
-        expected_phase = "reverse" if is_reverse else "apply"
-        if (
-            is_apply
-            and expected_phase == self.phase
-            and Path(repo).resolve() == self.repository
-            and self.patch_name in Path(args[-1]).read_bytes()
-            and not self.failed
-        ):
-            self.failed = True
-            raise GitError(("git",) + tuple(args), "injected real patch failure", 1)
-        return self.delegate.run(repo, args, check=check)
 
 
 class FailingNthPatchGit:
@@ -326,20 +267,15 @@ class RealCompositeHarness:
         self.fixture._run(self.fixture.parent, ("push", "origin", "main"))
 
     def _create_patches(self):
-        patches = []
-        for name in ("one", "two"):
-            path = self.fixture.submodule / (name + ".txt")
-            original = path.read_text(encoding="utf-8")
-            path.write_text(original.rstrip("\n") + " patched\n", encoding="utf-8")
-            content = self.git.run(
-                self.fixture.submodule,
-                ("diff", "--binary", "--", name + ".txt"),
-            ).stdout.encode("utf-8")
-            path.write_text(original, encoding="utf-8")
-            patches.append(
-                ManagedPatch(name, "modules/component", ".", content)
-            )
-        return tuple(patches)
+        path = self.fixture.submodule / "one.txt"
+        original = path.read_text(encoding="utf-8")
+        path.write_text(original.rstrip("\n") + " patched\n", encoding="utf-8")
+        content = self.git.run(
+            self.fixture.submodule,
+            ("diff", "--binary", "--", "one.txt"),
+        ).stdout.encode("utf-8")
+        path.write_text(original, encoding="utf-8")
+        return (ManagedPatch("one", "modules/component", ".", content),)
 
     def _push_target(self, conflicting_target, target_contains_patches):
         sub_updater = self.fixture.root / "sub updater"
@@ -350,8 +286,7 @@ class RealCompositeHarness:
         self.fixture._configure_user(sub_updater)
         if target_contains_patches:
             self.fixture.write_file(sub_updater, "one.txt", "base one patched\n")
-            self.fixture.write_file(sub_updater, "two.txt", "base two patched\n")
-            self.fixture._run(sub_updater, ("add", "one.txt", "two.txt"))
+            self.fixture._run(sub_updater, ("add", "one.txt"))
             self.fixture._run(sub_updater, ("commit", "-m", "include patch content"))
         elif conflicting_target:
             self.fixture.commit_file(
@@ -437,73 +372,6 @@ class RealCompositeHarness:
                 ("status", "--porcelain=v1", "-z", "--untracked-files=all"),
             ).stdout,
         )
-
-
-class StackedPatchHarness(RealCompositeHarness):
-    """构造同一文件 A→B、B→C 的有序补丁栈。"""
-
-    def _add_base_files(self):
-        self.fixture.commit_file(self.fixture.submodule, "stack.txt", "A\n", "add stack")
-        self.fixture._run(self.fixture.submodule, ("push", "origin", "main"))
-        self.fixture._run(self.fixture.parent, ("add", "modules/component"))
-        self.fixture._run(self.fixture.parent, ("commit", "-m", "advance stack base"))
-        self.fixture._run(self.fixture.parent, ("push", "origin", "main"))
-
-    def _create_patches(self):
-        return (
-            ManagedPatch(
-                "a-to-b",
-                "modules/component",
-                ".",
-                _single_line_patch("stack.txt", "A", "B"),
-            ),
-            ManagedPatch(
-                "b-to-c",
-                "modules/component",
-                ".",
-                _single_line_patch("stack.txt", "B", "C"),
-            ),
-        )
-
-    def _push_target(self, conflicting_target, target_contains_patches):
-        """推送保持 A 基线或已内置整组补丁的目标 pin。"""
-        sub_updater = self.fixture.root / "sub updater"
-        self.fixture._run(
-            self.fixture.root,
-            ("clone", str(self.fixture.submodule_remote), str(sub_updater)),
-        )
-        self.fixture._configure_user(sub_updater)
-        if target_contains_patches:
-            self.fixture.commit_file(
-                sub_updater, "stack.txt", "C\n", "include stacked patch content"
-            )
-        else:
-            self.fixture.commit_file(
-                sub_updater, "target.txt", "target only\n", "advance target"
-            )
-        self.fixture._run(sub_updater, ("push", "origin", "main"))
-        target_pin = self.fixture.rev_parse(sub_updater, "HEAD")
-        return self._push_parent_target(target_pin), target_pin
-
-    def recovery_adapter(self, state_dir):
-        """构造会在事实采集时校验持久化恢复日志的新 Adapter。"""
-        adapter = None
-
-        def collect(runtime_git, *, fresh):
-            facts = self.collect_plan_facts(runtime_git, fresh=fresh)
-            adapter._managed_patch_recovery_matches(
-                runtime_git, facts, self.patches, self.patches
-            )
-            return facts
-
-        adapter = DataInfraAdapter(
-            self.fixture.parent,
-            collect,
-            lambda commit: self.patches,
-            StateStore(state_dir),
-            "a" * 64,
-        )
-        return adapter
 
 
 class SymlinkEscapeHarness(RealCompositeHarness):
@@ -711,6 +579,25 @@ class ExecutorPreflightTest(unittest.TestCase):
 
 
 class ExecutorWriteTest(unittest.TestCase):
+    def test_multiple_declarations_block_when_planner_marks_them_continuous(self):
+        """防止受控 Adapter 绕过 Planner 标记后 Executor 开始领域写入。"""
+        git = RecordingGit()
+        patches = (
+            ManagedPatch("first", "modules/component", ".", b"first\n"),
+            ManagedPatch("second", "modules/component", ".", b"second\n"),
+        )
+        adapter = ScriptedAdapter(git, patches, patches)
+
+        result = execute_sync(git, adapter, None, True)
+
+        self.assertEqual((result.state, result.changed), ("blocked", False))
+        self.assertEqual(
+            result.reason_codes, ("managed_patch_transition_required",)
+        )
+        self.assertEqual(_exit_code(result), 2)
+        self.assertEqual(git.writes, [])
+        self.assertEqual(adapter.operations, [])
+
     def test_postcondition_recovery_cleanup_failure_is_explicit_partial(self):
         """防止后置采集的恢复日志清理失败被通用异常改写原因。"""
         git = RecordingGit()
@@ -1096,25 +983,6 @@ class ExecutorWriteTest(unittest.TestCase):
         self.assertEqual(git.child_head, TARGET_PIN)
         self.assertTrue(git.patch_applied)
 
-    def test_second_patch_reverse_failure_retries_only_the_remaining_patch(self):
-        git = RecordingGit()
-        patches = (
-            ManagedPatch("one", "modules/component", ".", b"one\n"),
-            ManagedPatch("two", "modules/component", ".", b"two\n"),
-        )
-        adapter = MultiPatchAdapter(git, patches)
-
-        partial = execute_sync(git, adapter, None, True)
-        recovered = execute_sync(git, adapter, None, True)
-
-        self.assertEqual(partial.state, "partial")
-        self.assertEqual(recovered.state, "updated")
-        self.assertEqual(
-            adapter.operations,
-            ["reverse:two", "reverse:one", "apply:one", "apply:two"],
-        )
-        self.assertEqual(adapter.states, {"one": "applied", "two": "applied"})
-
     def test_partial_reads_each_actual_head_when_full_collection_fails(self):
         git = RecordingGit()
         git.fail_checkout_once = True
@@ -1260,147 +1128,6 @@ class RealGitExecutorTest(unittest.TestCase):
                 (harness.fixture.submodule / "one.txt").read_text(encoding="utf-8"),
                 "base one patched\n",
             )
-            self.assertEqual(
-                (harness.fixture.submodule / "two.txt").read_text(encoding="utf-8"),
-                "base two patched\n",
-            )
-
-    def test_two_real_patches_resume_after_second_reverse_or_apply_failure(self):
-        for phase in ("reverse", "apply"):
-            with self.subTest(phase=phase):
-                with tempfile.TemporaryDirectory(
-                    prefix="executor real retry "
-                ) as directory:
-                    harness = RealCompositeHarness(Path(directory))
-                    failing_git = FailingPatchGit(
-                        harness.git,
-                        harness.fixture.submodule,
-                        "one.txt" if phase == "reverse" else "two.txt",
-                        phase,
-                    )
-
-                    partial = execute_sync(failing_git, harness.adapter, None, True)
-                    recovered = execute_sync(failing_git, harness.adapter, None, True)
-
-                    self.assertEqual(partial.state, "partial")
-                    self.assertEqual(recovered.state, "updated")
-                    self.assertEqual(
-                        harness.fixture.rev_parse(harness.fixture.parent, "HEAD"),
-                        harness.target_parent,
-                    )
-                    self.assertEqual(
-                        harness.fixture.rev_parse(harness.fixture.submodule, "HEAD"),
-                        harness.target_pin,
-                    )
-                    self.assertEqual(
-                        (harness.fixture.submodule / "one.txt").read_text(encoding="utf-8"),
-                        "base one patched\n",
-                    )
-                    self.assertEqual(
-                        (harness.fixture.submodule / "two.txt").read_text(encoding="utf-8"),
-                        "base two patched\n",
-                    )
-
-    def test_stacked_patches_use_forward_replay_and_reverse_unwind_order(self):
-        for phase in ("reverse", "apply"):
-            with self.subTest(phase=phase):
-                with tempfile.TemporaryDirectory(
-                    prefix="executor real stacked "
-                ) as directory:
-                    harness = StackedPatchHarness(Path(directory))
-                    failing_git = FailingNthPatchGit(
-                        harness.git,
-                        harness.fixture.submodule,
-                        phase,
-                        2,
-                    )
-
-                    partial = execute_sync(failing_git, harness.adapter, None, True)
-                    recovered = execute_sync(failing_git, harness.adapter, None, True)
-
-                    self.assertEqual(partial.state, "partial")
-                    self.assertEqual(recovered.state, "updated")
-                    self.assertEqual(
-                        (harness.fixture.submodule / "stack.txt").read_text(
-                            encoding="utf-8"
-                        ),
-                        "C\n",
-                    )
-
-    def test_stacked_patches_accept_target_with_integrated_ordered_group(self):
-        """依赖补丁的目标完整内置态应按有序组识别。"""
-        with tempfile.TemporaryDirectory(
-            prefix="executor real stacked integrated "
-        ) as directory:
-            harness = StackedPatchHarness(
-                Path(directory), target_contains_patches=True
-            )
-
-            result = execute_sync(harness.git, harness.adapter, None, True)
-
-            self.assertEqual((result.state, result.changed), ("updated", True))
-            self.assertEqual(
-                harness.fixture.rev_parse(harness.fixture.submodule, "HEAD"),
-                harness.target_pin,
-            )
-            self.assertEqual(
-                harness.git.run(
-                    harness.fixture.submodule,
-                    ("status", "--porcelain=v1", "-z", "--untracked-files=all"),
-                ).stdout,
-                "",
-            )
-            self.assertEqual(
-                (harness.fixture.submodule / "stack.txt").read_text(
-                    encoding="utf-8"
-                ),
-                "C\n",
-            )
-
-    def test_stacked_final_replay_crash_resumes_with_new_adapter(self):
-        """最后一项 replay 写入后的旧阶段日志必须可跨 Adapter 收敛。"""
-        with tempfile.TemporaryDirectory(
-            prefix="executor real stacked recovery "
-        ) as directory:
-            harness = StackedPatchHarness(Path(directory))
-            state_dir = harness.fixture.root / "recovery-state"
-            adapter = harness.recovery_adapter(state_dir)
-            original_advance = adapter.advance_managed_patch_recovery
-            failed = [False]
-
-            def fail_after_final_replay(stage):
-                if stage == "postcondition" and not failed[0]:
-                    failed[0] = True
-                    raise OSError("injected crash before postcondition stage")
-                original_advance(stage)
-
-            adapter.advance_managed_patch_recovery = fail_after_final_replay
-
-            partial = execute_sync(harness.git, adapter, None, True)
-            recovery_path = state_dir / "managed-patch-recovery.json"
-            persisted = json.loads(recovery_path.read_text(encoding="utf-8"))
-            recovery_git = Git()
-            recovered = execute_sync(
-                recovery_git,
-                harness.recovery_adapter(state_dir),
-                None,
-                True,
-            )
-
-            self.assertEqual((partial.state, partial.changed), ("partial", True))
-            self.assertEqual(
-                partial.reason_codes, ("managed_patch_recovery_write_failed",)
-            )
-            self.assertEqual(persisted["stage"], "replay")
-            self.assertEqual(partial.next_actions[0].kind, "resume_sync")
-            self.assertEqual(recovered.state, "updated")
-            self.assertEqual(
-                (harness.fixture.submodule / "stack.txt").read_text(
-                    encoding="utf-8"
-                ),
-                "C\n",
-            )
-            self.assertFalse(recovery_path.exists())
 
     def test_first_reverse_content_change_then_error_is_partial(self):
         with tempfile.TemporaryDirectory(prefix="executor real fingerprint ") as directory:

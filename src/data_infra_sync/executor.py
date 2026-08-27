@@ -60,7 +60,7 @@ def execute_sync(
         target_patches = adapter.managed_patches(facts.target_parent)
     except _EXPECTED_OPERATION_ERRORS:
         return _failed(plan, "git_precondition_failed")
-    if not _continuous_declarations(current_patches, target_patches):
+    if not _single_patch_declarations(current_patches, target_patches):
         return _from_plan(
             plan, "blocked", ("managed_patch_transition_required",)
         )
@@ -308,16 +308,12 @@ def _recovery_cleanup_result(error, writes_started, recovery_created):
     return _failed(actual_plan, "managed_patch_recovery_cleanup_failed")
 
 
-def _continuous_declarations(current, target) -> bool:
-    """确认补丁数量、名称、字节哈希、目标子仓和适用路径完全相同。"""
-    current_keys = tuple(_patch_key(item) for item in current)
-    target_keys = tuple(_patch_key(item) for item in target)
-    current_names = tuple(item[0] for item in current_keys)
-    target_names = tuple(item[0] for item in target_keys)
-    return (
-        len(current_names) == len(set(current_names))
-        and len(target_names) == len(set(target_names))
-        and current_keys == target_keys
+def _single_patch_declarations(current, target) -> bool:
+    """确认两侧均至多一项补丁，且声明字段完全相同。"""
+    if len(current) > 1 or len(target) > 1:
+        return False
+    return tuple(_patch_key(item) for item in current) == tuple(
+        _patch_key(item) for item in target
     )
 
 

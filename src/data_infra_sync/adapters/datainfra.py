@@ -1305,17 +1305,35 @@ def _with_managed_patch_states(adapter, git, facts):
     global_transition = any(
         item.target_submodule not in repository_paths for item in current + target
     )
-    if facts.target_parent is None:
-        return _replace_patch_facts(facts, facts.repositories, global_transition)
-    current_keys = tuple(_managed_patch_key(item) for item in current)
-    target_keys = tuple(_managed_patch_key(item) for item in target)
+    unsupported_count = len(current) > 1 or len(target) > 1
+    global_transition = global_transition or unsupported_count
     states = {}
-    if current_keys != target_keys:
+    if unsupported_count:
         states.update(
             (path, "transition")
             for path in {item.target_submodule for item in current + target}
         )
-    elif current:
+    if facts.target_parent is None:
+        repositories = tuple(
+            RepositoryPlanFacts(
+                item.path,
+                item.facts,
+                item.current_pin,
+                item.target_pin,
+                item.relation,
+                states.get(item.path, "none"),
+            )
+            for item in facts.repositories
+        )
+        return _replace_patch_facts(facts, repositories, global_transition)
+    current_keys = tuple(_managed_patch_key(item) for item in current)
+    target_keys = tuple(_managed_patch_key(item) for item in target)
+    if not unsupported_count and current_keys != target_keys:
+        states.update(
+            (path, "transition")
+            for path in {item.target_submodule for item in current + target}
+        )
+    elif not unsupported_count and current:
         paths = {item.target_submodule for item in current}
         repositories = {item.path: item for item in facts.repositories}
         dirty = paths.issubset(repositories) and all(

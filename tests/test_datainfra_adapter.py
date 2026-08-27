@@ -14,7 +14,11 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from data_infra_sync import cli
-from data_infra_sync.adapters.datainfra import DataInfraAdapter, _resolve_submodule_url
+from data_infra_sync.adapters.datainfra import (
+    DataInfraAdapter,
+    ManagedPatch,
+    _resolve_submodule_url,
+)
 from data_infra_sync.config import WorkspaceConfig, load_config, write_config
 from data_infra_sync.executor import execute_sync
 from data_infra_sync.git import Git, GitError
@@ -1368,6 +1372,40 @@ class DataInfraAdapterManagedPatchTest(unittest.TestCase):
             self.assertEqual(delta.managed_patch_state, "continuous")
             self.assertEqual(len(adapter.managed_patches(facts.current_parent)), 1)
             self.assertEqual(plan_sync(facts).state, "update_ready")
+
+    def test_multiple_unchanged_declarations_block_before_domain_writes(self):
+        """防止多个受控补丁绕过 Planner 后修改父仓或子仓。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fixture, patch_content = self._delta_fixture(Path(temp_dir))
+            self._advance_parent_only(fixture)
+            self._apply_patch(fixture, patch_content)
+            git = Git()
+            adapter = DataInfraAdapter.for_workspace(config_for(fixture), git)
+            declarations = (
+                ManagedPatch(
+                    "first", "plugins/iceberg_delta", ".", patch_content
+                ),
+                ManagedPatch(
+                    "second", "plugins/iceberg_delta", ".", patch_content
+                ),
+            )
+            adapter._patch_loader = lambda commit: declarations
+            before = self._domain_snapshot(fixture)
+
+            facts = adapter.collect_plan_facts(git, fresh=True)
+            planned = plan_sync(facts)
+            result = execute_sync(git, adapter, None, True)
+
+            self.assertEqual(facts.repositories[0].managed_patch_state, "transition")
+            self.assertTrue(facts.managed_patch_transition)
+            self.assertEqual(planned.state, "blocked")
+            self.assertIn("managed_patch_transition_required", planned.reason_codes)
+            self.assertEqual(
+                (result.state, result.reason_codes),
+                ("blocked", ("managed_patch_transition_required",)),
+            )
+            self.assertEqual(cli._exit_code(result), 2)
+            self.assertEqual(self._domain_snapshot(fixture), before)
 
     def test_unchanged_declared_patch_absent_from_clean_worktree_blocks(self):
         """防止同步主动把未应用的受控补丁引入干净工作树。"""
