@@ -1,5 +1,6 @@
 """DataInfra 项目的同步事实与受控补丁声明边界。"""
 
+import errno
 import hashlib
 import os
 import posixpath
@@ -83,6 +84,12 @@ _CRITICAL_INSTALL_PATHS = (
 
 _DELTA_PATCH_PATH = "build/patches/iceberg-delta-cmake-pie-filter.patch"
 _DELTA_SUBMODULE = "plugins/iceberg_delta"
+_PROCESS_DISAPPEARED = frozenset((errno.ENOENT, errno.ESRCH))
+
+
+def _process_disappeared(error: OSError) -> bool:
+    """判断 procfs 错误是否仅表示进程在读取期间已消失。"""
+    return error.errno in _PROCESS_DISAPPEARED
 
 
 class DataInfraInstallAdapter:
@@ -160,8 +167,10 @@ class DataInfraInstallAdapter:
                     continue
                 exe = os.readlink(process / "exe")
                 maps = _read_proc_text(process / "maps").splitlines()
-            except OSError:
-                continue
+            except OSError as error:
+                if _process_disappeared(error):
+                    continue
+                raise
             records.append({"name": name, "exe": exe, "maps": tuple(maps)})
         return tuple(records)
 

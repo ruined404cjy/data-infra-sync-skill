@@ -1,3 +1,4 @@
+import errno
 import os
 import sys
 import tempfile
@@ -11,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from data_infra_sync import cli
 from data_infra_sync.adapters.datainfra import (
     DataInfraAdapter,
+    DataInfraInstallAdapter,
     ManagedPatch,
     _resolve_submodule_url,
 )
@@ -19,6 +21,18 @@ from data_infra_sync.executor import execute_sync
 from data_infra_sync.git import Git, GitError
 from data_infra_sync.planner import plan_sync, snapshot_for
 from tests.git_fixture import CompositeFixture
+
+
+_DEFAULT_PROC_READER = DataInfraInstallAdapter._read_proc
+
+
+def setUpModule():
+    """隔离组合仓测试，避免宿主 gaussdb procfs 权限影响 Git 事实断言。"""
+    DataInfraInstallAdapter._read_proc = staticmethod(lambda: ())
+
+
+def tearDownModule():
+    DataInfraInstallAdapter._read_proc = staticmethod(_DEFAULT_PROC_READER)
 
 
 class RecordingGit:
@@ -48,6 +62,66 @@ def config_for(fixture, *, root=None, remote="origin", branch="main"):
 
 
 class DataInfraAdapterCollectionTest(unittest.TestCase):
+    def test_proc_reader_skips_pid_disappearing_during_comm_exe_or_maps_read(self):
+        """防止 procfs 竞态把已消失 PID 报为安装读取失败。"""
+        processes = tuple(Path("/proc") / pid for pid in ("101", "102", "103"))
+
+        def read_text(path):
+            if path.name == "comm" and path.parent.name == "101":
+                raise FileNotFoundError(errno.ENOENT, "gone")
+            if path.name == "comm" and path.parent.name == "102":
+                return "gaussdb\n"
+            if path.name == "maps" and path.parent.name == "103":
+                raise FileNotFoundError(errno.ENOENT, "gone")
+            return "gaussdb\n"
+
+        def readlink(path):
+            if path.parent.name == "102":
+                raise FileNotFoundError(errno.ENOENT, "gone")
+            return "/checkout/bin/gaussdb"
+
+        with mock.patch("data_infra_sync.adapters.datainfra.Path.iterdir", return_value=processes), \
+             mock.patch("data_infra_sync.adapters.datainfra._read_proc_text", side_effect=read_text), \
+             mock.patch("data_infra_sync.adapters.datainfra.os.readlink", side_effect=readlink):
+            self.assertEqual(_DEFAULT_PROC_READER(), ())
+
+    def test_proc_reader_does_not_read_exe_or_maps_for_non_gaussdb(self):
+        """防止非 gaussdb 进程触发不必要的 procfs 读取。"""
+        process = Path("/proc/201")
+        with mock.patch("data_infra_sync.adapters.datainfra.Path.iterdir", return_value=(process,)), \
+             mock.patch("data_infra_sync.adapters.datainfra._read_proc_text", return_value="postgres\n") as read_text, \
+             mock.patch("data_infra_sync.adapters.datainfra.os.readlink") as readlink:
+            self.assertEqual(_DEFAULT_PROC_READER(), ())
+            readlink.assert_not_called()
+            read_text.assert_called_once_with(process / "comm")
+
+    def test_proc_reader_propagates_permission_errors_from_comm_exe_and_maps(self):
+        """防止 procfs 权限错误被静默降级为无进程。"""
+        for field, error in (
+            ("comm", PermissionError(errno.EPERM, "denied")),
+            ("exe", PermissionError(errno.EPERM, "denied")),
+            ("maps", PermissionError(errno.EACCES, "denied")),
+        ):
+            with self.subTest(field=field):
+                process = Path("/proc/301")
+
+                def read_text(path, field=field, error=error):
+                    if path.name == field:
+                        raise error
+                    return "gaussdb\n"
+
+                def readlink(path, field=field, error=error):
+                    if field == "exe":
+                        raise error
+                    return "/checkout/bin/gaussdb"
+
+                with mock.patch("data_infra_sync.adapters.datainfra.Path.iterdir", return_value=(process,)), \
+                     mock.patch("data_infra_sync.adapters.datainfra._read_proc_text", side_effect=read_text), \
+                     mock.patch("data_infra_sync.adapters.datainfra.os.readlink", side_effect=readlink):
+                    with self.assertRaises(type(error)) as raised:
+                        _DEFAULT_PROC_READER()
+                    self.assertEqual(raised.exception.errno, error.errno)
+
     def test_uninitialized_empty_submodule_directory_is_missing_not_parent_repo(self):
         """防止空目录中的 Git 命令向上发现父仓并在错误对象库 fetch。"""
         with tempfile.TemporaryDirectory() as temp_dir:

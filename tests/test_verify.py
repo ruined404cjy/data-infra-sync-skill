@@ -1,4 +1,5 @@
 import dataclasses
+import errno
 import hashlib
 import json
 import os
@@ -13,9 +14,17 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from data_infra_sync.adapters.datainfra import DataInfraInstallAdapter, _read_proc_text
+from data_infra_sync.adapters.datainfra import (
+    DataInfraInstallAdapter,
+    _read_proc_text,
+)
 from data_infra_sync.state import StateStore
-from data_infra_sync.verify import InstallIdentity, collect_install_identity, verify_install
+from data_infra_sync.verify import (
+    InstallIdentity,
+    _VerificationError,
+    collect_install_identity,
+    verify_install,
+)
 
 
 def _git(repo, *args):
@@ -185,6 +194,29 @@ class InstallIdentityTest(unittest.TestCase):
 
             self.assertEqual(len(reads), 24)
             self.assertEqual(set(reads), {path for _, paths in adapter.artifact_groups() for path in paths})
+
+    def test_proc_permission_error_is_exposed_as_failed_proc_read(self):
+        """防止 gaussdb maps 权限错误被误报为 deployment_consistent。"""
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            root = base / "checkout"
+            adapter, _, _ = _make_workspace(root)
+            process = Path("/proc/401")
+
+            def read_text(path):
+                if path.name == "maps":
+                    raise PermissionError(errno.EACCES, "maps denied")
+                return "gaussdb\n"
+
+            adapter.proc_reader = DataInfraInstallAdapter._read_proc
+            with mock.patch("data_infra_sync.adapters.datainfra.Path.iterdir", return_value=(process,)), \
+                 mock.patch("data_infra_sync.adapters.datainfra._read_proc_text", side_effect=read_text), \
+                 mock.patch("data_infra_sync.adapters.datainfra.os.readlink", return_value=str(root / "bin/gaussdb")):
+                with self.assertRaises(_VerificationError) as raised:
+                    collect_install_identity(_config(root, base / "state"), adapter)
+
+            self.assertEqual(raised.exception.state, "failed")
+            self.assertEqual(raised.exception.reasons, ("proc_read_failed",))
 
     def test_install_adapter_uses_injected_git_reader_for_composite_heads(self):
         """防止安装身份 Git 读取硬编码为真实 subprocess。"""
