@@ -1391,6 +1391,7 @@ class DataInfraAdapterManagedPatchTest(unittest.TestCase):
             )
             adapter._patch_loader = lambda commit: declarations
             before = self._domain_snapshot(fixture)
+            before_files = self._worktree_file_bytes(fixture.submodule)
 
             facts = adapter.collect_plan_facts(git, fresh=True)
             planned = plan_sync(facts)
@@ -1406,6 +1407,7 @@ class DataInfraAdapterManagedPatchTest(unittest.TestCase):
             )
             self.assertEqual(cli._exit_code(result), 2)
             self.assertEqual(self._domain_snapshot(fixture), before)
+            self.assertEqual(self._worktree_file_bytes(fixture.submodule), before_files)
 
     def test_unchanged_declared_patch_absent_from_clean_worktree_blocks(self):
         """防止同步主动把未应用的受控补丁引入干净工作树。"""
@@ -1644,6 +1646,15 @@ class DataInfraAdapterManagedPatchTest(unittest.TestCase):
                 fixture.submodule,
                 ("status", "--porcelain=v1", "-z", "--untracked-files=all"),
             ).stdout,
+        )
+
+    @staticmethod
+    def _worktree_file_bytes(root):
+        """返回工作树全部常规文件的相对路径和原始字节，排除 Git 元数据。"""
+        return tuple(
+            (path.relative_to(root).as_posix(), path.read_bytes())
+            for path in sorted(root.rglob("*"))
+            if path.is_file() and ".git" not in path.relative_to(root).parts
         )
 
     @staticmethod
