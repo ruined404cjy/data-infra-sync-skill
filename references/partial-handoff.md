@@ -1,10 +1,10 @@
 # 部分失败接管
 
-`sync apply` 返回 `partial` 和退出码 4 时读取本文件。接管流程只收集现场和报告，不自动修改 Git 状态。
+任一命令返回 `partial` 和退出码 4 时读取本文件。接管流程只收集现场和报告，不自动修改 Git 状态。
 
 ## 接管步骤
 
-1. 保存该次完整 Result 与退出码 4，不再次运行 `sync apply`。
+1. 保存该次完整 Result 与退出码 4，不再次运行产生该 Result 的变更命令，也不自动执行其 `next_actions`，包括 `branch_resume`。
 2. 在 checkout 根目录，按 Result 的每个逻辑路径执行只读检查：
 
    ```bash

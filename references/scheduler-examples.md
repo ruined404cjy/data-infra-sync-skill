@@ -52,6 +52,6 @@ systemctl --user enable --now data-infra-sync.timer
 - 退出 0：读取 JSON state；`updated` 或 `up_to_date` 表示源码同步完成。
 - 退出 2：安全停点，需要记录并通知处理。常见 state 为 `unconfigured`、`waiting_for_pin` 或 `blocked`；该次运行不修改工作树或本地分支。
 - 退出 3：写入前失败，记录 JSON reason 并通知处理。
-- 退出 4：发生 `partial`，保留现场并按 Result 的恢复 argv 处理。
+- 退出 4：发生 `partial`，保存完整 Result 和退出码，读取 [部分失败接管](partial-handoff.md) 并报告现场；不自动恢复。
 
 systemd 默认会把退出 2 标记为失败，便于监控发现等待或阻塞状态。cron 需要由外层监控检查进程退出码与 JSON state。
