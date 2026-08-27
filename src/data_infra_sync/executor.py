@@ -166,7 +166,7 @@ def _read_repositories_individually(git, adapter, facts, before_plan):
     """逐仓尽力读取实际 Git 事实，并显式标记不可读取项。"""
     repositories = []
     changed = False
-    read_failed = False
+    read_failed = True
     for previous in before_plan.repositories:
         logical_path = previous["path"]
         path = facts.parent.path if logical_path == "." else adapter.root / logical_path

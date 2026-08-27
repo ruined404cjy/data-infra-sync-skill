@@ -653,7 +653,10 @@ class ExecutorWriteTest(unittest.TestCase):
         result = execute_sync(git, adapter, None, True)
 
         self.assertEqual((result.state, result.changed), ("partial", True))
-        self.assertEqual(result.reason_codes, ("postcondition_failed",))
+        self.assertEqual(
+            result.reason_codes,
+            ("postcondition_failed", "actual_state_read_failed"),
+        )
         self.assertEqual(result.repositories[0]["head"], TARGET_PARENT)
         self.assertEqual(result.next_actions, ())
 
