@@ -266,7 +266,9 @@ class EvalScenarioTests(unittest.TestCase):
             root / "workspace.conf", root / "state",
         )
         git = Git()
-        return fixture, DataInfraAdapter.for_workspace(config, git), git
+        return fixture, DataInfraAdapter.for_workspace(
+            config, git, process_reader=lambda: ()
+        ), git
 
     def test_complete_successful_records_produce_deterministic_metrics(self):
         """防止合格的 27 次执行被拒绝或指标计算错误。"""
