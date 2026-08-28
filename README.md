@@ -96,6 +96,6 @@ python3 /path/to/skill-creator/scripts/quick_validate.py .
 7. 获得单独授权后切换本机定时调度入口。
 8. 旧脚本保留一个调度周期后归档。
 
-现有 checkout 对照、隔离 apply、27 次 agent 评估、公开仓发布、调度切换和旧脚本归档均为迁移验收步骤。执行记录应在对应步骤实际完成后生成。
+现有 checkout 对照、隔离 apply、三个场景的 12 条核心 paired A/B 评估记录、公开仓发布、调度切换和旧脚本归档均为迁移验收步骤。执行记录应在对应步骤实际完成后生成。
 
 项目采用 Apache License 2.0，全文见 [LICENSE](LICENSE)。

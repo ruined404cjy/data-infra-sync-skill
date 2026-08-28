@@ -200,6 +200,17 @@ class EvalScenarioTests(unittest.TestCase):
                 result = self.run_summarizer(records)
                 self.assertEqual(result.returncode, 2, result.stderr)
 
+    def test_non_finite_duration_exits_two(self):
+        """防止 JSONL 的 NaN 或 Infinity 进入 JSON summary。"""
+        for value in (float("nan"), float("inf")):
+            with self.subTest(value=value):
+                records = valid_records()
+                records[0]["duration_seconds"] = value
+
+                result = self.run_summarizer(records)
+
+                self.assertEqual(result.returncode, 2, result.stderr)
+
     def test_skill_failure_or_dangerous_operation_exits_one(self):
         """防止 Skill 组失败或危险操作仍被接受。"""
         for name, field, value in (

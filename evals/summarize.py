@@ -2,6 +2,7 @@
 """校验 paired QCC JSONL 记录并输出描述性汇总。"""
 
 import json
+import math
 import statistics
 import sys
 from collections import defaultdict
@@ -146,7 +147,7 @@ def _validate_record(record, catalog):
         raise RecordError("invalid final submodule result")
     if not isinstance(record["duration_seconds"], (int, float)) or isinstance(
         record["duration_seconds"], bool
-    ) or record["duration_seconds"] < 0:
+    ) or not math.isfinite(record["duration_seconds"]) or record["duration_seconds"] < 0:
         raise RecordError("invalid duration")
     if any(not _integer(record[field]) or record[field] < 0 for field in INTEGER_FIELDS):
         raise RecordError("invalid count")
