@@ -448,7 +448,7 @@ git commit -m "fix: surface gaussdb process read failures"
 - [ ] **Step 7: 校验 Skill 和文档**
 
 ```bash
-python3 /home/omm/.codex/skills/.system/skill-creator/scripts/quick_validate.py .
+python3 "${CODEX_HOME:-$HOME/.codex}/skills/.system/skill-creator/scripts/quick_validate.py" .
 python3 -m unittest tests.test_install_script -v
 rg -n "managed-patch-recovery|resume_sync|跨进程恢复|连续受控补丁" \
   SKILL.md README.md references || true

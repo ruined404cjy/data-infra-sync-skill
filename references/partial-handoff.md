@@ -13,10 +13,10 @@
    ```
 
    父仓路径为 `.`；子仓路径使用 Result `repositories[].path` 的值。
-3. 对 Result 中的 Delta 仓执行只读命令。将输出与当前声明补丁对照：匹配为 `applied`，空输出为 `absent`，其余输出为其他 dirty 状态：
+3. DataInfra adapter 的 Delta 仓固定逻辑路径为 `plugins/iceberg_delta`。执行只读命令，并将输出与当前声明补丁对照：匹配为 `applied`，空输出为 `absent`，其余输出为其他 dirty 状态：
 
    ```bash
-   git -C <Delta 逻辑路径> diff --binary
+   git -C plugins/iceberg_delta diff --binary
    ```
 
 4. 汇总父仓和子仓的目标 pin、实际 HEAD、工作树状态与失败阶段。

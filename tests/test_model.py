@@ -154,6 +154,8 @@ class ResultModelTest(unittest.TestCase):
 
         invalid_documents = []
         for path, value in (
+            (("state",), "unexpected"),
+            (("snapshot",), "not-a-snapshot"),
             (("target", "unexpected"), True),
             (("repositories", 0, "role"), "dependency"),
             (("target", "parent_commit"), "not-an-oid"),

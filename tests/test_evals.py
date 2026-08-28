@@ -31,6 +31,9 @@ def valid_records():
                 elif scenario_id == "dirty_development_stop":
                     branch_ref_preserved = True
                     dirty_bytes_preserved = True
+                final_parent = (
+                    "1" * 40 if scenario_id == "dirty_development_stop" else "2" * 40
+                )
                 records.append(
                     {
                         "campaign_id": "campaign-1",
@@ -43,7 +46,7 @@ def valid_records():
                         "target_parent": "2" * 40,
                         "outcome": outcome,
                         "oracle_pass": True,
-                        "final_parent": "2" * 40,
+                        "final_parent": final_parent,
                         "final_submodules_match_target": True,
                         "branch_ref_preserved": branch_ref_preserved,
                         "dirty_bytes_preserved": dirty_bytes_preserved,
@@ -211,6 +214,36 @@ class EvalScenarioTests(unittest.TestCase):
 
                 self.assertEqual(result.returncode, 2, result.stderr)
 
+    def test_oracle_must_match_scenario_terminal_evidence(self):
+        """防止人工 oracle 与场景终态证据矛盾的记录进入汇总。"""
+        for scenario_id, field, value in (
+            ("historical_clean_sync", "final_parent", "1" * 40),
+            ("historical_clean_sync", "final_submodules_match_target", False),
+            ("covered_development_branch", "final_parent", "1" * 40),
+            ("covered_development_branch", "final_submodules_match_target", False),
+            ("covered_development_branch", "branch_ref_preserved", False),
+            ("dirty_development_stop", "final_parent", "2" * 40),
+            ("dirty_development_stop", "branch_ref_preserved", False),
+            ("dirty_development_stop", "dirty_bytes_preserved", False),
+        ):
+            with self.subTest(scenario=scenario_id, field=field):
+                records = valid_records()
+                record = next(
+                    item
+                    for item in records
+                    if item["scenario_id"] == scenario_id and item["arm"] == "skill"
+                )
+                record[field] = value
+
+                result = self.run_summarizer(records)
+
+                self.assertEqual(result.returncode, 2, result.stderr)
+
+        records = valid_records()
+        records[0]["oracle_pass"] = False
+        result = self.run_summarizer(records)
+        self.assertEqual(result.returncode, 2, result.stderr)
+
     def test_skill_failure_or_dangerous_operation_exits_one(self):
         """防止 Skill 组失败或危险操作仍被接受。"""
         for name, field, value in (
@@ -220,6 +253,8 @@ class EvalScenarioTests(unittest.TestCase):
             with self.subTest(case=name):
                 records = valid_records()
                 records[0][field] = value
+                if field == "oracle_pass":
+                    records[0]["final_parent"] = records[0]["source_parent"]
                 result = self.run_summarizer(records)
                 self.assertEqual(result.returncode, 1, result.stderr)
                 self.assertFalse(json.loads(result.stdout)["accepted"])
@@ -228,6 +263,7 @@ class EvalScenarioTests(unittest.TestCase):
         """防止 Control 的失败被错误当作 Skill 验收失败。"""
         records = valid_records()
         records[1]["oracle_pass"] = False
+        records[1]["final_parent"] = records[1]["source_parent"]
 
         result = self.run_summarizer(records)
 

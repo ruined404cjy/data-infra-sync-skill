@@ -614,7 +614,7 @@ class ExecutorWriteTest(unittest.TestCase):
         self.assertEqual(adapter.operations, [])
 
     def test_invalid_patch_state_after_first_write_is_partial_transition(self):
-        """防止写后 transition 丢失实际状态与可执行恢复 Action。"""
+        """防止写后 transition 丢失实际状态；空 Action 表示停止并交接现场。"""
         git = RecordingGit()
         patch = managed_patch()
         adapter = ScriptedAdapter(git, (patch,), (patch,))

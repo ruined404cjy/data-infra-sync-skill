@@ -177,6 +177,26 @@ def _validate_record(record, catalog):
     ):
         raise RecordError("invalid dirty preservation evidence")
 
+    if scenario_id == "historical_clean_sync":
+        evidence_pass = (
+            record["final_parent"] == record["target_parent"]
+            and record["final_submodules_match_target"] is True
+        )
+    elif scenario_id == "covered_development_branch":
+        evidence_pass = (
+            record["final_parent"] == record["target_parent"]
+            and record["final_submodules_match_target"] is True
+            and branch is True
+        )
+    else:
+        evidence_pass = (
+            record["final_parent"] == record["source_parent"]
+            and branch is True
+            and dirty is True
+        )
+    if evidence_pass != record["oracle_pass"]:
+        raise RecordError("oracle contradicts terminal evidence")
+
 
 def _read_records(path, catalog):
     """读取 JSONL 并校验 12 条记录的 paired 集合完整性。"""

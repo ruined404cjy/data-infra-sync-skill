@@ -332,10 +332,9 @@ class RoutingTests(unittest.TestCase):
             "branch": "main", "upstream": None, "ahead": None, "behind": None,
             "worktree": "clean", "relation": "equal", "reason_codes": [],
         }
-        action = Action("branch_resume", ("data-infra-sync", "branch", "resume", "--repo", ".", "--name", "work"), False, False, ())
         target = {"parent_commit": OID, "remote": "origin", "branch": "main", "gitlinks": {}}
         cases = (
-            (("sync", "apply", "--non-interactive"), result(command="sync apply", state="partial", changed=True, target=target, repositories=(repository,), next_actions=(action,))),
+            (("sync", "apply", "--non-interactive"), result(command="sync apply", state="partial", changed=True, target=target, repositories=(repository,), next_actions=())),
             (("branch", "start", "--repo", ".", "--name", "work"), result(command="branch start", state="branch_started", changed=True, repositories=(repository,))),
         )
         for argv, service_result in cases:
@@ -355,8 +354,7 @@ class RoutingTests(unittest.TestCase):
                     self.assertIn("audit_write_failed", document["reason_codes"])
 
     def test_render_failure_preserves_domain_write_exit_and_best_effort_audit(self):
-        action = Action("branch_resume", ("data-infra-sync", "branch", "resume", "--repo", ".", "--name", "work"), False, False, ())
-        written = result(command="sync apply", state="updated", changed=True, target={"parent_commit": OID, "remote": "origin", "branch": "main", "gitlinks": {}}, next_actions=(action,))
+        written = result(command="sync apply", state="updated", changed=True, target={"parent_commit": OID, "remote": "origin", "branch": "main", "gitlinks": {}}, next_actions=())
         with patch.object(cli, "_dispatch", return_value=written), patch.object(cli, "_render", side_effect=OSError("closed")):
             code, output, _ = self.run_main(("sync", "apply", "--non-interactive", "--format", "json"))
         self.assertEqual((code, output), (4, ""))

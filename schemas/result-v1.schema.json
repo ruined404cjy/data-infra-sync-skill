@@ -23,7 +23,27 @@
       "type": "string"
     },
     "state": {
-      "type": "string"
+      "enum": [
+        "waiting_for_pin",
+        "blocked",
+        "build_required",
+        "deployment_mismatch",
+        "publish_required",
+        "unconfigured",
+        "initialized",
+        "inspected",
+        "up_to_date",
+        "update_ready",
+        "updated",
+        "branch_status",
+        "branch_started",
+        "branch_resumed",
+        "publish_verified",
+        "deployment_consistent",
+        "unknown",
+        "partial",
+        "failed"
+      ]
     },
     "reason_codes": {
       "type": "array",
@@ -47,7 +67,10 @@
       "items": { "$ref": "#/$defs/action" }
     },
     "snapshot": {
-      "type": ["string", "null"]
+      "oneOf": [
+        { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        { "type": "null" }
+      ]
     },
     "stale_target": {
       "type": ["boolean", "null"]

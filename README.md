@@ -21,15 +21,15 @@
 从本仓库根目录选择一个 host：
 
 ```bash
-./scripts/install-skill.sh --host codex
-./scripts/install-skill.sh --host claude
-./scripts/install-skill.sh --host gemini
+./scripts/install-skill.sh --host codex --bin
+./scripts/install-skill.sh --host claude --bin
+./scripts/install-skill.sh --host gemini --bin
 ```
 
-添加 `--bin` 会同时创建 `~/.local/bin/data-infra-sync`：
+默认示例同时创建 `~/.local/bin/data-infra-sync`；请确保 `~/.local/bin` 位于 `PATH`。省略 `--bin` 可仅安装 Skill：
 
 ```bash
-./scripts/install-skill.sh --bin --host codex
+./scripts/install-skill.sh --host codex
 ```
 
 安装器只创建父目录和符号链接。相同链接重复安装保持幂等；已有其他文件或链接时拒绝覆盖。host 链接分别位于 `.agents/skills/data-infra-sync-skill`、`.claude/skills/data-infra-sync-skill` 和 `.gemini/skills/data-infra-sync-skill`。
