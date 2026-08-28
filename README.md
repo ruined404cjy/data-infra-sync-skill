@@ -2,6 +2,8 @@
 
 `data-infra-sync-skill` 为已有 DataInfra 组合仓提供确定性的本地状态检查、开发分支处理、公共 pin 同步和构建后安装身份核验。CLI 输出结构化 Result，Skill 指导 coding agent 按状态机安全执行下一步。
 
+系统架构、状态机、安全边界和实际能力见 [设计与能力](docs/design.md)。
+
 ## 范围
 
 本项目覆盖父仓和一级 submodule 检查、受控同步、分支状态与发布覆盖检查、安装 manifest、构建/安装副本和运行进程映射核验。
