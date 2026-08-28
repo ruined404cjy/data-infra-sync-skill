@@ -107,15 +107,26 @@ def plan_sync(facts: PlanFacts) -> Result:
     snapshot = snapshot_for(facts)
     actions: Tuple[Action, ...] = ()
     if state == "update_ready":
-        actions = (
-            Action(
-                "sync_apply",
-                ("data-infra-sync", "sync", "apply", "--snapshot", snapshot),
-                True,
-                False,
-                ("fresh_fetch", "snapshot_matches"),
-            ),
-        )
+        if facts.stale_target:
+            actions = (
+                Action(
+                    "sync_plan",
+                    ("data-infra-sync", "sync", "plan"),
+                    False,
+                    False,
+                    (),
+                ),
+            )
+        else:
+            actions = (
+                Action(
+                    "sync_apply",
+                    ("data-infra-sync", "sync", "apply", "--snapshot", snapshot),
+                    True,
+                    False,
+                    ("fresh_fetch", "snapshot_matches"),
+                ),
+            )
 
     return Result(
         "sync plan",

@@ -11,8 +11,8 @@ description: Use when an existing DataInfra composite checkout needs local versi
 
 1. 先运行 `data-infra-sync --format json inspect`。
 2. `unconfigured` 时执行 Result 的 `init` argv，然后重新 inspect。需要配置选项时读取 [configuration.md](references/configuration.md)。
-3. 开发分支任务使用 `branch status|start|resume|publish-check --repo <逻辑路径>`；同步公共 pin 使用 `sync plan`。
-4. `update_ready` 时原样执行 Result 的 snapshot argv。只有明确的无人值守任务使用 `sync apply --non-interactive`。snapshot 模式与 non-interactive 模式严格二选一。
+3. 开发分支任务使用 `branch status|start|resume|publish-check --repo <逻辑路径>`；同步公共 pin 按 Result 的 `next_actions` 依次执行。offline `inspect` 的 `update_ready` Action 是 fresh `sync plan`，fresh plan 的 `update_ready` Action 是 snapshot apply。
+4. 每次执行 Action 后只按新 Result 继续状态机。只有明确的无人值守任务使用 `sync apply --non-interactive`。snapshot 模式与 non-interactive 模式严格二选一。
 
 ## 同步状态机
 
@@ -26,7 +26,7 @@ description: Use when an existing DataInfra composite checkout needs local versi
 | `failed` | 停止，报告失败及退出码。 |
 | `partial` | 停止自动变更，保存完整 Result，读取 [partial-handoff.md](references/partial-handoff.md) 并报告实际现场。 |
 
-dirty 工作树、活动 Git transition、submodule 布局 transition 或受控补丁 transition 均保持现场。此流程不执行 stash、reset、commit、push、merge、rebase、分支删除或手工 submodule checkout。用户另行明确授权这些操作时，结束本流程后单独处理。
+只按顶层 `state` 决定继续或停止。`update_ready` 表示普通 dirty 已被排除；单个 repository 的 `worktree=dirty` 可以是连续受管补丁状态，继续执行 Action。`blocked` 表示 dirty 工作树、活动 Git transition、submodule 布局 transition 或受控补丁 transition 等安全停点，保持现场。此流程不执行 stash、reset、commit、push、merge、rebase、分支删除或手工 submodule checkout。用户另行明确授权这些操作时，结束本流程后单独处理。
 
 `partial` 的唯一后续流程是接管参考，其中未定义安全变更 Action；不构造变更命令。
 

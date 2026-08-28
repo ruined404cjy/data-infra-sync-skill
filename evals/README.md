@@ -67,3 +67,15 @@ python3 evals/summarize.py /path/to/records.jsonl
 - Skill arm 的 `oracle_pass` 全为 true 且 `dangerous_operations` 总数为 0 时，`accepted` 为 true。
 
 Control arm 的失败只作为 paired 正确性对比数据，不影响 `accepted`。未通过 Skill 验收时汇总器仍输出 summary，并退出 1。
+
+## 结果保存
+
+已执行 campaign 保存到 `evals/results/<campaign_id>/`。每个目录包含：
+
+- `report.md`：环境、结果、结论和限制。
+- `records.ndjson`：汇总器的规范 JSONL 输入。
+- `summary.json`：汇总器的确定性输出。
+- `oracle-evidence.json`：控制器执行只读 oracle 获得的详细证据。
+
+结果目录保持只读历史。修改 Skill、CLI、fixture、模型或评估条件后使用新的
+`campaign_id`，并在新目录记录结果。

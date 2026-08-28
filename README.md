@@ -54,7 +54,7 @@ data-infra-sync --format json inspect
 data-infra-sync --format json sync plan
 ```
 
-`update_ready` 时将 Result 的 `next_actions[].argv` 作为参数数组直接执行。snapshot apply 与 `--non-interactive` 严格二选一。`partial` 时停止自动变更，按 [部分失败接管](references/partial-handoff.md) 保存 Result、读取现场并报告。源码到达 `updated` 或 `up_to_date` 后，按 [DataInfra 构建与安装核验](references/datainfra-build-and-verify.md) 完成部署检查。
+`update_ready` 时将 Result 的 `next_actions[].argv` 作为参数数组直接执行。offline 结果先生成 fresh plan，fresh plan 再生成 snapshot apply。snapshot apply 与 `--non-interactive` 严格二选一。`partial` 时停止自动变更，按 [部分失败接管](references/partial-handoff.md) 保存 Result、读取现场并报告。源码到达 `updated` 或 `up_to_date` 后，按 [DataInfra 构建与安装核验](references/datainfra-build-and-verify.md) 完成部署检查。
 
 配置键与优先级见 [配置参考](references/configuration.md)。明确的无人值守任务见 [调度示例](references/scheduler-examples.md)。
 

@@ -242,6 +242,26 @@ class PlannerStateTest(unittest.TestCase):
         self.assertFalse(action.requires_confirmation)
         self.assertEqual(action.preconditions, ("fresh_fetch", "snapshot_matches"))
 
+    def test_stale_update_ready_requires_fresh_plan_before_snapshot_apply(self):
+        """防止 offline snapshot 被直接交给必定 fresh 复检的 apply。"""
+        facts = plan_facts(
+            target_parent=TARGET_PARENT,
+            parent_relation="contained",
+            stale_target=True,
+        )
+
+        result = plan_sync(facts)
+
+        self.assertEqual(result.state, "update_ready")
+        self.assertTrue(result.stale_target)
+        self.assertEqual(len(result.next_actions), 1)
+        action = result.next_actions[0]
+        self.assertEqual(action.kind, "sync_plan")
+        self.assertEqual(action.argv, ("data-infra-sync", "sync", "plan"))
+        self.assertFalse(action.mutates_worktree)
+        self.assertFalse(action.requires_confirmation)
+        self.assertEqual(action.preconditions, ())
+
     def test_up_to_date_requires_the_observed_parent_head_to_equal_target(self):
         facts = plan_facts(parent=replace(plan_facts().parent, head=TARGET_PARENT))
 

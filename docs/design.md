@@ -141,7 +141,7 @@ flowchart TD
 1. `init` 验证 checkout 根目录并写入独立配置。
 2. `inspect` 使用本地对象生成当前状态。
 3. `sync plan` fresh 获取目标并生成执行 snapshot。
-4. `update_ready` 时原样执行 `next_actions[].argv`。
+4. stale `update_ready` 先执行 fresh `sync plan` Action；fresh `update_ready` 再执行 snapshot apply Action。
 5. `updated` 或 `up_to_date` 后调用 DataInfra 原生构建与安装流程。
 6. `verify install --record` 记录安装身份，普通 `verify install` 再确认一致性。
 7. `blocked`、`waiting_for_pin`、`failed` 和 `partial` 停止自动变更并报告原因。
@@ -234,7 +234,7 @@ Planner 是纯函数。它按固定安全优先级输出状态和原因：
 - 父仓分支不匹配、无法 fast-forward、普通 dirty、活动 Git 操作、运行实例、嵌套 submodule、布局迁移或补丁迁移：`blocked`。
 - 子仓当前 HEAD 未被目标 pin 覆盖：`waiting_for_pin`。
 - 父仓和全部目标 submodule 已精确到位：`up_to_date`。
-- 其他安全状态：`update_ready`，并生成 snapshot apply Action。
+- 其他安全状态：`update_ready`。stale 事实生成 fresh `sync plan` Action，fresh 事实生成 snapshot apply Action。
 
 新增 submodule 可以初始化。已有 submodule 的删除、改名、路径变化、URL 变化，以及名称复用到新路径，均归类为布局迁移并停止。
 
