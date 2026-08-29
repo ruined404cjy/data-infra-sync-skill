@@ -170,6 +170,13 @@ class DataInfraInstallAdapter:
             except OSError as error:
                 if _process_disappeared(error):
                     continue
+                if isinstance(error, PermissionError) and os.geteuid() != 0:
+                    try:
+                        owner_uid = process.stat().st_uid
+                    except OSError:
+                        raise error
+                    if owner_uid != os.geteuid():
+                        continue
                 raise
             records.append({"name": name, "exe": exe, "maps": tuple(maps)})
         return tuple(records)

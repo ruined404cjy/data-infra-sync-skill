@@ -122,6 +122,26 @@ class DataInfraAdapterCollectionTest(unittest.TestCase):
                         _DEFAULT_PROC_READER()
                     self.assertEqual(raised.exception.errno, error.errno)
 
+    def test_proc_reader_skips_permission_denied_foreign_process_for_non_root_only(self):
+        """允许普通用户忽略无权读取的外部 UID 进程，root 仍严格检查。"""
+        process = Path("/proc/302")
+        denied = PermissionError(errno.EACCES, "denied")
+
+        with mock.patch("data_infra_sync.adapters.datainfra.Path.iterdir", return_value=(process,)), \
+             mock.patch("data_infra_sync.adapters.datainfra._read_proc_text", return_value="gaussdb\n"), \
+             mock.patch("data_infra_sync.adapters.datainfra.os.readlink", side_effect=denied), \
+             mock.patch.object(Path, "stat", return_value=mock.Mock(st_uid=70)), \
+             mock.patch("data_infra_sync.adapters.datainfra.os.geteuid", return_value=1000):
+            self.assertEqual(_DEFAULT_PROC_READER(), ())
+
+        with mock.patch("data_infra_sync.adapters.datainfra.Path.iterdir", return_value=(process,)), \
+             mock.patch("data_infra_sync.adapters.datainfra._read_proc_text", return_value="gaussdb\n"), \
+             mock.patch("data_infra_sync.adapters.datainfra.os.readlink", side_effect=denied), \
+             mock.patch.object(Path, "stat", return_value=mock.Mock(st_uid=70)), \
+             mock.patch("data_infra_sync.adapters.datainfra.os.geteuid", return_value=0):
+            with self.assertRaises(PermissionError):
+                _DEFAULT_PROC_READER()
+
     def test_uninitialized_empty_submodule_directory_is_missing_not_parent_repo(self):
         """防止空目录中的 Git 命令向上发现父仓并在错误对象库 fetch。"""
         with tempfile.TemporaryDirectory() as temp_dir:
