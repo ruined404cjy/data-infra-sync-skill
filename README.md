@@ -1,14 +1,32 @@
 # data-infra-sync-skill
 
-`data-infra-sync-skill` 为已有 DataInfra 组合仓提供确定性的本地状态检查、开发分支处理、公共 pin 同步和构建后安装身份核验。CLI 输出结构化 Result，Skill 指导 coding agent 按状态机安全执行下一步。
+`data-infra-sync-skill` 为已有 DataInfra 组合仓提供确定性的本地状态检查、开发分支处理、公共 pin 同步和构建后安装身份核验。CLI 输出结构化 Result，Skill 指导用户或 coding agent 按状态机执行下一步。
 
-系统架构、状态机、安全边界和实际能力见 [设计与能力](docs/design.md)。
+## 需求背景
 
-## 范围
+DataInfra 使用父仓 gitlink 固定多个一级 submodule 的精确版本。开发者在子仓分支上工作时，需要同时处理父仓目标、公共 pin、子仓提交覆盖关系、工作树状态和受管构建补丁。直接组合 Git 命令容易遗漏父仓更新、切换未发布提交或破坏本地修改。
 
-本项目覆盖父仓和一级 submodule 检查、受控同步、分支状态与发布覆盖检查、安装 manifest、构建/安装副本和运行进程映射核验。
+本项目将状态检查、决策和安全变更封装为确定性 CLI，并使用通用 Agent Skill 描述固定执行流程。低经验用户和低推理强度模型可以读取结构化结果，依次执行 `next_actions`，在异常状态停止并保留现场。
+
+## 核心功能
+
+- 检查父仓和一级 submodule 的 Git 状态。
+- 解析公共目标父仓及其精确 submodule pin。
+- 生成 fresh snapshot，并在前置状态不变时执行受控同步。
+- 检查、创建和恢复子仓开发分支，确认开发提交已被公共 pin 覆盖。
+- 在声明不变时重放单个受管 Delta 构建补丁。
+- 记录安装 manifest，核验源码、构建副本、安装 `.so` 和运行进程映射的一致性。
+- 通过 Result v1、稳定状态和原因码向用户或 Agent 提供下一步。
+
+系统架构、状态机和完整能力表见 [设计与能力](docs/design.md)。
+
+## 功能边界
+
+本项目覆盖父仓和一级 submodule 检查、受控同步、开发分支状态与发布覆盖检查、安装 manifest，以及构建副本、安装副本和运行进程映射核验。
 
 仓库 clone、Git 凭据配置、基础开发环境安装、自动 commit/push/merge/rebase/stash/reset、分支删除和 PR 管理不在本项目范围内。
+
+DataInfra 构建和测试继续使用项目原生文档与脚本。本项目负责调用指导和构建后身份核验。
 
 ## 平台要求
 
@@ -36,7 +54,7 @@
 
 安装器只创建父目录和符号链接。相同链接重复安装保持幂等；已有其他文件或链接时拒绝覆盖。host 链接分别位于 `.agents/skills/data-infra-sync-skill`、`.claude/skills/data-infra-sync-skill` 和 `.gemini/skills/data-infra-sync-skill`。
 
-## 快速开始
+## 使用
 
 在已有 DataInfra checkout 中初始化独立配置：
 
@@ -69,35 +87,13 @@ python3 scripts/data-infra-sync --help
 python3 scripts/data-infra-sync sync apply --help
 ```
 
-## 测试
+## 文档
 
-运行安装器测试和全量标准库测试：
-
-```bash
-python3 -m unittest tests.test_install_script -v
-python3 -m unittest discover -s tests -v
-bash -n scripts/install-skill.sh
-```
-
-验证 Agent Skill frontmatter 与目录：
-
-```bash
-python3 /path/to/skill-creator/scripts/quick_validate.py .
-```
-
-## QCC 与迁移验收
-
-发布与迁移按以下顺序验收：
-
-1. 在临时 bare Git 仓库构造的 fixture 中运行全量自动测试。
-2. 对现有 DataInfra checkout 执行 `inspect`、`sync plan --offline` 和 `verify install`，与现行工具的结果对照。命令写入独立审计状态，不修改 checkout 的 refs、index 或工作树。对照记录包含取消 upstream-only 自动切换这一有意差异。
-3. 在隔离工作区执行实际 apply、单补丁重放和部分失败接管测试。
-4. 按 [QCC paired A/B 评估协议](evals/README.md) 在全新会话中执行三个核心场景的 12 次配对运行。
-5. 运行 `scripts/public-scan.sh`，检查个人路径、凭据、带 userinfo 的真实 URL、本地日志/状态文件和未跟踪源码/文档/配置片段。
-6. 在个人公开仓库发布 Apache-2.0 版本。
-7. 获得单独授权后切换本机定时调度入口。
-8. 旧脚本保留一个调度周期后归档。
-
-现有 checkout 对照、隔离 apply、三个场景的 12 条核心 paired A/B 评估记录、公开仓发布、调度切换和旧脚本归档均为迁移验收步骤。执行记录应在对应步骤实际完成后生成。
+- [设计与能力](docs/design.md)
+- [QCC 提效申请报告](docs/qcc-application-report.md)
+- [配置参考](references/configuration.md)
+- [DataInfra 构建与安装核验](references/datainfra-build-and-verify.md)
+- [部分失败接管](references/partial-handoff.md)
+- [调度示例](references/scheduler-examples.md)
 
 项目采用 Apache License 2.0，全文见 [LICENSE](LICENSE)。
