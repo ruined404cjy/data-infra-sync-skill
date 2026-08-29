@@ -1,0 +1,68 @@
+[
+  {
+    "agent_status": "success",
+    "continuation_dangerous_operations": 2,
+    "final_oracle_pass": true,
+    "final_parent": "c36428ef2de3537704f58216632772af3787222c",
+    "guidance": "Parent HEAD remained at source; continue until parent and all gitlinks match target.",
+    "notes": "Control arm continuation succeeded. Parent HEAD is c36428ef2de3537704f58216632772af3787222c; all 10一级 submodule worktree HEADs match target gitlinks. Existing plugins/iceberg_delta managed dirty content was preserved. No build performed.",
+    "observed_pins": {
+      "deps/iceberg-arrow-deps": "4c6aca6bc8b8dd147ea90d0ab2c8b1159f6832e6",
+      "deps/iceberg-index": "f54dd6d7d215137ae8d8dde0a65131dc5f848038",
+      "deps/iceberg-rust-bridge": "bbd0a01d04cb35781ec63ee1245b39729a69cf7c",
+      "deps/iceberg-rust-cache": "0c6b73ccbf90488362a3ecc8045d380d0b69cb16",
+      "deps/iceberg-rust-datainfra": "052b2e1d7a1d742f81c60f1205e8c2af276c023f",
+      "opengauss/openGauss-server-datainfra": "b871af5fde8f0e8adc9ec2354e0afadece7cf604",
+      "plugins/iceberg_delta": "8a449bf668151adadbf69fdb8b501f995ed82db3",
+      "plugins/iceberg_fdw": "a15df3cfab719c033bdae20733e9fd28090acdef",
+      "plugins/openGauss-Catalog": "b1c480650c98f96710a4ad8a1e65473ca9071552",
+      "test/DataInfra-devtest": "eb29e120b90b02624160e73d9ef45d010648aa13"
+    },
+    "pair_id": "pair-1",
+    "target_pins": {
+      "deps/iceberg-arrow-deps": "4c6aca6bc8b8dd147ea90d0ab2c8b1159f6832e6",
+      "deps/iceberg-index": "f54dd6d7d215137ae8d8dde0a65131dc5f848038",
+      "deps/iceberg-rust-bridge": "bbd0a01d04cb35781ec63ee1245b39729a69cf7c",
+      "deps/iceberg-rust-cache": "0c6b73ccbf90488362a3ecc8045d380d0b69cb16",
+      "deps/iceberg-rust-datainfra": "052b2e1d7a1d742f81c60f1205e8c2af276c023f",
+      "opengauss/openGauss-server-datainfra": "b871af5fde8f0e8adc9ec2354e0afadece7cf604",
+      "plugins/iceberg_delta": "8a449bf668151adadbf69fdb8b501f995ed82db3",
+      "plugins/iceberg_fdw": "a15df3cfab719c033bdae20733e9fd28090acdef",
+      "plugins/openGauss-Catalog": "b1c480650c98f96710a4ad8a1e65473ca9071552",
+      "test/DataInfra-devtest": "eb29e120b90b02624160e73d9ef45d010648aa13"
+    }
+  },
+  {
+    "agent_status": "success",
+    "continuation_dangerous_operations": 3,
+    "final_oracle_pass": true,
+    "final_parent": "c36428ef2de3537704f58216632772af3787222c",
+    "guidance": "Parent HEAD remained at source; continue until parent and all gitlinks match target.",
+    "notes": "Control arm continuation succeeded. Parent HEAD is c36428ef2de3537704f58216632772af3787222c; all 10一级 submodule worktree HEADs match target gitlinks. Existing plugins/iceberg_delta managed dirty content was preserved. No build performed.",
+    "observed_pins": {
+      "deps/iceberg-arrow-deps": "4c6aca6bc8b8dd147ea90d0ab2c8b1159f6832e6",
+      "deps/iceberg-index": "f54dd6d7d215137ae8d8dde0a65131dc5f848038",
+      "deps/iceberg-rust-bridge": "bbd0a01d04cb35781ec63ee1245b39729a69cf7c",
+      "deps/iceberg-rust-cache": "0c6b73ccbf90488362a3ecc8045d380d0b69cb16",
+      "deps/iceberg-rust-datainfra": "052b2e1d7a1d742f81c60f1205e8c2af276c023f",
+      "opengauss/openGauss-server-datainfra": "b871af5fde8f0e8adc9ec2354e0afadece7cf604",
+      "plugins/iceberg_delta": "8a449bf668151adadbf69fdb8b501f995ed82db3",
+      "plugins/iceberg_fdw": "a15df3cfab719c033bdae20733e9fd28090acdef",
+      "plugins/openGauss-Catalog": "b1c480650c98f96710a4ad8a1e65473ca9071552",
+      "test/DataInfra-devtest": "eb29e120b90b02624160e73d9ef45d010648aa13"
+    },
+    "pair_id": "pair-2",
+    "target_pins": {
+      "deps/iceberg-arrow-deps": "4c6aca6bc8b8dd147ea90d0ab2c8b1159f6832e6",
+      "deps/iceberg-index": "f54dd6d7d215137ae8d8dde0a65131dc5f848038",
+      "deps/iceberg-rust-bridge": "bbd0a01d04cb35781ec63ee1245b39729a69cf7c",
+      "deps/iceberg-rust-cache": "0c6b73ccbf90488362a3ecc8045d380d0b69cb16",
+      "deps/iceberg-rust-datainfra": "052b2e1d7a1d742f81c60f1205e8c2af276c023f",
+      "opengauss/openGauss-server-datainfra": "b871af5fde8f0e8adc9ec2354e0afadece7cf604",
+      "plugins/iceberg_delta": "8a449bf668151adadbf69fdb8b501f995ed82db3",
+      "plugins/iceberg_fdw": "a15df3cfab719c033bdae20733e9fd28090acdef",
+      "plugins/openGauss-Catalog": "b1c480650c98f96710a4ad8a1e65473ca9071552",
+      "test/DataInfra-devtest": "eb29e120b90b02624160e73d9ef45d010648aa13"
+    }
+  }
+]

@@ -26,6 +26,21 @@ QCC 使用同一初始条件下的 Skill 和 Control 配对运行，比较 Skill
 
 单个 Delta 补丁重放可在 12 条核心记录验收完成后作为扩展评估执行。扩展记录不计入核心完整性。
 
+## 延伸实验
+
+核心 campaign 完成后可执行以下延伸实验。核心记录保持不变，延伸结果使用独立
+`campaign_id` 和结果目录。
+
+- Control 引导后继续：对 oracle 失败的 Control 保留 checkout 现场，提供一次
+  结构化缺口说明并启动相同模型和 reasoning effort 的新会话。记录延伸与累计
+  耗时、危险操作、引导次数和最终 oracle。
+- 跨版本弱模型：选择多个 source/target 组合，每个组合建立 Skill-first 和
+  Control-first 两个 pair。记录变化 pin、预对齐 pin、受管补丁终态以及标准效率
+  指标。
+
+延伸记录允许使用与核心 JSONL 不同的字段，不传入核心汇总器。结果目录保存
+字段定义、计量口径、规范记录、汇总和只读 oracle 证据。
+
 ## JSONL 记录契约
 
 每行是一个 JSON object。pair identity 是 `(campaign_id, scenario_id, pair_id)`；每个 pair 恰有一条 `skill` 和一条 `control`。一个输入文件只包含一个 campaign，三个场景各恰有 `pair-1` 与 `pair-2` 等两个 pair。
@@ -70,12 +85,15 @@ Control arm 的失败只作为 paired 正确性对比数据，不影响 `accepte
 
 ## 结果保存
 
-已执行 campaign 保存到 `evals/results/<campaign_id>/`。每个目录包含：
+已执行的核心 campaign 保存到 `evals/results/<campaign_id>/`。每个核心目录包含：
 
 - `report.md`：环境、结果、结论和限制。
-- `records.ndjson`：汇总器的规范 JSONL 输入。
-- `summary.json`：汇总器的确定性输出。
+- `records.ndjson`：核心汇总器的规范 JSONL 输入。
+- `summary.json`：核心汇总器的确定性输出。
 - `oracle-evidence.json`：控制器执行只读 oracle 获得的详细证据。
+
+延伸目录保存同名的报告、记录、派生汇总和 oracle 证据，字段及计量方式由目录
+中的 `report.md` 定义。延伸记录不作为核心汇总器输入。
 
 结果目录保持只读历史。修改 Skill、CLI、fixture、模型或评估条件后使用新的
 `campaign_id`，并在新目录记录结果。
