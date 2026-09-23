@@ -852,6 +852,130 @@ class DataInfraAdapterLayoutTest(unittest.TestCase):
 
 
 class DataInfraAdapterManagedPatchTest(unittest.TestCase):
+    def test_clean_integrated_patch_allows_parent_advance_without_rewriting_delta(self):
+        """上游已提交补丁效果时，父仓前进不应改写干净的 Delta 工作树。"""
+        with tempfile.TemporaryDirectory(prefix="managed patch integrated ") as temp_dir:
+            fixture, patch_content = self._delta_fixture(Path(temp_dir))
+            self._pin_integrated_patch(fixture, patch_content)
+            target_parent, target_pin = self._advance_parent_only(fixture)
+            git = RecordingGit()
+            adapter = DataInfraAdapter.for_workspace(config_for(fixture), git)
+
+            result = execute_sync(git, adapter, None, True)
+
+            self.assertEqual((result.state, result.changed), ("updated", True))
+            self.assertEqual(fixture.rev_parse(fixture.parent, "HEAD"), target_parent)
+            self.assertEqual(fixture.rev_parse(fixture.submodule, "HEAD"), target_pin)
+            self.assertEqual(
+                (fixture.submodule / "README.md").read_text(encoding="utf-8"),
+                "patched submodule\n",
+            )
+            self.assertEqual(
+                fixture._run(
+                    fixture.submodule,
+                    ("status", "--porcelain=v1", "-z", "--untracked-files=all"),
+                ).stdout,
+                "",
+            )
+            self.assertFalse(
+                any(
+                    args[:2] == ("apply", "--reverse") and "--check" not in args
+                    for _, args in git.calls
+                )
+            )
+
+    def test_clean_integrated_patch_allows_target_delta_to_advance(self):
+        """目标 Delta 提交也含补丁效果时，允许更新 gitlink 并保持干净。"""
+        with tempfile.TemporaryDirectory(prefix="managed patch new delta ") as temp_dir:
+            fixture, patch_content = self._delta_fixture(Path(temp_dir))
+            self._pin_integrated_patch(fixture, patch_content)
+            target_parent, target_pin = self._advance_target_without_patch(fixture)
+            git = RecordingGit()
+            adapter = DataInfraAdapter.for_workspace(config_for(fixture), git)
+
+            result = execute_sync(git, adapter, None, True)
+
+            self.assertEqual((result.state, result.changed), ("updated", True))
+            self.assertEqual(fixture.rev_parse(fixture.parent, "HEAD"), target_parent)
+            self.assertEqual(fixture.rev_parse(fixture.submodule, "HEAD"), target_pin)
+            self.assertEqual(
+                (fixture.submodule / "README.md").read_text(encoding="utf-8"),
+                "patched submodule\n",
+            )
+            self.assertEqual(
+                fixture._run(
+                    fixture.submodule,
+                    ("status", "--porcelain=v1", "-z", "--untracked-files=all"),
+                ).stdout,
+                "",
+            )
+            self.assertFalse(
+                any(
+                    args[:2] == ("apply", "--reverse") and "--check" not in args
+                    for _, args in git.calls
+                )
+            )
+
+    def test_clean_integrated_patch_blocks_target_without_patch_effect(self):
+        """目标 Delta 丢失补丁效果时，保持父仓与子仓现场。"""
+        with tempfile.TemporaryDirectory(prefix="managed patch removed effect ") as temp_dir:
+            fixture, patch_content = self._delta_fixture(Path(temp_dir))
+            self._pin_integrated_patch(fixture, patch_content)
+            current_parent = fixture.rev_parse(fixture.parent, "HEAD")
+            current_delta = fixture.rev_parse(fixture.submodule, "HEAD")
+            publisher = fixture.clone_parent("publisher")
+            fixture._run(
+                publisher,
+                ("-c", "protocol.file.allow=always", "submodule", "update", "--init"),
+            )
+            child = publisher / "plugins/iceberg_delta"
+            fixture._configure_user(child)
+            fixture.commit_file(child, "README.md", "initial submodule\n", "remove patch effect")
+            fixture._run(child, ("push", "origin", "HEAD:main"))
+            fixture._run(publisher, ("add", "plugins/iceberg_delta"))
+            fixture._run(publisher, ("commit", "-m", "pin unpatched delta"))
+            fixture.push(publisher)
+            git = Git()
+
+            result = execute_sync(
+                git, DataInfraAdapter.for_workspace(config_for(fixture), git), None, True
+            )
+
+            self.assertEqual(
+                (result.state, result.reason_codes),
+                ("blocked", ("managed_patch_transition_required",)),
+            )
+            self.assertFalse(result.changed)
+            self.assertEqual(fixture.rev_parse(fixture.parent, "HEAD"), current_parent)
+            self.assertEqual(fixture.rev_parse(fixture.submodule, "HEAD"), current_delta)
+
+    def test_clean_integrated_patch_blocks_changed_declaration(self):
+        """已集成补丁的干净工作树也须遵守父仓补丁声明。"""
+        with tempfile.TemporaryDirectory(prefix="managed patch declaration ") as temp_dir:
+            fixture, patch_content = self._delta_fixture(Path(temp_dir))
+            self._pin_integrated_patch(fixture, patch_content)
+            current_parent = fixture.rev_parse(fixture.parent, "HEAD")
+            current_delta = fixture.rev_parse(fixture.submodule, "HEAD")
+            publisher = fixture.clone_parent("publisher")
+            patch_path = publisher / "build/patches/iceberg-delta-cmake-pie-filter.patch"
+            patch_path.write_bytes(patch_content + b"\n# changed declaration\n")
+            fixture._run(publisher, ("add", "build/patches"))
+            fixture._run(publisher, ("commit", "-m", "change patch declaration"))
+            fixture.push(publisher)
+            git = Git()
+
+            result = execute_sync(
+                git, DataInfraAdapter.for_workspace(config_for(fixture), git), None, True
+            )
+
+            self.assertEqual(
+                (result.state, result.reason_codes),
+                ("blocked", ("managed_patch_transition_required",)),
+            )
+            self.assertFalse(result.changed)
+            self.assertEqual(fixture.rev_parse(fixture.parent, "HEAD"), current_parent)
+            self.assertEqual(fixture.rev_parse(fixture.submodule, "HEAD"), current_delta)
+
     def test_parent_merge_failure_hands_off_partial_without_resume(self):
         """父仓 merge 失败后交接现场，后续同步保持阻塞。"""
         with tempfile.TemporaryDirectory(prefix="managed patch partial handoff ") as temp_dir:
@@ -1186,6 +1310,17 @@ class DataInfraAdapterManagedPatchTest(unittest.TestCase):
         patch_file = fixture.root / "managed.patch"
         patch_file.write_bytes(patch_content)
         fixture._run(fixture.submodule, ("apply", str(patch_file)))
+
+    @classmethod
+    def _pin_integrated_patch(cls, fixture, patch_content):
+        """将受管补丁效果提交到 Delta，并更新当前父仓 pin。"""
+        cls._apply_patch(fixture, patch_content)
+        fixture._run(fixture.submodule, ("add", "README.md"))
+        fixture._run(fixture.submodule, ("commit", "-m", "integrate patch"))
+        fixture._run(fixture.submodule, ("push", "origin", "HEAD:main"))
+        fixture._run(fixture.parent, ("add", "plugins/iceberg_delta"))
+        fixture._run(fixture.parent, ("commit", "-m", "pin integrated delta"))
+        fixture.push(fixture.parent)
 
     @staticmethod
     def _advance_parent_only(fixture):

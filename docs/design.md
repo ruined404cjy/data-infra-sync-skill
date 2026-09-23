@@ -310,13 +310,14 @@ DataInfra Adapter 从指定父仓提交读取版本化补丁声明。当前自�
 - 父仓补丁文件：`build/patches/iceberg-delta-cmake-pie-filter.patch`
 - 目标 submodule：`plugins/iceberg_delta`
 
-自动重放要求当前与目标两侧均至多声明一个补丁，且补丁名称、内容 SHA-256、目标 submodule 和适用路径完全相同。当前工作树必须能够证明 dirty 只来自该补丁，目标 pin 必须能够应用补丁或已经包含等价内容。
+自动重放要求当前与目标两侧均至多声明一个补丁，且补丁名称、内容 SHA-256、目标 submodule 和适用路径完全相同。当前 Delta 工作树含补丁改动时，dirty 必须精确对应补丁，目标 pin 必须能够应用补丁或已包含等价内容。当前 Delta 工作树干净时，当前提交与目标 pin 均须包含补丁效果；同步保留已提交的内容，跳过反向应用和重新应用补丁。
 
 以下状态返回 `managed_patch_transition_required`：
 
 - 任一侧声明多个补丁。
 - 补丁新增、删除、内容变化、目标仓变化或适用路径变化。
 - 当前 dirty 包含补丁之外的字节。
+- 当前工作树干净，但当前提交或目标 pin 未包含补丁效果。
 - 目标 pin 无法应用补丁，且未等价包含补丁结果。
 - 双向 `git apply --check` 无法唯一判断 applied 或 absent。
 

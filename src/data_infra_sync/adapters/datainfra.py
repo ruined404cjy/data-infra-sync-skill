@@ -287,11 +287,10 @@ class DataInfraAdapter:
         )
         if target_state == "invalid":
             return False
-        if facts.current_parent == facts.target_parent:
-            repositories = {item.path: item for item in facts.repositories}
-            repository = repositories.get(patch.target_submodule)
-            if repository is not None and repository.facts.worktree == "clean":
-                return self.patch_state(git, patch) == "applied"
+        repositories = {item.path: item for item in facts.repositories}
+        repository = repositories.get(patch.target_submodule)
+        if repository is not None and repository.facts.worktree == "clean":
+            return target_state == "applied" and self.patch_state(git, patch) == "applied"
         return self._current_worktree_is_exact(git, patch)
 
     def _apply_patch(self, git, patch: ManagedPatch, *, reverse: bool) -> None:
@@ -1050,8 +1049,10 @@ def _with_managed_patch_states(adapter, git, facts):
         dirty = paths.issubset(repositories) and all(
             repositories[path].facts.worktree == "dirty" for path in paths
         )
-        integrated = facts.current_parent == facts.target_parent and (
-            adapter.patch_state(git, target[0]) == "applied"
+        integrated = (
+            paths.issubset(repositories)
+            and all(repositories[path].facts.worktree == "clean" for path in paths)
+            and adapter.patch_state(git, target[0]) == "applied"
         )
         state = "transition"
         if (

@@ -58,6 +58,7 @@ def execute_sync(
         except _EXPECTED_OPERATION_ERRORS:
             return _failed(plan, "git_precondition_failed")
 
+    repositories = {item.path: item for item in facts.repositories}
     mutation_attempted = False
     failure_reason = "sync_write_failed"
     try:
@@ -66,6 +67,9 @@ def execute_sync(
                 failure_reason = "managed_patch_reverse_failed"
                 state = adapter.patch_state(git, patch)
                 if state == "applied":
+                    # 干净工作树中的补丁效果已进入提交，保留该内容。
+                    if repositories[patch.target_submodule].facts.worktree == "clean":
+                        continue
                     mutation_attempted = True
                     adapter.reverse_patch(git, patch)
                 elif state != "absent":
@@ -78,7 +82,6 @@ def execute_sync(
                 ("merge", "--ff-only", facts.target_parent),
             )
 
-        repositories = {item.path: item for item in facts.repositories}
         for target in sorted(facts.target_submodules, key=lambda item: item.path):
             repository = repositories[target.path]
             if repository.facts.head == target.pin:
